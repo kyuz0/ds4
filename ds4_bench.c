@@ -506,7 +506,7 @@ int main(int argc, char **argv) {
         const double prefill_sec = prefill_t1 - prefill_t0;
         const int prefill_tokens = frontier - previous;
 
-        if (bench_snapshot_save(session, &snap, err, sizeof(err)) != 0) {
+        if (!distributed && bench_snapshot_save(session, &snap, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
             rc = 1;
             break;
@@ -555,7 +555,7 @@ int main(int argc, char **argv) {
         const double gen_t1 = bench_now_sec();
         if (rc != 0) break;
 
-        if (bench_snapshot_load(session, &snap, err, sizeof(err)) != 0) {
+        if (!distributed && bench_snapshot_load(session, &snap, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: restore at %d failed: %s\n", frontier, err);
             rc = 1;
             break;
