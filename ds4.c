@@ -18211,19 +18211,249 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen) {
-    (void)s;
-    (void)tokens;
-    (void)n_tokens;
-    (void)pos0;
-    (void)layer_start;
-    (void)layer_end;
-    (void)input_hc;
-    (void)output_hc;
-    (void)output_logits;
-    (void)logits;
-    payload_set_err(err, errlen, "distributed layer slices are not supported in this ROCm branch");
+    if (!s || !s->engine) {
+        if (errlen) snprintf(err, errlen, "missing layer-slice session");
+        return 1;
+    }
+    if (layer_start > layer_end || layer_end >= (uint32_t)DS4_N_LAYER) {
+        if (errlen) snprintf(err, errlen, "invalid layer-slice layer range %u:%u",
+                             layer_start, layer_end);
+        return 1;
+    }
+    if (layer_start != 0 && !input_hc) {
+        if (errlen) snprintf(err, errlen, "layer-slice layer %u requires input hidden-state",
+                             layer_start);
+        return 1;
+    }
+    if (output_logits && layer_end + 1u != (uint32_t)DS4_N_LAYER) {
+        if (errlen) snprintf(err, errlen, "layer-slice logits require final transformer layer");
+        return 1;
+    }
+    if (output_logits && !logits) {
+        if (errlen) snprintf(err, errlen, "layer-slice logits output is missing");
+        return 1;
+    }
+    if (!weights_layers_bound(&s->engine->weights, layer_start, layer_end)) {
+        if (errlen) snprintf(err, errlen, "requested layer slice %u:%u is not loaded",
+                             layer_start, layer_end);
+        return 1;
+    }
+    if (!input_hc && !s->engine->weights.token_embd) {
+        if (errlen) snprintf(err, errlen, "token embedding is not loaded");
+        return 1;
+    }
+    if (output_logits && !weights_have_output_head(&s->engine->weights)) {
+        if (errlen) snprintf(err, errlen, "output head is not loaded");
+        return 1;
+    }
+    if (ds4_session_slice_check_timeline(s, tokens, n_tokens, pos0, err, errlen) != 0) {
+        return 1;
+    }
+
+#ifdef DS4_NO_METAL
+    payload_set_err(err, errlen, "Metal support is not compiled in");
     return 1;
+#else
+    ds4_engine *e = s->engine;
+    ds4_metal_graph *g = &s->graph;
+
+    if (pos0 == 0) {
+        bool ok = true;
+        ds4_tokens span = {0};
+        if (n_tokens == 1) {
+            ok = ds4_metal_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_token_raw_swa(g,
+                                                &e->model,
+                                                &e->weights,
+                                                tokens[0],
+                                                pos0,
+                                                logits != NULL,
+                                                false);
+            if (ok) ok = ds4_metal_end_commands() != 0;
+            if (ok && logits) {
+                ok = ds4_metal_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            }
+        } else {
+            if (pos0 > (uint32_t)INT_MAX - n_tokens) {
+                if (errlen) snprintf(err, errlen, "layer-slice full span is too large");
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            span.len = (int)(pos0 + n_tokens);
+            span.cap = span.len;
+            span.v = calloc((size_t)span.len, sizeof(span.v[0]));
+            if (span.v) {
+                for (uint32_t i = 0; i < n_tokens; i++) span.v[pos0 + i] = tokens[i];
+                ok = metal_graph_prefill_layer_major(g,
+                                                     &e->model,
+                                                     &e->weights,
+                                                     &span,
+                                                     pos0,
+                                                     n_tokens,
+                                                     logits,
+                                                     false,
+                                                     NULL,
+                                                     NULL,
+                                                     NULL);
+            }
+            free(span.v);
+        }
+        if (!ok) {
+            if (ds4_metal_synchronize() == 0) {
+                fprintf(stderr, "ds4: synchronize after layer-slice full failure also failed\n");
+            }
+            if (errlen) snprintf(err, errlen, "%s layer-slice full evaluation failed",
+                                 ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+        return 0;
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = (uint64_t)n_tokens * hc_dim * sizeof(float);
+    if (n_tokens == 1 && pos0 > 0) {
+        if (g->raw_cap == 0) {
+            if (errlen) snprintf(err, errlen, "%s layer-slice decode has no raw KV cache",
+                                 ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            return 1;
+        }
+
+        bool ok = true;
+        if (input_hc) {
+            ok = ds4_metal_tensor_write(g->cur_hc, 0, input_hc, hc_dim * sizeof(float)) != 0;
+        }
+        if (ok) ok = ds4_metal_begin_commands() != 0;
+        if (ok && !input_hc) {
+            ok = ds4_metal_embed_token_hc_tensor(g->cur_hc,
+                                               e->model.map,
+                                               e->model.size,
+                                               e->weights.token_embd->abs_offset,
+                                               (uint32_t)e->weights.token_embd->dim[1],
+                                               (uint32_t)tokens[0],
+                                               DS4_N_EMBD,
+                                               DS4_N_HC) != 0;
+        }
+        const uint32_t raw_row = pos0 % g->raw_cap;
+        const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, 1);
+        const uint32_t split_after_layers = metal_graph_token_split_after_layers();
+        uint32_t encoded_layers = 0;
+        for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+            ok = metal_graph_encode_decode_layer(g,
+                                                 &e->model,
+                                                 &e->weights.layer[il],
+                                                 il,
+                                                 pos0,
+                                                 g->layer_raw_cache[il],
+                                                 g->raw_cap,
+                                                 raw_row,
+                                                 n_raw,
+                                                 tokens[0]);
+            ds4_metal_tensor *tmp = g->cur_hc;
+            g->cur_hc = g->after_ffn_hc;
+            g->after_ffn_hc = tmp;
+            encoded_layers++;
+            if (ok &&
+                split_after_layers != 0 &&
+                encoded_layers == split_after_layers &&
+                il < layer_end)
+            {
+                ok = ds4_metal_flush_commands() != 0;
+            }
+        }
+        if (ok && output_logits) {
+            ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
+        }
+        if (ok) ok = ds4_metal_end_commands() != 0;
+        if (ok && !output_hc && !output_logits) ok = ds4_metal_synchronize() != 0;
+        if (ok && output_hc) {
+            ok = ds4_metal_tensor_read(g->cur_hc, 0, output_hc, hc_dim * sizeof(float)) != 0;
+        }
+        if (ok && output_logits) {
+            ok = ds4_metal_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        }
+        if (!ok) {
+            if (ds4_metal_synchronize() == 0) {
+                fprintf(stderr, "ds4: synchronize after layer-slice decode failure also failed\n");
+            }
+            if (errlen) snprintf(err, errlen, "%s layer-slice decode failed",
+                                 ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            return 1;
+        }
+
+        ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+        return 0;
+    }
+
+    ds4_tokens span = {
+        .v = (int *)tokens,
+        .len = (int)n_tokens,
+        .cap = (int)n_tokens,
+    };
+
+    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens);
+    if (ok && input_hc) {
+        ok = ds4_metal_tensor_write(g->batch_cur_hc, 0, input_hc, hc_bytes) != 0;
+    } else if (ok) {
+        ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                     g->prefill_tokens,
+                                                     &e->model,
+                                                     &e->weights,
+                                                     &span,
+                                                     0,
+                                                     n_tokens);
+    }
+
+    ds4_metal_tensor *last_hc = NULL;
+    ds4_metal_tensor *saved_cur = NULL;
+    if (ok) ok = ds4_metal_begin_commands() != 0;
+    for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+        ok = metal_graph_encode_layer_batch(g,
+                                            &e->model,
+                                            &e->weights.layer[il],
+                                            il,
+                                            pos0,
+                                            n_tokens);
+    }
+    if (ok && output_logits) {
+        saved_cur = g->cur_hc;
+        last_hc = metal_graph_tensor_row_view(g->batch_cur_hc, n_tokens - 1u, hc_dim);
+        ok = last_hc != NULL;
+        if (ok) {
+            g->cur_hc = last_hc;
+            ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
+            g->cur_hc = saved_cur;
+        }
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    if (saved_cur) g->cur_hc = saved_cur;
+    if (last_hc) ds4_metal_tensor_free(last_hc);
+
+    if (ok && !output_hc && !output_logits) ok = ds4_metal_synchronize() != 0;
+    if (ok && output_hc) {
+        ok = ds4_metal_tensor_read(g->batch_cur_hc, 0, output_hc, hc_bytes) != 0;
+    }
+    if (ok && output_logits) {
+        ok = ds4_metal_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (!ok) {
+        if (ds4_metal_synchronize() == 0) {
+            fprintf(stderr, "ds4: synchronize after layer-slice failure also failed\n");
+        }
+        if (errlen) snprintf(err, errlen, "%s layer-slice failed",
+                             ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return 1;
+    }
+
+    ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+    return 0;
+#endif
 }
+
 
 int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          const float *hidden_hc,
@@ -18954,6 +19184,17 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         return 1;
     }
 
+    if (s->distributed) {
+        const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
+        return ds4_dist_session_sync(s->distributed,
+                                     s,
+                                     checkpoint,
+                                     prompt,
+                                     s->logits,
+                                     err,
+                                     errlen);
+    }
+
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
         ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -19316,6 +19557,22 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
+
+    if (s->distributed) {
+        if (!s->checkpoint_valid) {
+            if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
+            return 1;
+        }
+        (void)probe_mtp;
+        return ds4_dist_session_eval(s->distributed,
+                                     s,
+                                     &s->checkpoint,
+                                     token,
+                                     s->logits,
+                                     err,
+                                     errlen);
+    }
+
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
