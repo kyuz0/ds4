@@ -18242,42 +18242,20 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     ds4_engine *e = s->engine;
     ds4_metal_graph *g = &s->graph;
 
-    if (pos0 == 0) {
+    if (pos0 == 0 && n_tokens == 1) {
         bool ok = true;
         ds4_tokens span = {0};
-        if (n_tokens == 1) {
-            ok = ds4_metal_begin_commands() != 0;
-            if (ok) ok = metal_graph_encode_token_raw_swa(g,
-                                                &e->model,
-                                                &e->weights,
-                                                tokens[0],
-                                                pos0,
-                                                logits != NULL,
-                                                false);
-            if (ok) ok = ds4_metal_end_commands() != 0;
-            if (ok && logits) {
-                ok = ds4_metal_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-            }
-        } else {
-            if (pos0 > (uint32_t)INT_MAX - n_tokens) {
-                if (errlen) snprintf(err, errlen, "layer-slice full span is too large");
-                s->checkpoint_valid = false;
-                return 1;
-            }
-            span.len = (int)(pos0 + n_tokens);
-            span.cap = span.len;
-            span.v = calloc((size_t)span.len, sizeof(span.v[0]));
-            if (span.v) {
-                for (uint32_t i = 0; i < n_tokens; i++) span.v[pos0 + i] = tokens[i];
-                ok = metal_graph_prefill_layer_major(g,
-                                                     &e->model,
-                                                     &e->weights,
-                                                     &span,
-                                                     n_tokens,
-                                                     logits,
-                                                     false);
-            }
-            free(span.v);
+        ok = ds4_metal_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_token_raw_swa(g,
+                                            &e->model,
+                                            &e->weights,
+                                            tokens[0],
+                                            pos0,
+                                            logits != NULL,
+                                            false);
+        if (ok) ok = ds4_metal_end_commands() != 0;
+        if (ok && logits) {
+            ok = ds4_metal_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
         if (!ok) {
             if (ds4_metal_synchronize() == 0) {
