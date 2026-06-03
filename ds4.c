@@ -18199,6 +18199,12 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
     return 0;
 }
 
+static void ds4_session_slice_commit_timeline(ds4_session *s, const int *tokens, uint32_t n_tokens) {
+    for (uint32_t i = 0; i < n_tokens; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+}
+
 int ds4_session_eval_layer_slice(ds4_session *s,
                                  const int *tokens,
                                  uint32_t n_tokens,
@@ -18266,7 +18272,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             s->checkpoint_valid = false;
             return 1;
         }
-        /* ds4_session_slice_commit_timeline(s, tokens, n_tokens); */
+        ds4_session_slice_commit_timeline(s, tokens, n_tokens);
         return 0;
     }
 
@@ -18343,7 +18349,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             return 1;
         }
 
-        /* ds4_session_slice_commit_timeline(s, tokens, n_tokens); */
+        ds4_session_slice_commit_timeline(s, tokens, n_tokens);
         return 0;
     }
 
@@ -18408,7 +18414,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         return 1;
     }
 
-    /* ds4_session_slice_commit_timeline(s, tokens, n_tokens); */
+    ds4_session_slice_commit_timeline(s, tokens, n_tokens);
     return 0;
 #endif
 }
