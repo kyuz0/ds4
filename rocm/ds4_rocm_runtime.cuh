@@ -1576,10 +1576,13 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         return 0;
     }
     cuda_model_range r;
+    r.host_base = model_map;
     r.offset = map_offset;
     r.bytes = map_size;
-    r.device_ptr = dev;
+    r.device_ptr = (char *)dev;
     r.registered_base = NULL;
+    r.registered_device_base = NULL;
+    r.registered_bytes = 0;
     r.host_registered = 0;
     r.arena_allocated = 0;
     g_model_ranges.push_back(r);
