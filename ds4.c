@@ -18195,8 +18195,8 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
     if (s) ds4_session_invalidate(s);
-    payload_set_err(err, errlen, "distributed layer slices are not supported in this ROCm branch");
-    return 1;
+    if (errlen) err[0] = '\0';
+    return 0;
 }
 
 int ds4_session_eval_layer_slice(ds4_session *s,
