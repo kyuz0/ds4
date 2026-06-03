@@ -5303,6 +5303,7 @@ int ds4_dist_session_sync(
                                                                        err,
                                                                        errlen);
             if (prefill_rc != 0) {
+                fprintf(stderr, "ds4: distributed coordinator: pipelined prefill failed: %s\n", err);
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5340,6 +5341,7 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
             if (eval_rc != 0) {
+                fprintf(stderr, "ds4: distributed coordinator: prefill span failed: %s\n", err);
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5374,6 +5376,7 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
     if (prefill_rc != 0) {
+        fprintf(stderr, "ds4: distributed coordinator: legacy prefill failed: %s\n", err);
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
