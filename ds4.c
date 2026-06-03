@@ -18233,22 +18233,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         if (errlen) snprintf(err, errlen, "layer-slice logits output is missing");
         return 1;
     }
-    if (!weights_layers_bound(&s->engine->weights, layer_start, layer_end)) {
-        if (errlen) snprintf(err, errlen, "requested layer slice %u:%u is not loaded",
-                             layer_start, layer_end);
-        return 1;
-    }
-    if (!input_hc && !s->engine->weights.token_embd) {
-        if (errlen) snprintf(err, errlen, "token embedding is not loaded");
-        return 1;
-    }
-    if (output_logits && !weights_have_output_head(&s->engine->weights)) {
-        if (errlen) snprintf(err, errlen, "output head is not loaded");
-        return 1;
-    }
-    if (ds4_session_slice_check_timeline(s, tokens, n_tokens, pos0, err, errlen) != 0) {
-        return 1;
-    }
+
 
 #ifdef DS4_NO_METAL
     payload_set_err(err, errlen, "Metal support is not compiled in");
@@ -18288,13 +18273,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                      &e->model,
                                                      &e->weights,
                                                      &span,
-                                                     pos0,
                                                      n_tokens,
                                                      logits,
-                                                     false,
-                                                     NULL,
-                                                     NULL,
-                                                     NULL);
+                                                     false);
             }
             free(span.v);
         }
@@ -18307,7 +18288,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             s->checkpoint_valid = false;
             return 1;
         }
-        ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+        /* ds4_session_slice_commit_timeline(s, tokens, n_tokens); */
         return 0;
     }
 
@@ -18338,7 +18319,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
         const uint32_t raw_row = pos0 % g->raw_cap;
         const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, 1);
-        const uint32_t split_after_layers = metal_graph_token_split_after_layers();
+        const uint32_t split_after_layers = 0;
         uint32_t encoded_layers = 0;
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
             ok = metal_graph_encode_decode_layer(g,
@@ -18384,7 +18365,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             return 1;
         }
 
-        ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+        /* ds4_session_slice_commit_timeline(s, tokens, n_tokens); */
         return 0;
     }
 
