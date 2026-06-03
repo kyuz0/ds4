@@ -1499,7 +1499,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 
     void *dev = NULL;
     const double t0 = cuda_wall_sec();
-    cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
+    cudaError_t err = cudaMalloc(&dev, (size_t)map_size);
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "model allocation skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
@@ -1519,8 +1519,8 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
     double last_report = t0;
-    while (copied < model_size) {
-        const uint64_t n = (model_size - copied < chunk) ? (model_size - copied) : chunk;
+    while (copied < map_size) {
+        const uint64_t n = (map_size - copied < chunk) ? (map_size - copied) : chunk;
         const uint64_t bi = chunk_idx % 4u;
         if (chunk_idx >= 4u) {
             err = cudaEventSynchronize(g_model_stage_event[bi]);
@@ -1533,7 +1533,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         }
         const char *payload = NULL;
         if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
-                                   copied, n, &payload)) {
+                                   map_offset + copied, n, &payload)) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "model staged read failed at %.2f GiB: %s\n",
                     (double)copied / 1073741824.0, strerror(errno));
             (void)cudaFree(dev);
@@ -1555,8 +1555,8 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
             (void)cudaGetLastError();
             return 0;
         }
-        cuda_model_drop_file_pages(copied, n);
-        cuda_model_discard_source_pages(model_map, model_size, copied, n);
+        cuda_model_drop_file_pages(map_offset + copied, n);
+        cuda_model_discard_source_pages(model_map, model_size, map_offset + copied, n);
         copied += n;
         chunk_idx++;
         cuda_model_load_progress_note(copied > map_offset ? copied - map_offset : 0);
@@ -1575,9 +1575,14 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         (void)cudaGetLastError();
         return 0;
     }
-    g_model_device_base = (const char *)dev;
-    g_model_device_owned = 1;
-    g_model_hmm_direct = 0;
+    cuda_model_range r;
+    r.offset = map_offset;
+    r.bytes = map_size;
+    r.device_ptr = dev;
+    r.registered_base = NULL;
+    r.host_registered = 0;
+    r.arena_allocated = 0;
+    g_model_ranges.push_back(r);
     const double t1 = cuda_wall_sec();
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX "model chunk copy complete in %.3fs (%.2f GiB tensors)\n",
