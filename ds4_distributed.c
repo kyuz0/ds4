@@ -1022,7 +1022,7 @@ static int dist_set_socket_low_latency(int fd) {
     int one = 1;
     int rc = 0;
     int buffer_bytes = dist_socket_buffer_bytes();
-    int timeout_sec = 60;
+    int timeout_sec = 600;
     const char *timeout_env = getenv("DS4_DIST_SOCKET_TIMEOUT_SEC");
     if (timeout_env && timeout_env[0]) {
         char *end = NULL;
