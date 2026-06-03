@@ -18430,7 +18430,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         return 1;
     }
 
-    ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+    /* ds4_session_slice_commit_timeline(s, tokens, n_tokens); */
     return 0;
 #endif
 }
