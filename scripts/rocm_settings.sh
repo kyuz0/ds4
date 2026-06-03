@@ -2,6 +2,10 @@
 # Shared ROCm runtime presets for DS4 launch/bench scripts.
 # Source this file from scripts after ROOT_DIR/cd has been established.
 
+if [[ -d "/opt/rocm/bin" ]]; then
+  export PATH="/opt/rocm/bin:$PATH"
+fi
+
 # Export a DS4_CUDA_* and DS4_HIP_* boolean alias when the caller-facing
 # DS4_SERVER_* knob is enabled.
 ds4_rocm_export_pair_flag() {
