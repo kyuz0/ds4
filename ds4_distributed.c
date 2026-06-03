@@ -747,6 +747,10 @@ static uint32_t dist_worker_forward_window(void) {
     return depth;
 }
 
+static bool dist_decode_profile_enabled(void) {
+    return getenv("DS4_DIST_DECODE_PROFILE") != NULL;
+}
+
 static bool dist_parse_positive_u32(
         const char *s,
         const char *name,
@@ -2388,7 +2392,10 @@ static int dist_coordinator_eval_remote_on_fd(
         uint32_t hidden_hc_bytes,
         float *logits,
         char *err,
-        size_t errlen) {
+         size_t errlen) {
+    const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
+    const double total_t0 = profile ? dist_now_sec() : 0.0;
+    const double send_t0 = profile ? dist_now_sec() : 0.0;
     int rc = dist_coordinator_send_remote_work_on_fd(state,
                                                      plan,
                                                      fd,
@@ -2405,10 +2412,12 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      hidden_hc_bytes,
                                                      err,
                                                      errlen);
+    const double send_t1 = profile ? dist_now_sec() : 0.0;
     uint32_t kind = 0, payload_bytes = 0;
     uint64_t result_hash = 0;
     void *payload = NULL;
     if (rc == 0) {
+        const double recv_t0 = profile ? dist_now_sec() : 0.0;
         rc = dist_recv_result_alloc(fd,
                                     state,
                                     request_id,
@@ -2418,6 +2427,17 @@ static int dist_coordinator_eval_remote_on_fd(
                                     &payload_bytes,
                                     err,
                                     errlen);
+        const double recv_t1 = profile ? dist_now_sec() : 0.0;
+        if (profile) {
+            fprintf(stderr,
+                    "ds4: dist decode profile: remote request=%llu pos=%u send=%.3fms wait_result=%.3fms kind=%u payload=%.2fMiB\n",
+                    (unsigned long long)request_id,
+                    pos0,
+                    (send_t1 - send_t0) * 1000.0,
+                    (recv_t1 - recv_t0) * 1000.0,
+                    kind,
+                    (double)payload_bytes / (1024.0 * 1024.0));
+        }
     }
     if (rc != 0) return rc;
     if (result_hash != expected_result_hash) {
@@ -2428,11 +2448,21 @@ static int dist_coordinator_eval_remote_on_fd(
 
     const uint32_t logits_bytes = (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
     if (kind == DS4_DIST_RESULT_LOGITS && payload_bytes == logits_bytes) {
+        const double copy_t0 = profile ? dist_now_sec() : 0.0;
         memcpy(logits, payload, logits_bytes);
         free(payload);
+        if (profile) {
+            const double copy_t1 = dist_now_sec();
+            fprintf(stderr,
+                    "ds4: dist decode profile: remote request=%llu copy_logits=%.3fms total=%.3fms\n",
+                    (unsigned long long)request_id,
+                    (copy_t1 - copy_t0) * 1000.0,
+                    (copy_t1 - total_t0) * 1000.0);
+        }
         return 0;
     }
     if (kind == DS4_DIST_RESULT_HIDDEN_STATE && payload_bytes == hidden_hc_bytes) {
+        const double head_t0 = profile ? dist_now_sec() : 0.0;
         int head_rc = ds4_session_eval_output_head_from_hc(session,
                                                            payload,
                                                            n_tokens,
@@ -2440,6 +2470,15 @@ static int dist_coordinator_eval_remote_on_fd(
                                                            err,
                                                            errlen);
         free(payload);
+        if (profile) {
+            const double head_t1 = dist_now_sec();
+            fprintf(stderr,
+                    "ds4: dist decode profile: remote request=%llu output_head=%.3fms total=%.3fms rc=%d\n",
+                    (unsigned long long)request_id,
+                    (head_t1 - head_t0) * 1000.0,
+                    (head_t1 - total_t0) * 1000.0,
+                    head_rc);
+        }
         return head_rc;
     }
     if (kind == DS4_DIST_RESULT_HIDDEN_STATE) {
@@ -2465,6 +2504,8 @@ static int dist_coordinator_eval_span(
         float *logits,
         char *err,
         size_t errlen) {
+    const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
+    const double span_t0 = profile ? dist_now_sec() : 0.0;
     const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
     const uint64_t hidden_bytes64 = (uint64_t)n_tokens * hc_values * sizeof(float);
     if (hidden_bytes64 > UINT32_MAX) {
@@ -2512,6 +2553,7 @@ static int dist_coordinator_eval_span(
         }
     }
 
+    const double local_t0 = profile ? dist_now_sec() : 0.0;
     int rc = ds4_session_eval_layer_slice(session,
                                           tokens,
                                           n_tokens,
@@ -2524,7 +2566,10 @@ static int dist_coordinator_eval_span(
                                           local_logits ? logits : NULL,
                                           err,
                                           errlen);
+    const double local_t1 = profile ? dist_now_sec() : 0.0;
+    double remote_t0 = 0.0, remote_t1 = 0.0;
     if (rc == 0 && plan->count != 0) {
+        remote_t0 = profile ? dist_now_sec() : 0.0;
         rc = dist_coordinator_eval_remote_on_fd(state,
                                                 session,
                                                 plan,
@@ -2542,6 +2587,21 @@ static int dist_coordinator_eval_span(
                                                 logits,
                                                 err,
                                                 errlen);
+        remote_t1 = profile ? dist_now_sec() : 0.0;
+    }
+    if (profile) {
+        const double span_t1 = dist_now_sec();
+        fprintf(stderr,
+                "ds4: dist decode profile: span request=%llu pos=%u layers=%u:%u local=%.3fms remote=%.3fms total=%.3fms hidden=%.2fMiB rc=%d\n",
+                (unsigned long long)request_id,
+                pos0,
+                state->local_start,
+                state->local_end,
+                (local_t1 - local_t0) * 1000.0,
+                (remote_t1 - remote_t0) * 1000.0,
+                (span_t1 - span_t0) * 1000.0,
+                (double)hidden_bytes / (1024.0 * 1024.0),
+                rc);
     }
     free(hidden);
     return rc;
@@ -6933,6 +6993,8 @@ static int dist_worker_process_work_payload(
                                                            work.prefix_hash_lo);
     const uint64_t work_result_hash = dist_u64_from_halves(work.result_hash_hi,
                                                            work.result_hash_lo);
+    const bool profile = dist_decode_profile_enabled() && work.n_tokens == 1;
+    const double total_t0 = profile ? dist_now_sec() : 0.0;
     DIST_DEBUG("worker work request=%llu layers=%u:%u tokens=%u pos=%u flags=0x%x token_bytes=%u input_hc=%u/%ub route_count=%u route_index=%u route_bytes=%u",
                (unsigned long long)request_id,
                work.layer_start,
@@ -7187,8 +7249,11 @@ static int dist_worker_process_work_payload(
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "decoded input hidden-state size does not match token span");
     }
+    const double decode_t1 = profile ? dist_now_sec() : 0.0;
 
+    const double lock_t0 = profile ? dist_now_sec() : 0.0;
     pthread_mutex_lock(&state->mu);
+    const double lock_t1 = profile ? dist_now_sec() : 0.0;
     ds4_dist_worker_session *session = dist_worker_get_session_locked(state, session_id, err, sizeof(err));
     if (!session) {
         pthread_mutex_unlock(&state->mu);
@@ -7294,7 +7359,7 @@ static int dist_worker_process_work_payload(
         .input_bytes = work.token_bytes + work.input_hc_bytes,
         .output_bytes = result_wire_bytes,
     };
-
+    const double send_t0 = profile ? dist_now_sec() : 0.0;
     int send_rc;
     if (has_next) {
         send_rc = dist_forward_work_to_next(upstream,
@@ -7316,6 +7381,23 @@ static int dist_worker_process_work_payload(
                                                         1,
                                                         result,
                                                         result_bytes);
+    }
+    const double send_t1 = profile ? dist_now_sec() : 0.0;
+    if (profile) {
+        fprintf(stderr,
+                "ds4: dist decode profile: worker request=%llu pos=%u layers=%u:%u input_decode=%.3fms lock_wait=%.3fms eval=%.3fms send=%.3fms total=%.3fms input=%.2fMiB output=%.2fMiB rc=%d\n",
+                (unsigned long long)request_id,
+                work.pos0,
+                work.layer_start,
+                work.layer_end,
+                (decode_t1 - total_t0) * 1000.0,
+                (lock_t1 - lock_t0) * 1000.0,
+                (eval_t1 - eval_t0) * 1000.0,
+                (send_t1 - send_t0) * 1000.0,
+                (send_t1 - total_t0) * 1000.0,
+                (double)(work.token_bytes + work.input_hc_bytes) / (1024.0 * 1024.0),
+                (double)result_wire_bytes / (1024.0 * 1024.0),
+                send_rc);
     }
     DIST_DEBUG("worker send complete request=%llu has_next=%d send_rc=%d",
                (unsigned long long)request_id,
