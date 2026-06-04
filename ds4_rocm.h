@@ -5,6 +5,7 @@
 #include <hip/hip_fp16.h>
 #include <hipcub/hipcub.hpp>
 #include <rocwmma/rocwmma-version.hpp>
+#include <rocwmma/rocwmma.hpp>
 
 #define cudaError_t hipError_t
 #define cudaStream_t hipStream_t

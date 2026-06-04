@@ -139,7 +139,11 @@ __global__ static void indexer_scores_wmma_kernel(
         float scale,
         int causal) {
 #if __CUDA_ARCH__ >= 700 || defined(__HIP_DEVICE_COMPILE__)
+#ifdef __HIP_PLATFORM_AMD__
+    namespace wmma = rocwmma;
+#else
     namespace wmma = nvcuda::wmma;
+#endif
     const uint32_t tile_c = blockIdx.x * 16u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
@@ -247,7 +251,11 @@ __global__ static void indexer_scores_wmma32_kernel(
         float scale,
         int causal) {
 #if __CUDA_ARCH__ >= 700 || defined(__HIP_DEVICE_COMPILE__)
+#ifdef __HIP_PLATFORM_AMD__
+    namespace wmma = rocwmma;
+#else
     namespace wmma = nvcuda::wmma;
+#endif
     const uint32_t tile_c = blockIdx.x * 32u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
@@ -363,7 +371,11 @@ __global__ static void indexer_scores_wmma64_kernel(
         float scale,
         int causal) {
 #if __CUDA_ARCH__ >= 700 || defined(__HIP_DEVICE_COMPILE__)
+#ifdef __HIP_PLATFORM_AMD__
+    namespace wmma = rocwmma;
+#else
     namespace wmma = nvcuda::wmma;
+#endif
     const uint32_t tile_c = blockIdx.x * 64u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
@@ -479,7 +491,11 @@ __global__ static void indexer_scores_wmma128_kernel(
         float scale,
         int causal) {
 #if __CUDA_ARCH__ >= 700 || defined(__HIP_DEVICE_COMPILE__)
+#ifdef __HIP_PLATFORM_AMD__
+    namespace wmma = rocwmma;
+#else
     namespace wmma = nvcuda::wmma;
+#endif
     const uint32_t tile_c = blockIdx.x * 128u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
