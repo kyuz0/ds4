@@ -1,7 +1,7 @@
 __device__ static float softplus_dev(float x) {
     if (x > 20.0f) return x;
-    if (x < -20.0f) return expf(x);
-    return log1pf(expf(x));
+    if (x < -20.0f) return ds4_precise_expf(x);
+    return ds4_precise_log1pf(ds4_precise_expf(x));
 }
 
 __global__ static void router_select_kernel(
@@ -23,8 +23,7 @@ __global__ static void router_select_kernel(
     float *prob = probs + (uint64_t)t * DS4_ROCM_N_EXPERT;
     int32_t *sel = selected + (uint64_t)t * DS4_ROCM_N_EXPERT_USED;
     float *w = weights + (uint64_t)t * DS4_ROCM_N_EXPERT_USED;
-
-    for (int i = 0; i < DS4_ROCM_N_EXPERT; i++) prob[i] = sqrtf(softplus_dev(log[i]));
+    for (int i = 0; i < DS4_ROCM_N_EXPERT; i++) prob[i] = ds4_precise_sqrtf(softplus_dev(log[i]));
 
     if (hash_mode) {
         int32_t tok = tokens ? tokens[t] : token_scalar;
@@ -78,7 +77,7 @@ __global__ static void router_select_parallel_kernel(
     float *w = weights + (uint64_t)t * DS4_ROCM_N_EXPERT_USED;
     __shared__ float sprob[DS4_ROCM_N_EXPERT];
 
-    const float p = sqrtf(softplus_dev(log[i]));
+    const float p = ds4_precise_sqrtf(softplus_dev(log[i]));
     sprob[i] = p;
     prob[i] = p;
     __syncthreads();
@@ -147,7 +146,7 @@ __global__ static void router_select_warp_topk_kernel(
     #pragma unroll
     for (uint32_t j = 0; j < DS4_ROCM_N_EXPERT / 32u; j++) {
         const uint32_t e = lane + j * 32u;
-        const float p = sqrtf(softplus_dev(log[e]));
+        const float p = ds4_precise_sqrtf(softplus_dev(log[e]));
         local_prob[j] = p;
         local_score[j] = p + (has_bias ? bias[e] : 0.0f);
         sprob[row_in_block][e] = p;

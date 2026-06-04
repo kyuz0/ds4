@@ -129,3 +129,13 @@ static __device__ __forceinline__ int32_t __dp4a(int32_t a, int32_t b, int32_t c
 #endif
 }
 
+// Precise transcendentals for the MoE router top-k scores, immune to -fapprox-func.
+// These functions are to be used on paths where small error can be translated to
+// some macro effect - like expert selection kernels
+extern "C" __device__ __attribute__((pure))  float __ocml_exp_f32(float);
+extern "C" __device__ __attribute__((pure))  float __ocml_log1p_f32(float);
+extern "C" __device__ __attribute__((const)) float __ocml_sqrt_f32(float);
+
+static __device__ __forceinline__ float ds4_precise_expf(float x)   { return __ocml_exp_f32(x); }
+static __device__ __forceinline__ float ds4_precise_log1pf(float x) { return __ocml_log1p_f32(x); }
+static __device__ __forceinline__ float ds4_precise_sqrtf(float x)  { return __ocml_sqrt_f32(x); }

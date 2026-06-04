@@ -138,7 +138,7 @@ __global__ static void indexer_scores_wmma_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
+#if __CUDA_ARCH__ >= 700 || defined(__HIP_DEVICE_COMPILE__)
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 16u;
     const uint32_t tile_t = blockIdx.y * 16u;
@@ -246,7 +246,7 @@ __global__ static void indexer_scores_wmma32_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
+#if __CUDA_ARCH__ >= 700 || defined(__HIP_DEVICE_COMPILE__)
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 32u;
     const uint32_t tile_t = blockIdx.y * 16u;
@@ -362,7 +362,7 @@ __global__ static void indexer_scores_wmma64_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
+#if __CUDA_ARCH__ >= 700 || defined(__HIP_DEVICE_COMPILE__)
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 64u;
     const uint32_t tile_t = blockIdx.y * 16u;
@@ -478,7 +478,7 @@ __global__ static void indexer_scores_wmma128_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
+#if __CUDA_ARCH__ >= 700 || defined(__HIP_DEVICE_COMPILE__)
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 128u;
     const uint32_t tile_t = blockIdx.y * 16u;
