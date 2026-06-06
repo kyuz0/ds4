@@ -348,7 +348,23 @@ __device__ static float warp_max_f32(float v) {
 }
 
 __device__ static uint16_t f32_to_f16_bits_hip_round(float f) {
-    return (uint16_t)__half_as_ushort(__float2half(f));
+    union { float f; uint32_t u; } v;
+    v.f = f;
+    uint32_t sign = (v.u >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((v.u >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = v.u & 0x7fffffu;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) half_mant++;
+        return (uint16_t)(sign | half_mant);
+    }
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    if (mant & 0x1000u) half++;
+    return (uint16_t)half;
 }
 
 __device__ static float f16_bits_to_f32(uint16_t bits) {
