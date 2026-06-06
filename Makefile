@@ -4,7 +4,8 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
 else
-NATIVE_CPU_FLAG ?= -march=native
+# Target AMD Ryzen AI Max "Strix Halo" APUs (Zen 5 architecture)
+NATIVE_CPU_FLAG ?= -march=znver5
 endif
 
 DEBUG_FLAGS ?= -g
