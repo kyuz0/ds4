@@ -119,7 +119,7 @@ static __device__ __forceinline__ int32_t __dp4a(int32_t a, int32_t b, int32_t c
     union ds4_i8x4_bits { int32_t i; char4 v; } av, bv;
     av.i = a;
     bv.i = b;
-    return amd_mixed_dot(av.v, bv.v, c, true);
+    return amd_mixed_dot(av.v, bv.v, c, false);
 #else
     const int8_t *a_bytes = reinterpret_cast<const int8_t*>(&a);
     const int8_t *b_bytes = reinterpret_cast<const int8_t*>(&b);
