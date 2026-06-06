@@ -15494,6 +15494,17 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
     return m;
 }
 
+typedef struct {
+    float val;
+    uint32_t idx;
+} ds4_logit_idx;
+
+static int cmp_logit_idx(const void *a, const void *b) {
+    float va = ((const ds4_logit_idx*)a)->val;
+    float vb = ((const ds4_logit_idx*)b)->val;
+    return (va < vb) - (va > vb);
+}
+
 static int metal_graph_prompt_logits_test(
         const ds4_model   *model,
         const ds4_weights *weights,
@@ -15622,15 +15633,70 @@ static int metal_graph_prompt_logits_test(
         }
         const uint64_t cpu_top = argmax_f32(cpu_logits, DS4_N_VOCAB);
         const uint64_t gpu_top = argmax_f32(gpu_logits, DS4_N_VOCAB);
+
+        // 1. Top-20 Overlap Logic
+        int top_k = 20;
+        ds4_logit_idx *cpu_pairs = xmalloc(DS4_N_VOCAB * sizeof(ds4_logit_idx));
+        ds4_logit_idx *gpu_pairs = xmalloc(DS4_N_VOCAB * sizeof(ds4_logit_idx));
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            cpu_pairs[i].val = cpu_logits[i];
+            cpu_pairs[i].idx = i;
+            gpu_pairs[i].val = gpu_logits[i];
+            gpu_pairs[i].idx = i;
+        }
+        qsort(cpu_pairs, DS4_N_VOCAB, sizeof(ds4_logit_idx), cmp_logit_idx);
+        qsort(gpu_pairs, DS4_N_VOCAB, sizeof(ds4_logit_idx), cmp_logit_idx);
+
+        int overlap_count = 0;
+        for (int i = 0; i < top_k; i++) {
+            for (int j = 0; j < top_k; j++) {
+                if (cpu_pairs[i].idx == gpu_pairs[j].idx) {
+                    overlap_count++;
+                    break;
+                }
+            }
+        }
+        free(cpu_pairs);
+        free(gpu_pairs);
+
+        // 2. KL Divergence Logic
+        double cpu_max = cpu_logits[0], gpu_max = gpu_logits[0];
+        for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
+            if (cpu_logits[i] > cpu_max) cpu_max = cpu_logits[i];
+            if (gpu_logits[i] > gpu_max) gpu_max = gpu_logits[i];
+        }
+        double cpu_sum = 0, gpu_sum = 0;
+        float *cpu_p = xmalloc(DS4_N_VOCAB * sizeof(float));
+        float *gpu_p = xmalloc(DS4_N_VOCAB * sizeof(float));
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            cpu_p[i] = expf(cpu_logits[i] - cpu_max);
+            cpu_sum += cpu_p[i];
+            gpu_p[i] = expf(gpu_logits[i] - gpu_max);
+            gpu_sum += gpu_p[i];
+        }
+        double kl_div = 0;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            double p = cpu_p[i] / cpu_sum;
+            double q = gpu_p[i] / gpu_sum;
+            if (p > 1e-10) {
+                if (q < 1e-10) q = 1e-10;
+                kl_div += p * log(p / q);
+            }
+        }
+        free(cpu_p);
+        free(gpu_p);
+
         fprintf(stderr,
-                "ds4: Metal prompt graph logits: tokens=%d logits_max=%g logits_rms=%g cpu_top=%llu gpu_top=%llu cpu_top_logit=%g gpu_top_logit=%g\n",
+                "ds4: Metal prompt graph logits: tokens=%d logits_max=%g logits_rms=%g cpu_top=%llu gpu_top=%llu cpu_top_logit=%g gpu_top_logit=%g top20_match=%d/20 kl_div=%g\n",
                 n_test,
                 max_abs_diff(cpu_logits, gpu_logits, DS4_N_VOCAB),
                 rms_abs_diff(cpu_logits, gpu_logits, DS4_N_VOCAB),
                 (unsigned long long)cpu_top,
                 (unsigned long long)gpu_top,
                 cpu_logits[cpu_top],
-                gpu_logits[gpu_top]);
+                gpu_logits[gpu_top],
+                overlap_count,
+                kl_div);
         if (oracle_logits) {
             const uint64_t oracle_top = argmax_f32(oracle_logits, DS4_N_VOCAB);
             fprintf(stderr,
