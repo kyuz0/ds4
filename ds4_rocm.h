@@ -7,6 +7,17 @@
 #include <rocwmma/rocwmma-version.hpp>
 #include <rocwmma/rocwmma.hpp>
 
+/* ── Architecture detection ─────────────────────────────────────────────
+ * hipcc pre-defines __GFX11__ / __GFX12__ based on --offload-arch.
+ * These convenience macros let kernel code branch on the RDNA generation
+ * without hard-coding individual gfx IDs. */
+#if defined(__GFX12__)
+#define DS4_RDNA4   /* gfx1200 / gfx1201 – RDNA 4 */
+#endif
+#if defined(__GFX11__)
+#define DS4_RDNA3   /* gfx1100–gfx1151 – RDNA 3 / 3.5 */
+#endif
+
 #define cudaError_t hipError_t
 #define cudaStream_t hipStream_t
 #define cudaEvent_t hipEvent_t

@@ -670,7 +670,13 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kerne
 }
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
+#if defined(DS4_RDNA4)
+/* gfx12 (RDNA 4): WMMA inputs are <8 x _Float16>, builtin has _gfx12 suffix */
+typedef _Float16 __attribute__((ext_vector_type(8)))  ds4_q8_wmma_half_t;
+#else
+/* gfx11 (RDNA 3/3.5): WMMA inputs are <16 x _Float16> */
+typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_wmma_half_t;
+#endif
 typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
 
 /* Four-wave, 64x64 output-tile Q8_0 batched GEMM for large prefill chunks.
@@ -737,8 +743,41 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
 
         const int8_t *w0 = (const int8_t *)(bp + 2u);
         const int8_t *w1 = (const int8_t *)(bp + 18u);
-        ds4_q8_half16_t a0;
-        ds4_q8_half16_t a1;
+
+#if defined(DS4_RDNA4)
+        /* gfx12: 8-element input fragments, _gfx12 builtin */
+        ds4_q8_wmma_half_t a0;
+        ds4_q8_wmma_half_t a1;
+#pragma unroll
+        for (uint32_t i = 0; i < 8u; i++) {
+            a0[i] = sc * (_Float16)(float)(int)w0[i];
+            a1[i] = sc * (_Float16)(float)(int)w1[i];
+        }
+
+#pragma unroll
+        for (uint32_t ntile = 0; ntile < N_TILES_PER_WARP; ntile++) {
+            const uint32_t nt = ntile * 16u + lane16;
+            const _Float16 *xb = lds_x + nt * K_TILE;
+            const ds4_q8_wmma_half_t b0 = *(const ds4_q8_wmma_half_t *)(xb);
+            const ds4_q8_wmma_half_t b1 = *(const ds4_q8_wmma_half_t *)(xb + 8u);
+            if (ntile == 0u) {
+                acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, acc0);
+                acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, acc0);
+            } else if (ntile == 1u) {
+                acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, acc1);
+                acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, acc1);
+            } else if (ntile == 2u) {
+                acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, acc2);
+                acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, acc2);
+            } else {
+                acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, acc3);
+                acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, acc3);
+            }
+        }
+#else
+        /* gfx11: 16-element input fragments */
+        ds4_q8_wmma_half_t a0;
+        ds4_q8_wmma_half_t a1;
 #pragma unroll
         for (uint32_t i = 0; i < 16u; i++) {
             a0[i] = sc * (_Float16)(float)(int)w0[i];
@@ -749,8 +788,8 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         for (uint32_t ntile = 0; ntile < N_TILES_PER_WARP; ntile++) {
             const uint32_t nt = ntile * 16u + lane16;
             const _Float16 *xb = lds_x + nt * K_TILE;
-            const ds4_q8_half16_t b0 = *(const ds4_q8_half16_t *)(xb);
-            const ds4_q8_half16_t b1 = *(const ds4_q8_half16_t *)(xb + 16u);
+            const ds4_q8_wmma_half_t b0 = *(const ds4_q8_wmma_half_t *)(xb);
+            const ds4_q8_wmma_half_t b1 = *(const ds4_q8_wmma_half_t *)(xb + 16u);
             if (ntile == 0u) {
                 acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc0);
                 acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc0);
@@ -765,6 +804,7 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
                 acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc3);
             }
         }
+#endif /* DS4_RDNA4 */
         __syncthreads();
     }
 
@@ -780,6 +820,7 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         }
     }
 }
+
 
 template <int TILES_N=8, int BM=16, int BN=16, int BK=16>
 __global__ static void matmul_q8_0_f32_batch_wmma_onthefly_kernel(
