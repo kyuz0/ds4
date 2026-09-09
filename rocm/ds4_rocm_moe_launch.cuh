@@ -826,9 +826,17 @@ static int routed_moe_launch(
             gate_row_bytes == 1320u && gate_expert_bytes == 3041280u &&
             down_row_bytes == 756u && down_expert_bytes == 3870720u &&
             ds4_rocm_is_gfx1151();
+        /* GLM-5.3 Flash has 288 experts, beyond the generic admission cap.
+         * Admit only its resident IQ2 gate/up and Q2 down topology on gfx1151;
+         * the existing checks below still exclude quality and small batches. */
+        const uint32_t glm53_iq2_mmq_topology =
+            g_glm_model && !g_ssd_streaming_mode && ds4_rocm_is_gfx1151() &&
+            n_total_expert == DS4_ROCM_GLM53_N_EXPERT &&
+            n_expert == 8u && expert_in_dim == 4096u &&
+            expert_mid_dim == 2048u && out_dim == 4096u;
         const uint32_t use_rocm_mmq_gateup =
             ok && iq2_path && n_tokens >= 128u && !g_quality_mode &&
-            (n_total_expert <= 256u || v41_mmq_topology) &&
+            (n_total_expert <= 256u || v41_mmq_topology || glm53_iq2_mmq_topology) &&
             !batch_stream_selected && !batch_stream_split_selected &&
             !split_selected && !compact_selected && gate_w && up_w &&
             (stream_full_layer || full_table_cached) &&
