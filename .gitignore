@@ -38,6 +38,7 @@
 /tests/test_sampling
 /tests/test_web_recovery
 /tests/test_quality_api
+/tests/test_raw_completions
 /tests/test_cuda_q8_scratch
 /tests/test_cuda_dspark_moe
 /tests/test_session_state
