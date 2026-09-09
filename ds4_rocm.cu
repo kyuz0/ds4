@@ -60,6 +60,9 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_swiglu(
     float *gate, float *discard, float *mid_f32, void *mid_f16,
     int M, int K, int n_tokens, int n_experts, int n_expert_used,
     float clamp, cudaStream_t stream);
+extern "C" int ds4_mmq_q4_K_dense(
+    const void *W, const float *X_f32, float *out_f32,
+    int M, int N, int K, cudaStream_t stream);
 extern "C" int ds4_mmq_q8_0_dense_vec(
     const void *W, const float *X_f32, float *out_f32,
     int M, int N, int K, cudaStream_t stream);
