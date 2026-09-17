@@ -108,7 +108,7 @@ Measured with ROCm 10 on a 128 GB Strix Halo, resident weights and disk-only n-g
 | Q2 | 277 t/s | 462 t/s | 21.4 t/s |
 | Q4 | 297 t/s | 364 t/s | 20.0 t/s |
 
-These are native `ds4-bench` measurements with `speed-bench/promessi_sposi.txt`, 8192-token prefill chunks and 128 greedy generated tokens. Model loading is excluded. A matched run of the preceding ROCm candidate measured 279/464/21.4 t/s for Q2 and 292/360/20.0 t/s for Q4; the main integration preserves full frontier logits and decoded continuations. These are incremental engine timings, not end-to-end follow-up request throughput.
+These are native `ds4-bench` measurements with `speed-bench/promessi_sposi.txt`, 8192-token prefill chunks and 128 greedy generated tokens. Model loading is excluded. These are incremental engine timings, not end-to-end follow-up request throughput.
 
 On two coding prompts, each repeated with reversed ordinary/MTP ordering, Q2 generation measured 21.5–21.8 t/s ordinary and 23.9–24.9 t/s with MTP; Q4 measured 20.2–20.4 and 22.4–23.1 t/s respectively. All eight pairs produced identical text and passed the same executable checks. MTP verification counters confirmed speculation ran. This small sample does not predict acceptance or speed for every prompt.
 

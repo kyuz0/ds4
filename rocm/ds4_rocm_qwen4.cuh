@@ -649,11 +649,13 @@ __global__ void expert_tiles(unsigned *prefix, const int *counts, unsigned NE, u
 typedef _Float16 __attribute__((ext_vector_type(16))) half16;
 typedef float __attribute__((ext_vector_type(8))) float8;
 
-template<unsigned TYPE, bool DOWN, unsigned NT, unsigned NR = 64>
-__launch_bounds__(256)
+template<unsigned TYPE, bool DOWN, unsigned NT, unsigned NR = 64, unsigned WAVES = 8>
+__launch_bounds__(WAVES * 32)
 __global__ void matrix_half_tile(float *out, const float *x, const char *w0, const char *w1,
         const int *lists, const int *counts, const unsigned *tiles, unsigned NE,
         unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+    static_assert(NR % 16 == 0 && WAVES % (NR / 16) == 0 &&
+                  NT % (16 * (WAVES / (NR / 16))) == 0, "complete WMMA tiles");
     const unsigned tid=threadIdx.x, wave=tid/32, lane=tid%32, lane16=lane%16;
     const unsigned nr=(M+NR-1)/NR, job=blockIdx.x/nr;
     if (job >= tiles[NE]) return;
@@ -661,20 +663,20 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
     while (e<end) { const unsigned mid=(e+end)/2; if (tiles[mid+1]<=job) e=mid+1; else end=mid; }
     const unsigned count=counts[e], t0=(job-tiles[e])*NT, r0=(blockIdx.x%nr)*NR;
     const unsigned wr=wave%(NR/16), wc=wave/(NR/16);
-    constexpr unsigned NC=NT/(8/(NR/16));
+    constexpr unsigned NC=NT/(WAVES/(NR/16));
     // Padding avoids repeated LDS bank conflicts for bulk Q2 expert tiles.
     constexpr unsigned LD = NT >= 64 && (TYPE == 16 || TYPE == 10) ? 72 : 64;
     __shared__ _Float16 a[NR][LD], u[DOWN ? 1 : NR][LD], b[NT][LD];
     __shared__ uint64_t grid_table[TYPE == 16 ? 256 : 1];
     __shared__ uint8_t sign_table[TYPE == 16 ? 128 : 1];
     if (TYPE==16) {
-        for (unsigned i=tid;i<256;i+=256) grid_table[i]=cuda_iq2xxs_grid[i];
-        for (unsigned i=tid;i<128;i+=256) sign_table[i]=cuda_ksigns_iq2xs[i];
+        for (unsigned i=tid;i<256;i+=WAVES*32) grid_table[i]=cuda_iq2xxs_grid[i];
+        for (unsigned i=tid;i<128;i+=WAVES*32) sign_table[i]=cuda_ksigns_iq2xs[i];
         __syncthreads();
     }
     float8 acc[NC/16]={}, up[NC/16]={};
     for (unsigned k0=0;k0<K;k0+=64) {
-        for (unsigned i=tid*4;i<NR*64;i+=256*4) {
+        for (unsigned i=tid*4;i<NR*64;i+=WAVES*32*4) {
             const unsigned row=r0+i/64, k=k0+i%64;
             const uint64_t off=((uint64_t)e*M+row)*rb;
             float4 av = {}, uv = {};
@@ -694,7 +696,7 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
                 if (!DOWN) u[i/64][i%64+j]=(_Float16)((float *)&uv)[j];
             }
         }
-        for (unsigned i=tid;i<NT*64;i+=256) {
+        for (unsigned i=tid;i<NT*64;i+=WAVES*32) {
             const unsigned item=t0+i/64, k=k0+i%64;
             const unsigned pair=item<count ? lists[(uint64_t)e*cap+item] : 0;
             const uint64_t row=DOWN ? (uint64_t)(pair/NS)*NO+pair%NS : pair/NS;
@@ -734,7 +736,7 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
     }
 }
 
-/* Stage the next Q2 gate block in registers while consuming the LDS tile. */
+/* Stage the next gate block in registers while consuming the LDS tile. */
 template<unsigned TYPE, bool DOWN, unsigned NT, unsigned NR = 64>
 __launch_bounds__(256)
 __global__ void matrix_half_tile_prefetch(float *out, const float *x, const char *w0, const char *w1,
@@ -857,7 +859,8 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
     const dim3 grid((M + 15) / 16, lists ? NE : 1, std::min(8u, (T + 15) / 16));
     const uint64_t rb = expert_row_bytes(type, K);
         if (ds4_rocm_is_gfx1151() && lists && !g_quality_mode && (type == 16 || type == 10 || type == 12 || type == 39)) {
-            const unsigned nt = T >= 2048 ? (down ? 64 : 128) : 32;
+            /* Four waves cover a short routed list with less padded work. */
+            const unsigned nt = T >= 2048 ? (down ? 64 : 128) : T <= 256 ? 16 : 32;
             unsigned *tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
             if (!tiles) return 0;
             expert_tiles<<<1,1,0,0>>>(tiles,counts,NE,nt);
@@ -867,9 +870,10 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
             const uint64_t blocks = (((uint64_t)T*NS+nt-1)/nt+NE)*((M+nr-1)/nr);
             if (blocks > INT_MAX) return 0;
 #define QWEN_HALF(TYPE, DOWN) \
-            if (nt == 128 && TYPE == 16 && !DOWN && !(K%64)) matrix_half_tile_prefetch<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+            if (nt == 128 && (TYPE == 16 || (TYPE == 12 && T >= 7168)) && !DOWN && !(K%64)) matrix_half_tile_prefetch<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
             else if (nt == 128) matrix_half_tile<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
             else if (nt == 64) matrix_half_tile<TYPE,DOWN,64,((TYPE == 10 || TYPE == 16) ? 64 : 128)><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+            else if (nt == 16) matrix_half_tile<TYPE,DOWN,16,64,4><<<blocks,128,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
             else matrix_half_tile<TYPE,DOWN,32><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb)
 #define QWEN_HALF_TYPE(TYPE) case TYPE: if (down) { QWEN_HALF(TYPE,true); } else { QWEN_HALF(TYPE,false); } break
             switch (type) { QWEN_HALF_TYPE(16); QWEN_HALF_TYPE(10); QWEN_HALF_TYPE(12); QWEN_HALF_TYPE(39); }
