@@ -187,6 +187,8 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 #include "rocm/ds4_rocm_deepseek4_vision.cuh"
 
+#include "rocm/ds4_rocm_qwen4.cuh"
+
 #include "rocm/ds4_rocm_tp.cuh"
 
 extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {

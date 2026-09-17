@@ -1352,8 +1352,6 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
 
-#ifdef __APPLE__
-/* Native cross-session row kernels are Metal-only; CUDA uses ordered rows. */
 static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta, uint64_t offa,
                        const ds4_gpu_tensor *tb, uint64_t offb, uint64_t bytes) {
     uint8_t *a = malloc(bytes), *b = malloc(bytes);
@@ -1372,6 +1370,8 @@ static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta,
  * bit for bit: the caches written, the block key, scores, selection, token
  * list and output.  Rows: dense, dense completing a block, sparse completing
  * a block on the plain selector's width, sparse on the prefiltered width. */
+#ifdef __APPLE__
+/* These native session-batch APIs currently have a Metal implementation only. */
 static void test_attention_rows(arena_t *a) {
     const uint32_t H = 8, Hkv = 2, D = 256, n_rot = 64, Hi = 4, Di = 128, k_blocks = 4, ratio = 4, R = 4;
     const uint32_t sparse_pos = (k_blocks + 1) * ratio - 1;
@@ -1527,7 +1527,6 @@ static void test_attention_rows(arena_t *a) {
     free(ik); free(iq); free(vp); free(kp); free(qg);
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
-
 #endif
 
 /* ---- routed experts ---- */
@@ -2030,8 +2029,14 @@ static void test_mv_ext_groups(arena_t *a) {
                 for (uint32_t mode = 0; mode < 4u; mode++) {
                     require_ok(setenv("DS4_METAL_MV_EXT_NSG", groups[mode], 1) == 0, "mv_ext groups override");
                     require_ok(ds4_gpu_tensor_fill_f32(go, 127.25f, n + guard) &&
+#if !defined(__APPLE__)
+                        ds4_gpu_qwen4_dense_mm_tensor(go, gx, a->base, a->size,
+                            off, wt ? 1u : 8u, T, in_dim, rows)
+#else
                         (wt ? ds4_gpu_matmul_f16_tensor(go, a->base, a->size, off, in_dim, rows, gx, T)
-                            : ds4_gpu_qwen4_matmul_q8_0_tensor(go, a->base, a->size, off, in_dim, rows, gx, T)) &&
+                            : ds4_gpu_qwen4_matmul_q8_0_tensor(go, a->base, a->size, off, in_dim, rows, gx, T))
+#endif
+                        &&
                         ds4_gpu_tensor_read(go, 0, mode ? got : ref, (n + guard) * sizeof(float)), "mv_ext groups dispatch/read");
                     if (mode) check_exact_f32(wt ? "F16 mv_ext groups and guard" : "Q8 mv_ext groups and guard", got, ref, n + guard);
                     else check_exact_f32("mv_ext groups reference finite", ref, ref, n + guard);
@@ -2045,9 +2050,10 @@ static void test_mv_ext_groups(arena_t *a) {
     printf("few-row matvec simdgroup counts: Q8 and F16 verify-row shapes exact at 1/2/4/8 groups\n");
 }
 
-#ifdef __APPLE__
 /* The grouped decode-batch kernels must reproduce the per-token kernels bit
  * for bit under heavy expert reuse (sixteen rows over eight experts). */
+#ifdef __APPLE__
+/* These native session-batch APIs currently have a Metal implementation only. */
 static void test_moe_grouped(arena_t *a) {
     const uint32_t NE = 8, slots = 6, E = 2560, F = 640, T = 16, cap = 64;
     double *gate_w, *up_w, *down_w;
@@ -2086,7 +2092,6 @@ static void test_moe_grouped(arena_t *a) {
     ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
     free(sel); free(x);
 }
-
 #endif
 
 static void test_hc_pair_groups(arena_t *a) {
@@ -3428,9 +3433,85 @@ static void test_half_expert_tiles(arena_t *a, uint32_t T, uint32_t type, uint32
 }
 #endif
 
-#ifdef __APPLE__
+#ifdef DS4_ROCM_BUILD
+/* Default bulk F16/Q8 projections use power-of-two-scaled F16 operands and
+ * FP32 accumulation/output. The CPU oracle rounds operands independently and
+ * accumulates in double; every output and guard is checked. Original FP32
+ * differences are reported separately. Model-quality tests are also required.
+ * Quality-mode projections retain the original double-reference checks below. */
+static double dense_half_reference_scale(const float *p, unsigned n) {
+    float mx=0; for(unsigned k=0;k<n;k++) mx=fmaxf(mx,fabsf(p[k]));
+    int exponent=0; if(mx) { frexpf(mx,&exponent); exponent--; }
+    if (exponent < -120) exponent = -120;
+    if (exponent > 120) exponent = 120;
+    return ldexp(1.0,exponent);
+}
+static void test_dense_half_operands(arena_t *a,unsigned type,unsigned K,unsigned M,unsigned T) {
+    const unsigned P=17,guard=64;const uint64_t n=(uint64_t)T*M;
+    double *w;uint64_t off=type==8?arena_q8_0(a,M,K,&w,.05f):arena_f16(a,(uint64_t)M*K,&w,.05f);
+    float *patterns=rand_vec((uint64_t)P*K,1.0f),*x=malloc((uint64_t)T*K*4),*wr=malloc((uint64_t)K*4);
+    double *rounded=calloc((uint64_t)P*M,sizeof(double)),*original=calloc((uint64_t)P*M,sizeof(double));
+    double *sx=malloc(P*sizeof(double)),*sw=malloc(M*sizeof(double));
+    require_ok(patterns&&x&&wr&&rounded&&original&&sx&&sw,"leading oracle allocation");
+    for(unsigned p=0;p<P;p++) {
+        // Include representable scale extremes; scaled F16 stays finite.
+        const float multiplier=p==0?0x1p20f:p==1?0x1p-20f:1.0f;
+        for(unsigned k=0;k<K;k++) patterns[(uint64_t)p*K+k]*=multiplier;
+        sx[p]=dense_half_reference_scale(patterns+(uint64_t)p*K,K);
+    }
+    for(unsigned m=0;m<M;m++) {
+        for(unsigned k=0;k<K;k++) wr[k]=(float)w[(uint64_t)m*K+k];
+        sw[m]=type==8?dense_half_reference_scale(wr,K):1;
+        for(unsigned p=0;p<P;p++) {
+            double z=0,full=0;
+            for(unsigned k=0;k<K;k++) {
+                const double xv=patterns[(uint64_t)p*K+k],wv=wr[k];
+                const double xh=(double)(_Float16)(float)(xv/sx[p]);
+                const double wh=type==8?(double)(_Float16)(float)(wv/sw[m]):wv;
+                z+=xh*wh;full+=xv*wv;
+            }
+            rounded[(uint64_t)p*M+m]=z*sx[p]*sw[m];original[(uint64_t)p*M+m]=full;
+        }
+    }
+    for(unsigned t=0;t<T;t++) memcpy(x+(uint64_t)t*K,patterns+(uint64_t)(t%P)*K,K*4);
+    ds4_gpu_tensor *gx=upload(x,(uint64_t)T*K),*go=upload(NULL,n+guard);
+    double absmax=0,scale=1e-30,fp32diff=0,scales[P],worst_relative=0;
+    for(unsigned p=0;p<P;p++) { scales[p]=1e-30;for(unsigned m=0;m<M;m++) scales[p]=fmax(scales[p],fabs(rounded[(uint64_t)p*M+m])); }
+    for(unsigned repeat=0;repeat<2;repeat++) {
+        require_ok(ds4_gpu_tensor_fill_f32(go,17.25f,n+guard),"leading fill");
+        require_ok(ds4_gpu_qwen4_dense_mm_tensor(go,gx,a->base,a->size,off,type,T,K,M)&&ds4_gpu_synchronize(),"leading projection");
+        float *got=download(go,n+guard);
+        for(unsigned t=0;t<T;t++) for(unsigned m=0;m<M;m++) {
+            const double expected=rounded[(uint64_t)(t%P)*M+m],v=got[(uint64_t)t*M+m];
+            require_ok(isfinite(v),"finite leading output");
+            absmax=fmax(absmax,fabs(v-expected));scale=fmax(scale,fabs(expected));
+            worst_relative=fmax(worst_relative,fabs(v-expected)/scales[t%P]);
+            fp32diff=fmax(fp32diff,fabs(v-original[(uint64_t)(t%P)*M+m]));
+        }
+        for(unsigned g=0;g<guard;g++) require_ok(got[n+g]==17.25f,"leading output guard");
+        free(got);
+    }
+    printf("leading type=%u K=%u M=%u T=%u outputs=%llu error=%.9g scale=%.9g relative=%.9g fp32_max_diff=%.9g\n",type,K,M,T,(unsigned long long)n,absmax,scale,worst_relative,fp32diff);
+    require_ok(worst_relative<=3e-5,"per-pattern half-operand accumulation bound");
+    ds4_gpu_tensor_free(gx);ds4_gpu_tensor_free(go);free(w);free(patterns);free(x);free(wr);free(rounded);free(original);free(sx);free(sw);
+}
+static void test_dense_half_suite(arena_t *a) {
+    test_dense_half_operands(a,1,10240,320,33);
+    test_dense_half_operands(a,1,320,10240,40);
+    test_dense_half_operands(a,8,2560,6144,33);
+    test_dense_half_operands(a,8,10240,1700,32);
+    test_dense_half_operands(a,1,67,97,35);
+    test_dense_half_operands(a,8,96,129,35);
+    test_dense_half_operands(a,1,64,2051,8201);
+    test_dense_half_operands(a,8,64,2051,8201);
+}
+#endif
+
+/* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
 /* The decode-batch Q8 GEMM: reference in double, and the same sums the
  * per-token matvec finds, to rounding. */
+#ifdef __APPLE__
+/* These native session-batch APIs currently have a Metal implementation only. */
 static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T) {
     double *sh;
     const uint64_t off = arena_q8_0(a, rows, in_dim, &sh, 0.05f);
@@ -3460,10 +3541,8 @@ static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_
     free(bm); free(am); free(ref); free(x); free(sh);
     ds4_gpu_tensor_free(gmv); ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
-
 #endif
 
-/* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
 static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T, uint32_t wtype) {
     double *sh;
     uint64_t off = wtype == 8u ? arena_q8_0(a, rows, in_dim, &sh, 0.05f)
@@ -3479,10 +3558,18 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
         }
     ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim);
     ds4_gpu_tensor *gout = upload(NULL, (uint64_t)T * rows);
+#ifdef DS4_ROCM_BUILD
+    /* Default half-operand bulk arithmetic is checked independently above. */
+    const int quality = T >= 32 && (wtype == 1 || wtype == 8);
+    if (quality) ds4_gpu_set_quality(true);
+#endif
     require_ok(ds4_gpu_qwen4_dense_mm_tensor(gout, gx, a->base, a->size, off, wtype, T, in_dim, rows), "dense mm");
     char name[96];
     snprintf(name, sizeof(name), "dense mm type %u %ux%u T=%u", wtype, rows, in_dim, T);
     check_tensor(name, gout, ref, (uint64_t)T * rows, 3e-5);
+#ifdef DS4_ROCM_BUILD
+    if (quality) ds4_gpu_set_quality(false);
+#endif
     free(ref); free(x); free(sh);
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
@@ -3513,6 +3600,9 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
     for (uint32_t i = 0; i < guard; i++) ref[count+i] = 17.25;
     ds4_gpu_tensor *gx = upload(x, (uint64_t)T*K);
     ds4_gpu_tensor *out = upload(NULL, count+guard);
+#ifdef DS4_ROCM_BUILD
+    ds4_gpu_set_quality(true);
+#endif
     for (unsigned repeat = 0; repeat < 2; repeat++) {
         require_ok(ds4_gpu_tensor_fill_f32(out, 17.25f, count+guard), "large dense guard fill");
         require_ok(ds4_gpu_qwen4_dense_mm_tensor(out, gx, a->base, a->size,
@@ -3523,6 +3613,9 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
         require_ok(ds4_gpu_tensor_read(out, count*4u, got_guard, sizeof(got_guard)), "large dense guard read");
         for (unsigned i = 0; i < guard; i++) require_ok(got_guard[i] == 17.25f, "large dense output guard");
     }
+#ifdef DS4_ROCM_BUILD
+    ds4_gpu_set_quality(false);
+#endif
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gx);
     free(ref); free(dots); free(x); free(rows); free(weights);
 }
@@ -3541,6 +3634,9 @@ int main(void) {
 #ifndef __APPLE__
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
     if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
+#ifdef DS4_ROCM_BUILD
+        test_dense_half_suite(&arena);
+#endif
         test_dense_mm_large(&arena, 1u);
         test_dense_mm_large(&arena, 8u);
         test_dense_mm(&arena, 10240, 1700, 32, 8u);
@@ -3595,6 +3691,9 @@ int main(void) {
         bench_dispatch(&arena);
         return 0;
     }
+#ifndef __APPLE__
+    printf("Metal-only session-batch kernel tests are not applicable on this backend.\n");
+#endif
     printf("hyper-connections\n");
     test_decode_fusions(&arena);
     test_qwen4_argmax();
@@ -3670,10 +3769,17 @@ int main(void) {
     test_moe_mm_tiles_exact(&arena, 39u);
     test_moe_mm_tiles_iq2(&arena);
     printf("dense mm\n");
+#ifdef DS4_ROCM_BUILD
+    test_dense_half_suite(&arena);
+#endif
     test_dense_mm(&arena, 2560, 512, 37, 0u);
 #ifdef __APPLE__
     test_batch_mm_q8(&arena, 2560, 640, 16);
+#endif
+#ifdef __APPLE__
     test_batch_mm_q8(&arena, 6144, 2560, 16);
+#endif
+#ifdef __APPLE__
     test_batch_mm_q8(&arena, 2560, 128, 8);
 #endif
     test_dense_mm(&arena, 10240, 320, 33, 1u);

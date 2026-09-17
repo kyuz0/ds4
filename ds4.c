@@ -50,7 +50,7 @@
 #if !defined(DS4_NO_GPU)
 #define DS4_HAS_DEEPSEEK41_GPU 1
 #endif
-#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+#if !defined(DS4_NO_GPU)
 #define DS4_HAS_QWEN4_GPU 1
 #ifdef __APPLE__
 #define DS4_HAS_QWEN4_METAL 1
@@ -3428,11 +3428,10 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     }
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
-        if (t->bytes == 0) continue;
+        if (t->bytes == 0 || t == m->ngram_tensor) continue;
 #ifdef DS4_ROCM_BUILD
         if (model_tensor_is_disk_only_engram(m, t)) continue;
 #else
-        if (t == m->ngram_tensor) continue;
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
             (ds4_streq(t->name, "blk.1.engram_embd.weight") ||
              ds4_streq(t->name, "blk.14.engram_embd.weight"))) continue;
@@ -59702,8 +59701,8 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
     const uint64_t out_dim = rows && rows < full_dim ? rows : full_dim;
     int rc = 0;
 #if !defined(__APPLE__)
-    /* Qwen's recurrent graph keeps activations in FP32. The generic CUDA
-     * projections can round them to half or quantize them for other models. */
+    /* Qwen's recurrent graph uses FP32 activation buffers. Keep its projection
+     * dispatch separate so each backend can select bulk and decode kernels. */
     if (in_dim <= UINT32_MAX && out_dim <= UINT32_MAX)
         rc = ds4_gpu_qwen4_dense_mm_tensor(out, x, m->map, m->size, w->abs_offset,
                                            w->type, n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
@@ -72383,7 +72382,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
             e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
             (opt->mtp_path && opt->mtp_path[0])) {
-            fprintf(stderr, "ds4: Qwen3.8 requires Metal or single-GPU CUDA (or --cpu --first-token-test); "
+            fprintf(stderr, "ds4: Qwen3.8 requires Metal or single-GPU CUDA/ROCm (or --cpu --first-token-test); "
                             "tensor parallelism, pipeline execution, SSD streaming, DSpark, "
                             "external MTP models and power throttling are not supported\n");
             ds4_engine_close(e);
@@ -72657,7 +72656,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         if (opt->first_token_test) {
             if (e->backend != DS4_BACKEND_CPU && e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) {
-                fprintf(stderr, "ds4: Qwen3.8 first-token test needs CPU, Metal or CUDA\n");
+                fprintf(stderr, "ds4: Qwen3.8 first-token test needs CPU, Metal, CUDA or ROCm\n");
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -74784,7 +74783,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         if (ds4_model_is_qwen4()) {
-            fprintf(stderr, "ds4: Qwen3.8 sessions require Metal or CUDA\n");
+            fprintf(stderr, "ds4: Qwen3.8 sessions require Metal, CUDA or ROCm\n");
             return 1;
         }
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
@@ -74892,7 +74891,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (ds4_model_is_qwen4()) {
         if ((e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) ||
             e->distributed.role != DS4_DISTRIBUTED_NONE) {
-            fprintf(stderr, "ds4: Qwen3.8 sessions require single-host Metal or CUDA\n");
+            fprintf(stderr, "ds4: Qwen3.8 sessions require single-host Metal, CUDA or ROCm\n");
             free(s);
             return 1;
         }

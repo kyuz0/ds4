@@ -582,7 +582,8 @@ static const char *cuda_model_range_ptr(
         const void *model_map,
         uint64_t offset,
         uint64_t bytes,
-        const char *what);
+        const char *what,
+        bool allow_host_registration = true);
 static int cuda_model_range_is_cached(
         const void *model_map,
         uint64_t offset,
@@ -5175,7 +5176,7 @@ static const char *cuda_model_range_copy_uncached(
     return (const char *)dev;
 }
 
-static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what, bool allow_host_registration) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     const char *image_ptr =
         cuda_model_image_range_ptr(model_map, offset, bytes);
@@ -5216,7 +5217,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     }
 
     cudaError_t err = cudaSuccess;
-    if (g_model_range_mapping_supported && model_map == g_model_host_base) {
+    if (allow_host_registration && g_model_range_mapping_supported && model_map == g_model_host_base) {
         const long page_sz_l = sysconf(_SC_PAGESIZE);
         const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
         const uintptr_t host_addr = (uintptr_t)((const char *)model_map + offset);
