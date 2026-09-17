@@ -12,6 +12,8 @@ struct cuda_hipblaslt_gemm_plan {
     uint32_t out_dim;
     uint32_t n_tok;
     uint32_t in_dim;
+    uint32_t output_stride;
+    uint32_t input_stride;
     hipDataType output_type;
     int solution_index;
     hipblasLtMatmulDesc_t desc;
@@ -48,11 +50,17 @@ static cuda_hipblaslt_gemm_plan *hipblaslt_gemm_plan_get(
         uint32_t in_dim,
         const char *label,
         hipDataType output_type = HIP_R_16F,
-        int solution_index = -1) {
+        int solution_index = -1,
+        uint32_t output_stride = 0,
+        uint32_t input_stride = 0) {
+    if (!output_stride) output_stride = out_dim;
+    if (!input_stride) input_stride = in_dim;
+    if (output_stride < out_dim || input_stride < in_dim) return NULL;
     for (size_t i = 0; i < g_hipblaslt_gemm_plans.size(); i++) {
         cuda_hipblaslt_gemm_plan &p = g_hipblaslt_gemm_plans[i];
         if (p.out_dim == out_dim && p.n_tok == n_tok && p.in_dim == in_dim &&
-            p.output_type == output_type && p.solution_index == solution_index) return &p;
+            p.output_type == output_type && p.solution_index == solution_index &&
+            p.output_stride == output_stride && p.input_stride == input_stride) return &p;
     }
 
     hipblasLtMatmulDesc_t desc = NULL;
@@ -72,13 +80,13 @@ static cuda_hipblaslt_gemm_plan *hipblaslt_gemm_plan_get(
         if (!hipblaslt_ok(hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB,
                                                           &op_b, sizeof(op_b)),
                           "set transB")) break;
-        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&a_desc, HIP_R_16F, in_dim, out_dim, in_dim),
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&a_desc, HIP_R_16F, in_dim, out_dim, input_stride),
                           "A layout create")) break;
-        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&b_desc, HIP_R_16F, in_dim, n_tok, in_dim),
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&b_desc, HIP_R_16F, in_dim, n_tok, input_stride),
                           "B layout create")) break;
-        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&c_desc, output_type, out_dim, n_tok, out_dim),
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&c_desc, output_type, out_dim, n_tok, output_stride),
                           "C layout create")) break;
-        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&d_desc, output_type, out_dim, n_tok, out_dim),
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&d_desc, output_type, out_dim, n_tok, output_stride),
                           "D layout create")) break;
         if (solution_index >= 0) {
             std::vector<int> indices{solution_index};
@@ -128,6 +136,8 @@ static cuda_hipblaslt_gemm_plan *hipblaslt_gemm_plan_get(
     p.out_dim = out_dim;
     p.n_tok = n_tok;
     p.in_dim = in_dim;
+    p.output_stride = output_stride;
+    p.input_stride = input_stride;
     p.output_type = output_type;
     p.solution_index = solution_index;
     p.desc = desc;

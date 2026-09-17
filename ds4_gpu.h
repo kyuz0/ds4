@@ -712,8 +712,7 @@ int ds4_gpu_matmul_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
-#if !defined(DS4_ROCM_BUILD)
-/* Qwen projections preserve FP32 activations on both GPU backends. */
+/* Qwen-specific projections accept FP32 activation buffers. */
 int ds4_gpu_qwen4_matmul_q8_0_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -723,9 +722,6 @@ int ds4_gpu_qwen4_matmul_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
-#else
-#define ds4_gpu_qwen4_matmul_q8_0_tensor ds4_gpu_matmul_q8_0_tensor
-#endif
 
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,

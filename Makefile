@@ -818,7 +818,7 @@ cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq
 cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -c -o $@ $<
 
-ds4_rocm.o: rocm/ds4_rocm_v41_gate_up.h ds4_rocm.cu ds4_rocm.h ds4_rocm_memory.h ds4_linux_memory.h ds4_gpu.h ds4_gpu_tp.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS) ds4_deepseek41_gpu.h rocm/halo/output_b/code.inc $(wildcard rocm/ds4_rocm_halo*.h rocm/halo/attention/*.hpp rocm/halo/attention/*.cuh rocm/halo/output_a_uncached/*.hpp rocm/halo/q2/*.hpp)
+ds4_rocm.o: rocm/ds4_rocm_v41_gate_up.h ds4_rocm.cu ds4_rocm.h ds4_rocm_memory.h ds4_linux_memory.h ds4_gpu.h ds4_gpu_tp.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_qwen4_vision.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS) ds4_deepseek41_gpu.h rocm/halo/output_b/code.inc $(wildcard rocm/ds4_rocm_halo*.h rocm/halo/attention/*.hpp rocm/halo/attention/*.cuh rocm/halo/output_a_uncached/*.hpp rocm/halo/q2/*.hpp)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
 cuda/mmq/ds4_ggml_stubs.rocm.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh cuda/mmq/vendors/hip.h ds4_rocm_memory.h ds4_linux_memory.h
@@ -1195,11 +1195,51 @@ clean:
 	rm -f tests/test_metal_tp_cancel
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_image_decode
-	rm -f tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_vision tests/test_qwen4_prefill
+	rm -f ds4-kernel-qwen-production tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_rocm tests/test_qwen4_vision tests/test_qwen4_prefill
 	rm -f speed-bench/session_concurrency_bench
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
+
+# Qwen independent CPU-reference kernels linked to the actual HIP backend.
+tests/test_qwen4_rocm.o: tests/test_qwen4_kernels.c ds4_gpu.h ds4.h ds4_qwen4_vision.h
+	$(CC) $(QUALITY_CFLAGS) $(ROCM_HOST_CFLAGS) -D_GNU_SOURCE -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/qwen4_image_rocm.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
+	$(CC) $(CFLAGS) $(ROCM_HOST_CFLAGS) -c -o $@ $<
+
+tests/test_qwen4_rocm: tests/test_qwen4_rocm.o ds4_rocm.o tests/qwen4_image_rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+.PHONY: test-qwen4-rocm
+test-qwen4-rocm: tests/test_qwen4_rocm
+	./tests/test_qwen4_rocm
+
+# Full-output oracle with production dimensions, expert count and GGUF strides.
+tests/test_qwen4_rocm_production.o: tests/test_qwen4_rocm_production.c tests/test_qwen4_kernels.c ds4_gpu.h ds4.h
+	$(CC) $(QUALITY_CFLAGS) $(ROCM_HOST_CFLAGS) -D_GNU_SOURCE -DDS4_ROCM_BUILD -Wno-unused-function -I. -c -o $@ $<
+
+ds4-kernel-qwen-production: tests/test_qwen4_rocm_production.o ds4_rocm.o tests/qwen4_image_rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+.PHONY: test-qwen4-rocm-production
+test-qwen4-rocm-production: ds4-kernel-qwen-production
+	@for quant in Q2 Q4; do for rows in 33 2049 8193; do ./ds4-kernel-qwen-production $$quant $$rows || exit 1; done; done
+
+# Build Qwen model-backed QA with the same HIP objects as the frontends.
+.PHONY: qwen4-rocm-qa-build
+qwen4-rocm-qa-build:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test \
+		gguf-tools/quality-testing/score_official \
+		tests/test_qwen4_ngram_state tests/test_qwen4_prefill tests/test_qwen4_vision \
+		tests/test_cuda_session_batch tests/test_cuda_mixed_batch \
+		tests/test_qwen4_rocm ds4-kernel-qwen-production \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)" \
+		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
+		QUALITY_CFLAGS="$(QUALITY_CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
+		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
+		DS4_LINK_LIBS="$(ROCM_LDLIBS)" \
+		NVCC="$(HIPCC)" NVCCFLAGS="$(ROCM_CFLAGS)" CUDA_LDLIBS="$(ROCM_LDLIBS)"
 
 # Compare production 2K/4K gate/up outputs with the current MMQ epilogue.
 tests/test_halo_moe_rocm.o: tests/test_halo_moe_rocm.cu cuda/mmq/ds4_mmq.h rocm/ds4_rocm_halo_moe.h
