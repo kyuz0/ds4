@@ -3,7 +3,7 @@
 [Back to README](../README.md)
 
 Qwen3.8-Flash-Next uses the `qwen4exp` GGUF architecture and a dedicated
-Metal/CUDA graph with gated delta-net, gated GQA, block-sparse attention,
+Metal/CUDA/ROCm graph with gated delta-net, gated GQA, block-sparse attention,
 hyper-connections, n-gram embeddings, MoE, and MTP.
 
 ## Download and run
@@ -86,6 +86,32 @@ throughput: adding 32 tokens after an 8K Q4 prefix took about 273 ms.
 MTP speed depends on how often drafts are accepted; the table measures
 ordinary decoding.
 
+## AMD Strix Halo / ROCm
+
+On a 128 GB Strix Halo (`gfx1151`), build with `make rocm ROCM_ARCH=gfx1151`. Use the same Q2/Q4 GGUF files; no requantization is required. Both fit resident with the original BF16 n-gram table left on local SSD. Allow additional memory for the context, runtime buffers and optional vision encoder.
+
+```sh
+make rocm ROCM_ARCH=gfx1151
+./ds4 --rocm -m /path/to/Qwen3.8-Flash-Next-Q2.gguf --ctx 8192 --prefill-chunk 8192
+```
+
+MTP weights are included in the model. Add `--mtp` for speculative decoding, or `--mtp --mtp-exact-sampling` for exact sampling. Vision requires the separate encoder and the same `--vision` option described below. The common session/checkpoint format includes the recurrent state; no ROCm-specific checkpoint conversion is needed.
+
+For ROCm server MTP, leave `--batched-session` unset. Enabling that option, including `--batched-session 1`, disables speculative decoding on this backend and uses ordinary decoding. Native batched MTP is currently Metal-only. To verify that Qwen MTP actually ran, add `--mtp-timing` and check for a positive verification-cycle count in the session shutdown log.
+
+Expert prefill uses wave32 WMMA with the actual IQ2_XXS/Q2_K and Q4_K/MXFP4 layouts, including Q2's padded down rows. Default bulk F16/Q8 projections use power-of-two scaling and FP16 operands with FP32 accumulation and output. This intentionally rounds operands; `--quality` retains the FP32 projection and expert reference paths, and few-token decoding keeps its existing matrix-vector path. The tested ROCm 10 hipBLASLt build uses a supported zero-workspace WMMA solution; other library revisions or unsupported shapes keep the BLAS fallback. Other AMD GPU architectures have not been qualified.
+
+Measured with ROCm 10 on a 128 GB Strix Halo, resident weights and disk-only n-grams:
+
+| Quant | Fresh 1024-token prefill | 7168-token append to 8192 | Ordinary decode at 8192 |
+| --- | ---: | ---: | ---: |
+| Q2 | 277 t/s | 462 t/s | 21.4 t/s |
+| Q4 | 297 t/s | 364 t/s | 20.0 t/s |
+
+These are native `ds4-bench` measurements with `speed-bench/promessi_sposi.txt`, 8192-token prefill chunks and 128 greedy generated tokens. Model loading is excluded. A matched run of the preceding ROCm candidate measured 279/464/21.4 t/s for Q2 and 292/360/20.0 t/s for Q4; the main integration preserves full frontier logits and decoded continuations. These are incremental engine timings, not end-to-end follow-up request throughput.
+
+On two coding prompts, each repeated with reversed ordinary/MTP ordering, Q2 generation measured 21.5–21.8 t/s ordinary and 23.9–24.9 t/s with MTP; Q4 measured 20.2–20.4 and 22.4–23.1 t/s respectively. All eight pairs produced identical text and passed the same executable checks. MTP verification counters confirmed speculation ran. This small sample does not predict acceptance or speed for every prompt.
+
 ## Conversion
 
 See [GGUF conversion](../gguf-tools/README.md) for conversion from the HF
@@ -151,13 +177,10 @@ The test checks that all four turns complete in each mode, including errors
 that the interactive CLI can report without a nonzero process exit. It saves
 the responses and diagnostics for inspection; it does not grade image content.
 
-The Metal and CUDA graphs accept Q8_0, Q4_0, F16, BF16 and F32
+The GPU graphs accept Q8_0, Q4_0, F16, BF16 and F32
 dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
 hyper-connection mixers and the original BF16 n-gram table.
-Tensor parallelism, pipeline execution and SSD expert streaming are not
-implemented for this model yet.
-ROCm is not supported. CPU code is a correctness reference, not a general
-inference backend.
+Tensor parallelism, pipeline execution and SSD expert streaming are not implemented for this model yet. Native multi-session decode batching is currently Metal-only; ROCm keeps separate session state and decodes ready sessions in order. CPU code is a correctness reference, not a general inference backend.
 
 
 ## Validation
@@ -172,10 +195,11 @@ python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_pack.py
 python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_native_ngrams.py
 ```
 
-On CUDA, use `make test-qwen4-cuda` for the kernel tests. They compare the
-active kernels with independent CPU references, without model weights.
+On CUDA, use `make test-qwen4-cuda` for the kernel tests. On ROCm, use `make test-qwen4-rocm` and `make test-qwen4-rocm-production`. They compare the active kernels with independent CPU references, without model weights. The default bulk dense oracle independently models scaling and FP16 rounding before double accumulation; quality mode retains its FP32-reference bounds. The production ROCm expert oracle checks every output for both quants at 33, 2049 and 8193 tokens, including real model dimensions, 512 experts, padded down rows, hot and empty experts, reserved slots and output guards.
+For the model-backed ROCm checks below, first run `make qwen4-rocm-qa-build ROCM_ARCH=gfx1151`. This builds the five frontends, official scorer, state/vision helpers and session-isolation oracles with HIP, including position-independent host objects. It builds the test executables without loading a model. A plain Linux `make` of these shared targets otherwise selects CUDA.
+
 Vision and end-to-end checks additionally require the checkpoints above.
-Run `tests/test_qwen4_ngram_state MODEL.gguf` on either backend to check
+Run `tests/test_qwen4_ngram_state MODEL.gguf` on each backend to check
 failed disk reads during prefill, decode and MTP, then exact recovery.
 
 Official Alibaba continuations are tracked for 100 short prompts and 12
