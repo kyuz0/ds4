@@ -634,6 +634,18 @@ __global__ void matrix(float *out, const float *x, const char *w0, const char *w
     }
 }
 
+// Build independent tile lists for experts with similar routed-token counts.
+__global__ void expert_tiles_range(unsigned *prefix, const int *counts, unsigned NE,
+        unsigned nt, unsigned lo, unsigned hi) {
+    unsigned n = 0;
+    prefix[0] = 0;
+    for (unsigned e = 0; e < NE; e++) {
+        const unsigned count = (unsigned)counts[e];
+        if (count > lo && count <= hi) n += (count + nt - 1) / nt;
+        prefix[e + 1] = n;
+    }
+}
+
 __global__ void expert_tiles(unsigned *prefix, const int *counts, unsigned NE, unsigned nt) {
     unsigned n = 0;
     prefix[0] = 0;
@@ -859,26 +871,42 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
     const dim3 grid((M + 15) / 16, lists ? NE : 1, std::min(8u, (T + 15) / 16));
     const uint64_t rb = expert_row_bytes(type, K);
         if (ds4_rocm_is_gfx1151() && lists && !g_quality_mode && (type == 16 || type == 10 || type == 12 || type == 39)) {
-            /* Four waves cover a short routed list with less padded work. */
-            const unsigned nt = T >= 2048 ? (down ? 64 : 128) : T <= 256 ? 16 : 32;
-            unsigned *tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
-            if (!tiles) return 0;
-            expert_tiles<<<1,1,0,0>>>(tiles,counts,NE,nt);
-            if (!launched()) return 0;
-            /* Wider rows reuse activations; keep Q2_K down at the smaller row tile. */
-            const unsigned nr = nt == 64 && type != 10 && type != 16 ? 128 : 64;
-            const uint64_t blocks = (((uint64_t)T*NS+nt-1)/nt+NE)*((M+nr-1)/nr);
-            if (blocks > INT_MAX) return 0;
+            // Keep bulk Q2 prefetch and wide down tiles; group the remaining
+            // matrix work by actual expert occupancy instead of padding every
+            // expert to the same tile width.
+            const bool grouped = T > 256 &&
+                (T < 2048 || (type == 12 && !down && T < 7168));
+            const unsigned passes = grouped ? (down ? 3 : 4) : 1;
+            for (unsigned pass = 0; pass < passes; pass++) {
+                const unsigned nt = grouped ? 16u << pass :
+                    T >= 2048 ? (down ? 64 : 128) : T <= 256 ? 16 : 32;
+                const unsigned lo = !grouped || pass == 0 ? 0 :
+                    pass == 1 ? 16 : pass == 2 ? 64 : 128;
+                const unsigned hi = !grouped || pass + 1 == passes ? UINT_MAX :
+                    pass == 0 ? 16 : pass == 1 ? 64 : 128;
+                unsigned *tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
+                if (!tiles) return 0;
+                if (grouped) expert_tiles_range<<<1,1,0,0>>>(tiles,counts,NE,nt,lo,hi);
+                else expert_tiles<<<1,1,0,0>>>(tiles,counts,NE,nt);
+                if (!launched()) return 0;
+                /* Wider rows reuse activations; keep Q2_K down at the smaller row tile. */
+                const unsigned nr = down && nt == 64 && type != 10 && type != 16 ? 128 : 64;
+                const uint64_t jobs = std::min(((uint64_t)T*NS+nt-1)/nt+NE,
+                    (uint64_t)NE * (((uint64_t)hi+nt-1)/nt));
+                const uint64_t blocks = jobs*((M+nr-1)/nr);
+                if (blocks > INT_MAX) return 0;
 #define QWEN_HALF(TYPE, DOWN) \
-            if (nt == 128 && (TYPE == 16 || (TYPE == 12 && T >= 7168)) && !DOWN && !(K%64)) matrix_half_tile_prefetch<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
-            else if (nt == 128) matrix_half_tile<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
-            else if (nt == 64) matrix_half_tile<TYPE,DOWN,64,((TYPE == 10 || TYPE == 16) ? 64 : 128)><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
-            else if (nt == 16) matrix_half_tile<TYPE,DOWN,16,64,4><<<blocks,128,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
-            else matrix_half_tile<TYPE,DOWN,32><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb)
+                if (nt == 128 && (TYPE == 16 || (TYPE == 12 && T >= 7168)) && !DOWN && !(K%64)) matrix_half_tile_prefetch<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+                else if (nt == 128) matrix_half_tile<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+                else if (nt == 64) matrix_half_tile<TYPE,DOWN,64,((!DOWN || TYPE == 10 || TYPE == 16) ? 64 : 128)><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+                else if (nt == 16) matrix_half_tile<TYPE,DOWN,16,64,4><<<blocks,128,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+                else matrix_half_tile<TYPE,DOWN,32><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb)
 #define QWEN_HALF_TYPE(TYPE) case TYPE: if (down) { QWEN_HALF(TYPE,true); } else { QWEN_HALF(TYPE,false); } break
-            switch (type) { QWEN_HALF_TYPE(16); QWEN_HALF_TYPE(10); QWEN_HALF_TYPE(12); QWEN_HALF_TYPE(39); }
+                switch (type) { QWEN_HALF_TYPE(16); QWEN_HALF_TYPE(10); QWEN_HALF_TYPE(12); QWEN_HALF_TYPE(39); }
 #undef QWEN_HALF_TYPE
 #undef QWEN_HALF
+                if (!launched()) return 0;
+            }
             return launched();
         }
 #define QWEN_MM(TYPE) case TYPE: \

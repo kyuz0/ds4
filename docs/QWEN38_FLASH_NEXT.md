@@ -101,14 +101,13 @@ For ROCm server MTP, leave `--batched-session` unset. Enabling that option, incl
 
 Expert prefill uses wave32 WMMA with the actual IQ2_XXS/Q2_K and Q4_K/MXFP4 layouts, including Q2's padded down rows. Default bulk F16/Q8 projections use power-of-two scaling and FP16 operands with FP32 accumulation and output. This intentionally rounds operands; `--quality` retains the FP32 projection and expert reference paths, and few-token decoding keeps its existing matrix-vector path. The tested ROCm 10 hipBLASLt build uses a supported zero-workspace WMMA solution; other library revisions or unsupported shapes keep the BLAS fallback. Other AMD GPU architectures have not been qualified.
 
-Measured with ROCm 10 on a 128 GB Strix Halo, resident weights and disk-only n-grams:
+Measured with ROCm 10 on a 128 GB Strix Halo, resident weights and disk-backed n-grams. Each point processes 2,048 new tokens at the listed history depth, then generates 128 tokens without MTP. Results are medians of three native `ds4-bench` runs with `speed-bench/promessi_sposi.txt`; model loading and history preparation are excluded.
 
-| Quant | Fresh 1024-token prefill | 7168-token append to 8192 | Ordinary decode at 8192 |
-| --- | ---: | ---: | ---: |
-| Q2 | 277 t/s | 462 t/s | 21.4 t/s |
-| Q4 | 297 t/s | 364 t/s | 20.0 t/s |
-
-These are native `ds4-bench` measurements with `speed-bench/promessi_sposi.txt`, 8192-token prefill chunks and 128 greedy generated tokens. Model loading is excluded. These are incremental engine timings, not end-to-end follow-up request throughput.
+| Existing history | Q2 prefill | Q2 decode | Q4 prefill | Q4 decode |
+|---|---:|---:|---:|---:|
+| 0 | 480 tok/s | 21.5 tok/s | 364 tok/s | 20.0 tok/s |
+| 8K | 451 tok/s | 21.4 tok/s | 349 tok/s | 19.9 tok/s |
+| 32K | 413 tok/s | 21.2 tok/s | 324 tok/s | 19.7 tok/s |
 
 On two coding prompts, each repeated with reversed ordinary/MTP ordering, Q2 generation measured 21.5–21.8 t/s ordinary and 23.9–24.9 t/s with MTP; Q4 measured 20.2–20.4 and 22.4–23.1 t/s respectively. All eight pairs produced identical text and passed the same executable checks. MTP verification counters confirmed speculation ran. This small sample does not predict acceptance or speed for every prompt.
 
