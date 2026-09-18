@@ -15,6 +15,7 @@ struct cuda_hipblaslt_gemm_plan {
     uint32_t output_stride;
     uint32_t input_stride;
     hipDataType output_type;
+    hipDataType input_type;
     int solution_index;
     hipblasLtMatmulDesc_t desc;
     hipblasLtMatrixLayout_t a_desc;
@@ -52,14 +53,16 @@ static cuda_hipblaslt_gemm_plan *hipblaslt_gemm_plan_get(
         hipDataType output_type = HIP_R_16F,
         int solution_index = -1,
         uint32_t output_stride = 0,
-        uint32_t input_stride = 0) {
+        uint32_t input_stride = 0,
+        hipDataType input_type = HIP_R_16F) {
     if (!output_stride) output_stride = out_dim;
     if (!input_stride) input_stride = in_dim;
     if (output_stride < out_dim || input_stride < in_dim) return NULL;
     for (size_t i = 0; i < g_hipblaslt_gemm_plans.size(); i++) {
         cuda_hipblaslt_gemm_plan &p = g_hipblaslt_gemm_plans[i];
         if (p.out_dim == out_dim && p.n_tok == n_tok && p.in_dim == in_dim &&
-            p.output_type == output_type && p.solution_index == solution_index &&
+            p.output_type == output_type && p.input_type == input_type &&
+            p.solution_index == solution_index &&
             p.output_stride == output_stride && p.input_stride == input_stride) return &p;
     }
 
@@ -80,9 +83,9 @@ static cuda_hipblaslt_gemm_plan *hipblaslt_gemm_plan_get(
         if (!hipblaslt_ok(hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB,
                                                           &op_b, sizeof(op_b)),
                           "set transB")) break;
-        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&a_desc, HIP_R_16F, in_dim, out_dim, input_stride),
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&a_desc, input_type, in_dim, out_dim, input_stride),
                           "A layout create")) break;
-        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&b_desc, HIP_R_16F, in_dim, n_tok, input_stride),
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&b_desc, input_type, in_dim, n_tok, input_stride),
                           "B layout create")) break;
         if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&c_desc, output_type, out_dim, n_tok, output_stride),
                           "C layout create")) break;
@@ -139,6 +142,7 @@ static cuda_hipblaslt_gemm_plan *hipblaslt_gemm_plan_get(
     p.output_stride = output_stride;
     p.input_stride = input_stride;
     p.output_type = output_type;
+    p.input_type = input_type;
     p.solution_index = solution_index;
     p.desc = desc;
     p.a_desc = a_desc;

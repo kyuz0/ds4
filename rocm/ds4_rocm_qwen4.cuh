@@ -1188,6 +1188,23 @@ static int dense_blas(float *out, const float *x, const char *w,
 #undef QWEN_UNPACK
             if (!launched()) return 0;
         }
+        if (!type && !g_quality_mode && T >= 512 && K == 2560 &&
+                (n == 48 || n == 512) && ds4_rocm_is_gfx1151() && g_hipblaslt_ready) {
+            int version = 0;
+            char revision[128] = {};
+            if (hipblasLtGetVersion(g_hipblaslt,&version) == HIPBLAS_STATUS_SUCCESS &&
+                    hipblasLtGetGitRevision(g_hipblaslt,revision) == HIPBLAS_STATUS_SUCCESS &&
+                    version == 100401 && !strcmp(revision,"8d1ae90e")) {
+                cuda_hipblaslt_gemm_plan *p = hipblaslt_gemm_plan_get(
+                    n,T,K,"Qwen FP32 projection",HIP_R_32F,2921,M,K,HIP_R_32F);
+                if (p) {
+                    if (!hipblaslt_ok(hipblasLtMatmul(g_hipblaslt,p->desc,
+                        &alpha,wf,p->a_desc,x,p->b_desc,&beta,out+r,p->c_desc,
+                        out+r,p->d_desc,&p->algo,NULL,0,0),"Qwen FP32 projection")) return 0;
+                    continue;
+                }
+            }
+        }
         if (!cublas_ok(cublasGemmEx(g_cublas,CUBLAS_OP_T,CUBLAS_OP_N,
                 n,T,K,&alpha,wf,CUDA_R_32F,K,x,CUDA_R_32F,K,&beta,out+r,CUDA_R_32F,M,
                 HIPBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT), "Qwen FP32 projection")) return 0;
