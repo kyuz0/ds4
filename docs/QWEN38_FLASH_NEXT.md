@@ -105,9 +105,9 @@ Measured with ROCm 10 on a 128 GB Strix Halo, resident weights and disk-backed n
 
 | Existing history | Q2 prefill | Q2 decode | Q4 prefill | Q4 decode |
 |---|---:|---:|---:|---:|
-| 0 | 508 tok/s | 21.5 tok/s | 460 tok/s | 19.9 tok/s |
-| 8K | 476 tok/s | 21.3 tok/s | 435 tok/s | 19.8 tok/s |
-| 32K | 434 tok/s | 21.1 tok/s | 400 tok/s | 19.7 tok/s |
+| 0 | 515 tok/s | 21.6 tok/s | 466 tok/s | 19.9 tok/s |
+| 8K | 482 tok/s | 21.4 tok/s | 440 tok/s | 19.9 tok/s |
+| 32K | 439 tok/s | 21.1 tok/s | 405 tok/s | 19.7 tok/s |
 
 On two coding prompts, each repeated with reversed ordinary/MTP ordering, Q2 generation measured 21.5–21.8 t/s ordinary and 23.9–24.9 t/s with MTP; Q4 measured 20.2–20.4 and 22.4–23.1 t/s respectively. All eight pairs produced identical text and passed the same executable checks. MTP verification counters confirmed speculation ran. This small sample does not predict acceptance or speed for every prompt.
 
