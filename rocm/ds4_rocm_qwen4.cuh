@@ -676,8 +676,8 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
     const unsigned count=counts[e], t0=(job-tiles[e])*NT, r0=(blockIdx.x%nr)*NR;
     const unsigned wr=wave%(NR/16), wc=wave/(NR/16);
     constexpr unsigned NC=NT/(WAVES/(NR/16));
-    // Padding avoids repeated LDS bank conflicts for bulk Q2 expert tiles.
-    constexpr unsigned LD = NT >= 64 && (TYPE == 16 || TYPE == 10) ? 72 : 64;
+    // Pad LDS rows for the Q2 and Q4 expert WMMA tiles.
+    constexpr unsigned LD = 72;
     __shared__ _Float16 a[NR][LD], u[DOWN ? 1 : NR][LD], b[NT][LD];
     __shared__ uint64_t grid_table[TYPE == 16 ? 256 : 1];
     __shared__ uint8_t sign_table[TYPE == 16 ? 128 : 1];
@@ -762,8 +762,8 @@ __global__ void matrix_half_tile_prefetch(float *out, const float *x, const char
     const unsigned count=counts[e], t0=(job-tiles[e])*NT, r0=(blockIdx.x%nr)*NR;
     const unsigned wr=wave%(NR/16), wc=wave/(NR/16);
     constexpr unsigned NC=NT/(8/(NR/16));
-    // Padding avoids repeated LDS bank conflicts for bulk Q2 expert tiles.
-    constexpr unsigned LD = NT >= 64 && (TYPE == 16 || TYPE == 10) ? 72 : 64;
+    // Pad LDS rows for the Q2 and Q4 expert WMMA tiles.
+    constexpr unsigned LD = 72;
     __shared__ _Float16 a[NR][LD], u[DOWN ? 1 : NR][LD], b[NT][LD];
     __shared__ uint64_t grid_table[TYPE == 16 ? 256 : 1];
     __shared__ uint8_t sign_table[TYPE == 16 ? 128 : 1];
@@ -1584,6 +1584,11 @@ extern "C" int ds4_gpu_qwen4_gdn_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 #define QWEN_GDN(ROWS, DIM) gdn_scan<ROWS,DIM><<<dim3((DIM+4*ROWS-1)/(4*ROWS),Hv),128,0,0>>>((float *)out->ptr, \
         (float *)state->ptr,(const float *)qkv->ptr,(const float *)a->ptr,(const float *)b->ptr, \
         T,Hk,Hv,snap ? (float *)snap->ptr : NULL,st,snap2 ? (float *)snap2->ptr : NULL,st2)
+    // Use eight state rows per wave for gfx1151 prefill.
+    if (D == 128 && T > 8 && ds4_rocm_is_gfx1151()) {
+        QWEN_GDN(8,128);
+        return launched();
+    }
 #define QWEN_GDN_DIM(DIM) case DIM: if (T > 8) { QWEN_GDN(4,DIM); } else { QWEN_GDN(1,DIM); } break
     switch (D) { QWEN_GDN_DIM(32); QWEN_GDN_DIM(64); QWEN_GDN_DIM(96); QWEN_GDN_DIM(128); }
 #undef QWEN_GDN_DIM
