@@ -879,7 +879,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
             const unsigned passes = grouped ? (down ? 3 : 4) : 1;
             for (unsigned pass = 0; pass < passes; pass++) {
                 const unsigned nt = grouped ? 16u << pass :
-                    T >= 2048 ? (down ? 64 : 128) : T <= 256 ? 16 : 32;
+                    T >= 2048 ? (down ? 32 : 128) : T <= 256 ? 16 : 32;
                 const unsigned lo = !grouped || pass == 0 ? 0 :
                     pass == 1 ? 16 : pass == 2 ? 64 : 128;
                 const unsigned hi = !grouped || pass + 1 == passes ? UINT_MAX :
@@ -889,14 +889,15 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
                 if (grouped) expert_tiles_range<<<1,1,0,0>>>(tiles,counts,NE,nt,lo,hi);
                 else expert_tiles<<<1,1,0,0>>>(tiles,counts,NE,nt);
                 if (!launched()) return 0;
-                /* Wider rows reuse activations; keep Q2_K down at the smaller row tile. */
-                const unsigned nr = down && nt == 64 && type != 10 && type != 16 ? 128 : 64;
+                /* Bulk down tiles reuse activations across 128 output rows. */
+                const unsigned nr = down && (T >= 2048 || (nt == 64 && type != 10 && type != 16)) ? 128 : 64;
                 const uint64_t jobs = std::min(((uint64_t)T*NS+nt-1)/nt+NE,
                     (uint64_t)NE * (((uint64_t)hi+nt-1)/nt));
                 const uint64_t blocks = jobs*((M+nr-1)/nr);
                 if (blocks > INT_MAX) return 0;
 #define QWEN_HALF(TYPE, DOWN) \
-                if (nt == 128 && (TYPE == 16 || (TYPE == 12 && T >= 7168)) && !DOWN && !(K%64)) matrix_half_tile_prefetch<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+                if (DOWN && T >= 2048) matrix_half_tile<TYPE,DOWN,32,128><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+                else if (nt == 128 && (TYPE == 16 || (TYPE == 12 && T >= 7168)) && !DOWN && !(K%64)) matrix_half_tile_prefetch<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
                 else if (nt == 128) matrix_half_tile<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
                 else if (nt == 64) matrix_half_tile<TYPE,DOWN,64,((!DOWN || TYPE == 10 || TYPE == 16) ? 64 : 128)><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
                 else if (nt == 16) matrix_half_tile<TYPE,DOWN,16,64,4><<<blocks,128,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
