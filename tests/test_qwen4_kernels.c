@@ -1352,6 +1352,8 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
 
+#ifdef __APPLE__
+/* Native cross-session row kernels are Metal-only; CUDA uses ordered rows. */
 static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta, uint64_t offa,
                        const ds4_gpu_tensor *tb, uint64_t offb, uint64_t bytes) {
     uint8_t *a = malloc(bytes), *b = malloc(bytes);
@@ -1370,8 +1372,6 @@ static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta,
  * bit for bit: the caches written, the block key, scores, selection, token
  * list and output.  Rows: dense, dense completing a block, sparse completing
  * a block on the plain selector's width, sparse on the prefiltered width. */
-#ifdef __APPLE__
-/* These native session-batch APIs currently have a Metal implementation only. */
 static void test_attention_rows(arena_t *a) {
     const uint32_t H = 8, Hkv = 2, D = 256, n_rot = 64, Hi = 4, Di = 128, k_blocks = 4, ratio = 4, R = 4;
     const uint32_t sparse_pos = (k_blocks + 1) * ratio - 1;
