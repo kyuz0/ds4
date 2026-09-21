@@ -1006,11 +1006,49 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     }
 }
 
+template<unsigned ROWS, unsigned OUTROWS, unsigned WAVES>
+__global__ void matvec_f16_input_first(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    const unsigned lane = threadIdx.x & 31;
+    const unsigned row0 = (blockIdx.x*WAVES + threadIdx.x/32)*OUTROWS;
+    if (row0 >= M) return;
+    float acc[OUTROWS][ROWS] = {};
+    for (unsigned i = lane*4; i < K; i += 128) {
+        float4 input[ROWS];
+        #pragma unroll
+        for (unsigned t = 0; t < ROWS; t++) if (t < T) input[t] = *(const float4 *)(x+(uint64_t)t*K+i);
+        #pragma unroll
+        for (unsigned j = 0; j < OUTROWS; j++) if (row0+j < M) {
+            const float4 v = value4<1>(w+(uint64_t)(row0+j)*stride,i,NULL,NULL);
+            #pragma unroll
+            for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+                acc[j][t] += v.x*input[t].x; acc[j][t] += v.y*input[t].y;
+                acc[j][t] += v.z*input[t].z; acc[j][t] += v.w*input[t].w;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned j = 0; j < OUTROWS; j++) if (row0+j < M) {
+        #pragma unroll
+        for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+            const float v = sum(acc[j][t]);
+            if (!lane) out[(uint64_t)t*M+row0+j] = v;
+        }
+    }
+}
+
 static int matvec_dispatch(float *out, const char *w, const float *x,
                            unsigned type, unsigned T, unsigned K, unsigned M) {
     const dim3 grid((M + 3) / 4, T);
     const uint64_t stride = row_bytes(type, K);
     if (!stride) return 0;
+    if (type == 1 && T > 1 && T <= 8 && M == 320 && K == 10240 &&
+        !((uintptr_t)x&15) && !((uintptr_t)w&7) && ds4_rocm_is_gfx1151()) {
+        if (T == 2) matvec_f16_input_first<2,1,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
+        else if (T <= 4) matvec_f16_input_first<4,1,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
+        else matvec_f16_input_first<8,1,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
+        return launched();
+    }
     if (type == 8 && T <= 8 && !((uintptr_t)x&15)) {
 #define QWEN_Q8_ROWS(N) matvec_q8<N><<<(M+3)/4,128,0,0>>>(out,w,x,T,K,M,stride)
         if (T == 1) { QWEN_Q8_ROWS(1); }
@@ -1076,6 +1114,27 @@ __global__ void dense_rescale(float *out, const float *scales,
  * output slices. This gfx1151 library build's first heuristic is a slow VALU
  * kernel; use the measured zero-workspace WMMA solution after support checks.
  * An unknown library or unsupported shape keeps the ordinary BLAS fallback. */
+static int dense_half_solution(unsigned M, unsigned T, unsigned K, unsigned stride) {
+    if (T != 32) return 2539;
+    if ((M == 1344 && K == 6144 && stride == 2560) ||
+        (M == 2880 && K == 2560 && stride == 6144) ||
+        (M == 3264 && K == 2560 &&
+         (stride == 6144 || stride == 10240 || stride == 12288)) ||
+        (M == 10240 && K == 320 && stride == 10240)) return 2538;
+    if ((M == 128 && K == 2560 && stride == 128) ||
+        (M == 320 && K == 10240 && stride == 320) ||
+        (M == 448 && K == 2560 && stride == 10240) ||
+        (M == 512 && K == 2560 && stride == 512) ||
+        (M == 640 && K == 2560 && stride == 640) ||
+        (M == 960 && K == 5120 && stride == 2560) ||
+        (M == 1216 && K == 6144 && stride == 2560) ||
+        (M == 1600 && K == 5120 && stride == 2560) ||
+        (M == 2496 && K == 2560 && stride == 12288) ||
+        (M == 2560 && ((K == 640 && stride == 2560) ||
+                       (K == 2560 && stride == 2560)))) return 2537;
+    return 2539;
+}
+
 static int dense_half_product(float *out, const __half *w, const __half *x,
         unsigned M, unsigned T, unsigned K, unsigned stride,
         float alpha, float beta, const char *label) {
@@ -1089,14 +1148,15 @@ static int dense_half_product(float *out, const __half *w, const __half *x,
             // bound. Sum shorter K segments; retain the original row strides.
             const unsigned segment = K > 4096 ? 1024 : K;
             const unsigned tail = K % segment ? K % segment : segment;
-            if (hipblaslt_gemm_plan_get(M,T,segment,label,HIP_R_32F,2539,stride,K) &&
-                hipblaslt_gemm_plan_get(M,T,tail,label,HIP_R_32F,2539,stride,K)) {
+            const int solution = dense_half_solution(M,T,K,stride);
+            if (hipblaslt_gemm_plan_get(M,T,segment,label,HIP_R_32F,solution,stride,K) &&
+                hipblaslt_gemm_plan_get(M,T,tail,label,HIP_R_32F,solution,stride,K)) {
                 // Preflight every layout before writing any output: fallback
                 // must not consume a partially accumulated product.
                 for (unsigned k = 0; k < K; k += segment) {
                     const unsigned n = std::min(segment,K-k);
                     cuda_hipblaslt_gemm_plan *p = hipblaslt_gemm_plan_get(
-                        M,T,n,label,HIP_R_32F,2539,stride,K);
+                        M,T,n,label,HIP_R_32F,solution,stride,K);
                     const float add = k ? 1.0f : beta;
                     if (!p || !hipblaslt_ok(hipblasLtMatmul(g_hipblaslt,p->desc,
                         &alpha,w+k,p->a_desc,x+k,p->b_desc,&add,
@@ -1188,15 +1248,18 @@ static int dense_blas(float *out, const float *x, const char *w,
 #undef QWEN_UNPACK
             if (!launched()) return 0;
         }
-        if (!type && !g_quality_mode && T >= 512 && K == 2560 &&
-                (n == 48 || n == 512) && ds4_rocm_is_gfx1151() && g_hipblaslt_ready) {
+        const int fp32_solution = T == 32 && K == 2560 && n == 48 ? 2842 :
+                                  T == 32 && K == 2560 && n == 512 ? 3019 :
+                                  T >= 512 && K == 2560 && (n == 48 || n == 512) ? 2921 : -1;
+        if (!type && !g_quality_mode && fp32_solution >= 0 &&
+                ds4_rocm_is_gfx1151() && g_hipblaslt_ready) {
             int version = 0;
             char revision[128] = {};
             if (hipblasLtGetVersion(g_hipblaslt,&version) == HIPBLAS_STATUS_SUCCESS &&
                     hipblasLtGetGitRevision(g_hipblaslt,revision) == HIPBLAS_STATUS_SUCCESS &&
                     version == 100401 && !strcmp(revision,"8d1ae90e")) {
                 cuda_hipblaslt_gemm_plan *p = hipblaslt_gemm_plan_get(
-                    n,T,K,"Qwen FP32 projection",HIP_R_32F,2921,M,K,HIP_R_32F);
+                    n,T,K,"Qwen FP32 projection",HIP_R_32F,fp32_solution,M,K,HIP_R_32F);
                 if (p) {
                     if (!hipblaslt_ok(hipblasLtMatmul(g_hipblaslt,p->desc,
                         &alpha,wf,p->a_desc,x,p->b_desc,&beta,out+r,p->c_desc,
@@ -1349,6 +1412,31 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
     for (unsigned j = 0; j < ni; j++) {
         const float v = block_sum(acc[j], red);
         if (!tid) inj[((uint64_t)tok * hc * 8 + stream * 8 + chunk) * ni + j] = v;
+    }
+}
+
+__global__ void hc_norm_one(float *xn, float *inj, const float *R, const float *gamma,
+                        const char *wi, unsigned type, unsigned E, unsigned hc,
+                        unsigned ni, float eps) {
+    const unsigned stream = blockIdx.x, tok = blockIdx.y;
+    const unsigned tid = threadIdx.x, dim = E * hc;
+    const uint64_t base = ((uint64_t)tok * hc + stream) * E;
+    __shared__ float red[32];
+    float ss = 0;
+    for (unsigned i = tid; i < E; i += blockDim.x) ss += R[base + i] * R[base + i];
+    const float inv = rsqrtf(block_sum(ss, red) / E + eps);
+    for (unsigned chunk=0; chunk<8; ++chunk) {
+        float acc[4] = {};
+        const unsigned per = (E + 7) / 8, end = min(E, (chunk + 1) * per);
+        for (unsigned i = chunk * per + tid; i < end; i += blockDim.x) {
+            const float v = R[base + i] * inv * gamma[stream * E + i];
+            xn[base + i] = v;
+            for (unsigned j = 0; j < ni; j++) acc[j] += scalar(wi, j * dim + stream * E + i, type) * v;
+        }
+        for (unsigned j = 0; j < ni; j++) {
+            const float v = block_sum(acc[j], red);
+            if (!tid) inj[((uint64_t)tok * hc * 8 + stream * 8 + chunk) * ni + j] = v;
+        }
     }
 }
 
@@ -1670,8 +1758,14 @@ extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *
     const char *wi = ni ? weight(map, size, io, row_bytes(type, (uint64_t)E * hc) * ni) : gamma;
     if (!gamma || !wi || (type != 0 && type != 1 && type != 8)) return 0;
     // Keep the same reduction schedule for decode, append and bulk prefill.
-    hc_norm<<<dim3(hc * 8, T), 128, 0, 0>>>((float *)xn->ptr,
-        ni ? (float *)inj->ptr : NULL, (const float *)R->ptr, (const float *)gamma, wi, type, E, hc, ni, eps);
+    // Reuse one RMS reduction while preserving all eight injection partials.
+    if (T >= 128 && E == 2560 && hc == 4 && (ni == 0 || (ni == 4 && type == 1)) && ds4_rocm_is_gfx1151()) {
+        hc_norm_one<<<dim3(hc, T), 128, 0, 0>>>((float *)xn->ptr,
+            ni ? (float *)inj->ptr : NULL, (const float *)R->ptr, (const float *)gamma, wi, type, E, hc, ni, eps);
+    } else {
+        hc_norm<<<dim3(hc * 8, T), 128, 0, 0>>>((float *)xn->ptr,
+            ni ? (float *)inj->ptr : NULL, (const float *)R->ptr, (const float *)gamma, wi, type, E, hc, ni, eps);
+    }
     return launched();
 }
 
