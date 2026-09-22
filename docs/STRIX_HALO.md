@@ -117,6 +117,14 @@ curl -L --fail -o "$DSPARK" \
 
 Use normal positive-temperature sampling with `--dspark`; `--mtp-exact-sampling` is a separate diagnostic mode. Set `DS4_DSPARK_STATS=1` to print proposal, acceptance and verifier counters at shutdown. The target contributes about 151.76 GiB of resident tensor spans and the support model about 7.42 GiB, before context and runtime buffers. DSpark is not available with SSD expert streaming.
 
+### Decoder SWA Bounded Replay
+
+For resident V4.1 inference, opt in to Decoder SWA Bounded Replay with `DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY=1`. It is off by default, replays only the final 128 prompt tokens through decoder layers, and does not apply to SSD streaming:
+
+```bash
+DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY=1 ./ds4 --rocm -m "$MODEL" --ctx 34816
+```
+
 ### Reproduce SSD measurements
 
 Prepare `bench-prompt.txt` as in the [cluster benchmark](CLUSTERING_ROCM.md#reproduce-the-table), then run from the engine build directory:
