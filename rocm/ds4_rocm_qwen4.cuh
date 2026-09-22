@@ -1198,8 +1198,148 @@ __global__ void dense_rescale2(float *out, const float *xs, const float *ws,
     }
 }
 
+/* Read Q8 blocks directly for gfx1151 bulk projections.  Shape-specific tiles
+ * keep the WMMA work resident across the Qwen dense projection dimensions. */
+template<unsigned WAVES, unsigned NT, unsigned KT, unsigned PAD, unsigned VEC>
+__launch_bounds__(WAVES*32u,1)
+__global__ void qwen_q8_direct(float *out,
+        const unsigned char *w, const __half *x, const float *xs, const float *ws,
+        unsigned T, unsigned K, unsigned M, unsigned begin, unsigned length) {
+    static_assert(KT%32==0 && NT%16==0);
+    constexpr unsigned NF=NT/16, MT=WAVES*16;
+    const unsigned block_m=blockIdx.x*MT, block_t=blockIdx.y*NT;
+    const unsigned tid=threadIdx.x, wave=tid>>5, lane=tid&31, lane16=lane&15;
+    const unsigned row0=block_m+wave*16, my_row=row0+lane16;
+    const unsigned safe_row=my_row<M ? my_row : M-1;
+    const uint64_t rb=(uint64_t)(K/32)*34;
+    const unsigned char *wr=w+(uint64_t)safe_row*rb;
+    const float winv=1.0f/ws[safe_row];
+    __shared__ _Float16 sx[NT][KT+PAD];
+    float8 acc[NF]={};
+    for (unsigned k0=0;k0<length;k0+=KT) {
+        for (unsigned j=tid*VEC;j<NT*KT;j+=WAVES*32*VEC) {
+            const unsigned tok=j/KT, kk=j%KT;
+            #pragma unroll
+            for (unsigned z=0;z<VEC;z++) {
+                const unsigned gt=block_t+tok, gk=begin+k0+kk+z;
+                if (kk+z<KT) sx[tok][kk+z]=(gt<T && gk<begin+length) ? (_Float16)x[(uint64_t)gt*K+gk] : (_Float16)0;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned kb=0;kb<KT/32;kb++) {
+            if (k0+kb*32>=length) break;
+            const unsigned char *bp=wr+(uint64_t)((begin+k0)/32+kb)*34;
+            uint16_t sb; __builtin_memcpy(&sb,bp,2);
+            const float sc=qwen_f16_to_f32(sb)*winv;
+            const int8_t *q=(const int8_t *)(bp+2);
+            half16 a0,a1;
+            #pragma unroll
+            for (unsigned i=0;i<16;i++) {
+                a0[i]=(_Float16)(sc*(float)(int)q[i]);
+                a1[i]=(_Float16)(sc*(float)(int)q[16+i]);
+            }
+            #pragma unroll
+            for (unsigned f=0;f<NF;f++) {
+                const unsigned tok=f*16+lane16;
+                const _Float16 *xp=&sx[tok][kb*32];
+                const half16 b0=*(const half16 *)xp, b1=*(const half16 *)(xp+16);
+                acc[f]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0,b0,acc[f]);
+                acc[f]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1,b1,acc[f]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned f=0;f<NF;f++) {
+        const unsigned tok=block_t+f*16+lane16;
+        if (tok>=T) continue;
+        #pragma unroll
+        for (unsigned j=0;j<8;j++) {
+            const unsigned row=row0+2*j+(lane>>4);
+            if (row<M) {
+                const uint64_t dst=(uint64_t)tok*M+row;
+                const float v=acc[f][j]*xs[tok]*ws[row];
+                out[dst]=begin ? out[dst]+v : v;
+            }
+        }
+    }
+}
+
+static int launch_qwen_q8_direct(float *out, const unsigned char *w,
+        const __half *x, const float *xs, const float *ws, unsigned T,
+        unsigned K, unsigned M, unsigned begin, unsigned length) {
+    if (T<=64) {
+        if (M<=2560) {
+            qwen_q8_direct<8,16,64,8,4><<<dim3((M+127)/128,(T+15)/16),256,0,0>>>(
+                out,w,x,xs,ws,T,K,M,begin,length);
+        } else if (M==6144 || M==10240 || M==12288) {
+            qwen_q8_direct<24,32,256,8,4><<<dim3((M+383)/384,(T+31)/32),768,0,0>>>(
+                out,w,x,xs,ws,T,K,M,begin,length);
+        } else {
+            qwen_q8_direct<16,64,128,8,4><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
+                out,w,x,xs,ws,T,K,M,begin,length);
+        }
+    } else if (M<=640 && T<=128) {
+        qwen_q8_direct<8,16,64,8,4><<<dim3((M+127)/128,(T+15)/16),256,0,0>>>(
+            out,w,x,xs,ws,T,K,M,begin,length);
+    } else if ((M==640 && T>=768 && T<1536) ||
+            (M==2560 && !(T>=256 && T<768))) {
+        qwen_q8_direct<16,64,256,8,8><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
+            out,w,x,xs,ws,T,K,M,begin,length);
+    } else if ((M==640 && T>=1536) || (M==6144 && T>=256) ||
+            ((M==10240 || M==12288) && T>=128 && T<1536)) {
+        qwen_q8_direct<16,128,128,8,8><<<dim3((M+255)/256,(T+127)/128),512,0,0>>>(
+            out,w,x,xs,ws,T,K,M,begin,length);
+    } else if ((M==10240 || M==12288) && T>=1536) {
+        qwen_q8_direct<24,128,128,8,8><<<dim3((M+383)/384,(T+127)/128),768,0,0>>>(
+            out,w,x,xs,ws,T,K,M,begin,length);
+    } else {
+        qwen_q8_direct<16,64,128,8,4><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
+            out,w,x,xs,ws,T,K,M,begin,length);
+    }
+    return launched();
+}
+
+template<unsigned TYPE>
+__global__ void qwen_dense_row_scales(float *scales, const char *x,
+        unsigned K, uint64_t rb) {
+    const unsigned row=blockIdx.x, tid=threadIdx.x;
+    __shared__ float maxima[256];
+    float mx=0;
+    for (unsigned k=tid;k<K;k+=256) mx=fmaxf(mx,fabsf(value<TYPE>(x+(uint64_t)row*rb,k)));
+    maxima[tid]=mx;
+    __syncthreads();
+    for (unsigned d=128;d;d/=2) {
+        if (tid<d) maxima[tid]=fmaxf(maxima[tid],maxima[tid+d]);
+        __syncthreads();
+    }
+    if (!tid) {
+        const int e=maxima[0]>0 ? max(-120,min(120,(int)((__float_as_uint(maxima[0])>>23)&255)-127)) : 0;
+        scales[row]=ldexpf(1,e);
+    }
+}
+
 static int dense_q8_blas(float *out, const float *x, const char *w,
         unsigned T, unsigned K, unsigned M) {
+    if (T>=32 && !(K%128) && ds4_rocm_is_gfx1151()) {
+        const uint64_t xn=(uint64_t)T*K;
+        const uint64_t xbytes=(xn*sizeof(__half)+15)&~UINT64_C(15);
+        __half *xh=(__half *)cuda_tmp_alloc(xbytes+((uint64_t)T+M)*sizeof(float),
+            "Qwen direct Q8 projection scratch");
+        if (!xh) return 0;
+        float *xs=(float *)((char *)xh+xbytes), *ws=xs+T;
+        pack_half_rows<0><<<T,256,0,0>>>(xs,xh,(const char *)x,K,(uint64_t)K*4);
+        qwen_dense_row_scales<8><<<M,256,0,0>>>(ws,w,K,row_bytes(8,K));
+        if (!launched()) return 0;
+        const unsigned segment=K>4096 ? 1024 : K;
+        for (unsigned begin=0;begin<K;begin+=segment) {
+            const unsigned length=std::min(segment,K-begin);
+            if (!launch_qwen_q8_direct(out,(const unsigned char *)w,xh,xs,ws,
+                    T,K,M,begin,length)) return 0;
+        }
+        return 1;
+    }
     // Retain the measured row tiling with a 16 MiB packed-weight budget.
     const unsigned bound = (unsigned)std::max(UINT64_C(1),(UINT64_C(16)<<20)/((uint64_t)K*sizeof(__half)));
     const unsigned tile = std::min(M,bound >= 64 ? bound/64*64 : bound);
