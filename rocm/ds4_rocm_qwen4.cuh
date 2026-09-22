@@ -257,8 +257,26 @@ static const char *weight(const void *map, uint64_t size, uint64_t off, uint64_t
 
 static int launched(void) { return cuda_ok(cudaGetLastError(), "Qwen kernel"); }
 
+#if defined(__gfx1151__)
+template<int MASK>
+__device__ __forceinline__ float qwen_dpp_xor(float x) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(x), 0x160 | MASK, 0xf, 0xf, true));
+}
+#endif
+
 __device__ __forceinline__ float sum(float x) {
+#if defined(__gfx1151__)
+    x += __int_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_int(x), __float_as_int(x),
+        0x76543210, 0xFEDCBA98, true, false));
+    x += qwen_dpp_xor<8>(x);
+    x += qwen_dpp_xor<4>(x);
+    x += qwen_dpp_xor<2>(x);
+    x += qwen_dpp_xor<1>(x);
+#else
     for (int d = 16; d; d >>= 1) x += __shfl_xor(x, d, 32);
+#endif
     return x;
 }
 
