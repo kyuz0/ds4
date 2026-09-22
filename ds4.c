@@ -40330,6 +40330,17 @@ typedef struct {
     ds4_gpu_tensor *window[40];
     ds4_gpu_tensor *compressed[4], *index_cache[4];
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
+    /* Frontier snapshots for prefix rewind. The SWA window and the
+     * compressor pair frontier cannot be rewound by truncating row counts,
+     * so a restart restores a captured frontier instead. Two rings: prefill
+     * chunk boundaries plus the sync frontier (which also keeps logits), and
+     * periodic decode steps. Slot state words are published with release
+     * semantics so the lock-free rewind hint never observes a torn entry. */
+    ds4_gpu_tensor *frontier_buf;
+    float *frontier_logits;
+    uint32_t *frontier_state;
+    uint32_t frontier_slots, frontier_prefill_slots;
+    uint32_t frontier_prefill_head, frontier_decode_head, frontier_steps;
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
@@ -40346,6 +40357,12 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
     ds4_cursor c = cursor_at(m, arr.data_pos);
     return cursor_read(&c, out, bytes);
 }
+
+#define DS41_FRONTIER_PREFILL_SLOTS 8
+#define DS41_FRONTIER_DECODE_SLOTS 8
+#define DS41_FRONTIER_DECODE_EVERY 64
+/* Empty slot marker: a position never collides because positions < 2^30. */
+#define DS41_FRONTIER_EMPTY UINT32_MAX
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
@@ -40392,6 +40409,9 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     free(g->host_text_mask);
 #endif
     ds4_gpu_tensor_free(g->prefill_tokens);
+    ds4_gpu_tensor_free(g->frontier_buf);
+    free(g->frontier_logits);
+    free(g->frontier_state);
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
 }
@@ -40438,7 +40458,14 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
     /* The index sorter owns two full-width merge buffers outside the graph. */
     const uint64_t sort = (uint64_t)DS41_INDEX_BATCH * ctx * 2u * sizeof(uint32_t);
 #endif
-    return floats * sizeof(float) + sizeof(*g) + (uint64_t)DS4_N_VOCAB * 4u + packed + sort;
+    /* Frontier snapshot rings: full SWA windows plus compressor pair
+     * frontiers per slot, and host-resident logits for exact-frontier
+     * restores that continue generation without a suffix prefill. */
+    const uint32_t frontier_slots = DS41_FRONTIER_PREFILL_SLOTS + DS41_FRONTIER_DECODE_SLOTS;
+    floats += (uint64_t)frontier_slots *
+        ((uint64_t)DS4_N_LAYER * 128u * DS4_N_HEAD_DIM + 8u * DS4_N_HEAD_DIM);
+    return floats * sizeof(float) + sizeof(*g) + (uint64_t)DS4_N_VOCAB * 4u + packed + sort +
+        (uint64_t)frontier_slots * DS4_N_VOCAB * sizeof(float);
 }
 
 static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
@@ -40453,12 +40480,136 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
     return m;
 }
 
+static void ds41_frontier_clear_slot(ds41_gpu_graph *g, uint32_t slot) {
+    __atomic_store_n(&g->frontier_state[slot], DS41_FRONTIER_EMPTY, __ATOMIC_RELEASE);
+}
+
 static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
     g->valid = true;
     ds4_engram_history_reset(&g->history);
+    /* Snapshots belong to the token branch the graph was building. A reset
+     * starts a different prefix, so every captured frontier is stale. */
+    for (uint32_t slot = 0; g->frontier_state && slot < g->frontier_slots; slot++)
+        ds41_frontier_clear_slot(g, slot);
+    g->frontier_prefill_head = 0;
+    g->frontier_decode_head = 0;
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
      * partial pair is overwritten by its even-position token before use. */
+}
+
+/* A snapshot stores the whole SWA window plus the compressor pair frontier:
+ * exactly the state a payload save rounds to, minus the append-only
+ * compressed/index rows that a rewind never needs to move. */
+static uint64_t ds41_frontier_slot_bytes(const ds41_gpu_graph *g) {
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        bytes += g->window[il] ? ds4_gpu_tensor_bytes(g->window[il]) : 0;
+    for (uint32_t i = 0; i < 4; i++) {
+        if (g->previous_kv[i]) bytes += ds4_gpu_tensor_bytes(g->previous_kv[i]);
+        if (g->previous_score[i]) bytes += ds4_gpu_tensor_bytes(g->previous_score[i]);
+    }
+    return bytes;
+}
+
+/* Publish order matters for the lock-free hint reader: device copies are
+ * enqueued first, the slot word is released last. Restores enqueue on the
+ * same stream, so a published slot always restores completed data. */
+static void ds41_frontier_publish(ds41_gpu_graph *g, uint32_t slot,
+                                  uint32_t pos, bool has_logits) {
+    __atomic_store_n(&g->frontier_state[slot],
+                     (pos << 1u) | (uint32_t)(has_logits ? 1u : 0u),
+                     __ATOMIC_RELEASE);
+}
+
+static void ds41_frontier_capture_slot(ds41_gpu_graph *g, uint32_t slot,
+                                       uint32_t pos, bool with_logits,
+                                       const float *logits) {
+    ds41_frontier_clear_slot(g, slot);
+    uint64_t off = (uint64_t)slot * ds41_frontier_slot_bytes(g);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint64_t bytes = ds4_gpu_tensor_bytes(g->window[il]);
+        if (!ds4_gpu_tensor_copy(g->frontier_buf, off, g->window[il], 0, bytes)) return;
+        off += bytes;
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        const uint64_t kv_bytes = ds4_gpu_tensor_bytes(g->previous_kv[i]);
+        if (!ds4_gpu_tensor_copy(g->frontier_buf, off, g->previous_kv[i], 0, kv_bytes)) return;
+        off += kv_bytes;
+        const uint64_t score_bytes = ds4_gpu_tensor_bytes(g->previous_score[i]);
+        if (!ds4_gpu_tensor_copy(g->frontier_buf, off, g->previous_score[i], 0, score_bytes)) return;
+        off += score_bytes;
+    }
+    if (with_logits && logits && g->frontier_logits)
+        memcpy(g->frontier_logits + (uint64_t)slot * DS4_N_VOCAB, logits,
+               (uint64_t)DS4_N_VOCAB * sizeof(float));
+    ds41_frontier_publish(g, slot, pos, with_logits && logits != NULL);
+}
+
+static void ds41_frontier_capture_prefill(ds41_gpu_graph *g, uint32_t pos,
+                                          bool with_logits, const float *logits) {
+    if (!g->frontier_buf) return;
+    ds41_frontier_capture_slot(g, g->frontier_prefill_head, pos, with_logits, logits);
+    g->frontier_prefill_head = (g->frontier_prefill_head + 1u) % g->frontier_prefill_slots;
+}
+
+static void ds41_frontier_capture_decode(ds41_gpu_graph *g, uint32_t pos,
+                                         const float *logits) {
+    if (!g->frontier_buf) return;
+    if (++g->frontier_steps < DS41_FRONTIER_DECODE_EVERY) return;
+    g->frontier_steps = 0;
+    const uint32_t slot = g->frontier_prefill_slots + g->frontier_decode_head;
+    ds41_frontier_capture_slot(g, slot, pos, logits != NULL, logits);
+    g->frontier_decode_head = (g->frontier_decode_head + 1u) %
+        (g->frontier_slots - g->frontier_prefill_slots);
+}
+
+/* Newest usable snapshot at or below desired: an exact-frontier match may
+ * only serve an empty suffix when it also restores logits, otherwise the
+ * caller would sample stale output-head values. Returns the position, or -1. */
+static int ds41_frontier_restore(ds41_gpu_graph *g, int desired, float *logits) {
+    if (!g->frontier_buf || desired < 0) return -1;
+    int best = -1;
+    uint32_t best_pos = 0;
+    bool best_logits = false;
+    for (uint32_t slot = 0; slot < g->frontier_slots; slot++) {
+        const uint32_t state = __atomic_load_n(&g->frontier_state[slot], __ATOMIC_ACQUIRE);
+        if (state == DS41_FRONTIER_EMPTY) continue;
+        const uint32_t pos = state >> 1u;
+        const bool has_logits = state & 1u;
+        if ((int)pos > desired) continue;
+        if (pos == (uint32_t)desired && !has_logits) continue;
+        if (best >= 0 && pos <= best_pos) continue;
+        best = (int)slot;
+        best_pos = pos;
+        best_logits = has_logits;
+    }
+    if (best < 0) return -1;
+    /* Snapshots ahead of the restored frontier belong to a token suffix the
+     * rewind discards; a later divergent prefill would invalidate them. */
+    for (uint32_t slot = 0; slot < g->frontier_slots; slot++) {
+        const uint32_t state = __atomic_load_n(&g->frontier_state[slot], __ATOMIC_ACQUIRE);
+        if (state != DS41_FRONTIER_EMPTY && (int)(state >> 1u) > (int)best_pos)
+            ds41_frontier_clear_slot(g, slot);
+    }
+    uint64_t off = (uint64_t)best * ds41_frontier_slot_bytes(g);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint64_t bytes = ds4_gpu_tensor_bytes(g->window[il]);
+        if (!ds4_gpu_tensor_copy(g->window[il], 0, g->frontier_buf, off, bytes)) return -1;
+        off += bytes;
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        const uint64_t kv_bytes = ds4_gpu_tensor_bytes(g->previous_kv[i]);
+        if (!ds4_gpu_tensor_copy(g->previous_kv[i], 0, g->frontier_buf, off, kv_bytes)) return -1;
+        off += kv_bytes;
+        const uint64_t score_bytes = ds4_gpu_tensor_bytes(g->previous_score[i]);
+        if (!ds4_gpu_tensor_copy(g->previous_score[i], 0, g->frontier_buf, off, score_bytes)) return -1;
+        off += score_bytes;
+    }
+    if (best_logits && logits)
+        memcpy(logits, g->frontier_logits + (uint64_t)best * DS4_N_VOCAB,
+               (uint64_t)DS4_N_VOCAB * sizeof(float));
+    return (int)best_pos;
 }
 
 static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model *m,
@@ -40530,6 +40681,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         g->previous_score[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
         if (!g->compressed[i] || !g->index_cache[i] || !g->previous_kv[i] || !g->previous_score[i]) goto fail;
     }
+    /* Frontier snapshot rings for prefix rewind, sized from the live window
+     * and pair tensors so the slot layout cannot drift from the state they
+     * capture. */
+    g->frontier_slots = DS41_FRONTIER_PREFILL_SLOTS + DS41_FRONTIER_DECODE_SLOTS;
+    g->frontier_prefill_slots = DS41_FRONTIER_PREFILL_SLOTS;
+    g->frontier_buf = ds4_gpu_tensor_alloc(ds41_frontier_slot_bytes(g) * g->frontier_slots);
+    g->frontier_logits = malloc((uint64_t)g->frontier_slots * DS4_N_VOCAB * sizeof(float));
+    g->frontier_state = malloc((uint64_t)g->frontier_slots * sizeof(uint32_t));
+    if (!g->frontier_buf || !g->frontier_logits || !g->frontier_state) goto fail;
+    for (uint32_t slot = 0; slot < g->frontier_slots; slot++)
+        g->frontier_state[slot] = DS41_FRONTIER_EMPTY;
 #ifdef DS4_ROCM_BUILD
 #define DS41_ALLOC(name, count) \
     if (!(g->name = ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(float)))) goto fail;
@@ -76508,6 +76670,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             decoder_pending = defer_decoder;
             pending_logits = true;
             s->checkpoint_valid = false;
+            /* Chunk frontiers carry no output-head logits yet; a rewind that
+             * lands exactly here re-prefills at least one token instead. */
+            ds41_frontier_capture_prefill(g, (uint32_t)i, false, NULL);
             if (s->progress)
                 s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
@@ -76527,6 +76692,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return 1;
             }
             s->checkpoint_valid = true;
+            /* The sync frontier is the most valuable rewind point: restoring
+             * it also restores the output head, so a request whose prompt is
+             * a strict prefix of the live transcript continues without any
+             * suffix prefill. */
+            ds41_frontier_capture_prefill(g, (uint32_t)s->checkpoint.len, true, s->logits);
             if (s->progress)
                 s->progress(s->progress_ud, "prefill_chunk", s->checkpoint.len, prompt->len);
         }
@@ -77473,6 +77643,23 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
             DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
     }
 
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    /* A captured frontier at or below the rewrite point makes this an
+     * in-place operation after all: restore it and re-prefill the canonical
+     * suffix.  Without one, report a rebuild so the server can prefer an
+     * older disk checkpoint before replaying from token zero. */
+    if (ds4_session_is_ds41(s) && s->ds41_graph_ready) {
+        ds4_session_rewind(s, common);
+        if (!s->checkpoint_valid || s->checkpoint.len > common) {
+            snprintf(err, errlen, "rewrite needs rebuild: no frontier snapshot covers common=%d",
+                     common);
+            return DS4_SESSION_REWRITE_REBUILD_NEEDED;
+        }
+        return ds4_session_sync(s, prompt, err, errlen) == 0 ?
+            DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
+    }
+#endif
+
     if (ds4_session_rewrite_requires_rebuild(s->checkpoint.len, prompt->len, common)) {
         snprintf(err, errlen, "rewrite needs rebuild: common=%d live=%d canonical=%d",
                  common, s->checkpoint.len, prompt->len);
@@ -78380,6 +78567,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
+        ds41_frontier_capture_decode(&s->ds41_graph, (uint32_t)s->checkpoint.len, s->logits);
         return 0;
     }
 #endif
@@ -86235,6 +86423,51 @@ void ds4_session_invalidate(ds4_session *s) {
 #endif
 }
 
+/* Newest captured DS41 frontier at or below desired_pos, or -1.
+ *
+ * Lock-free hint for the server reuse probe: slot words carry release
+ * semantics and the device copies are enqueued before the word flips, so a
+ * reader either sees a completed snapshot or none.  The authoritative
+ * resolution happens under the inference lock at rewind time and the server
+ * re-validates the restored frontier before trusting it. */
+int ds4_session_frontier_hint(const ds4_session *s, int desired_pos) {
+    int best = -1;
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (s && desired_pos >= 1 && s->ds41_graph_ready && s->ds41_graph.frontier_state) {
+        const ds41_gpu_graph *g = &s->ds41_graph;
+        for (uint32_t slot = 0; slot < g->frontier_slots; slot++) {
+            const uint32_t state =
+                __atomic_load_n(&g->frontier_state[slot], __ATOMIC_ACQUIRE);
+            if (state == DS41_FRONTIER_EMPTY) continue;
+            const uint32_t pos = state >> 1u;
+            if ((int)pos > desired_pos) continue;
+            /* An exact frontier may only serve an empty suffix with logits. */
+            if (pos == (uint32_t)desired_pos && !(state & 1u)) continue;
+            if (pos > (uint32_t)best) best = (int)pos;
+        }
+    }
+#else
+    (void)s;
+    (void)desired_pos;
+#endif
+    return best;
+}
+
+/* Decode-frontier bookkeeping: call when the session frontier advanced by
+ * accepted decode tokens and the checkpoint vector matches the graph
+ * position.  Cheap: one bounded device copy every
+ * DS41_FRONTIER_DECODE_EVERY tokens. */
+void ds4_session_decode_frontier_note(ds4_session *s) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (s && s->ds41_graph_ready && ds4_session_is_ds41(s) && s->checkpoint_valid &&
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len && s->ds41_graph.frontier_buf)
+        ds41_frontier_capture_decode(&s->ds41_graph, (uint32_t)s->checkpoint.len,
+                                     s->logits);
+#else
+    (void)s;
+#endif
+}
+
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
     if (pos < 0) pos = 0;
@@ -86281,6 +86514,28 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (s->checkpoint_valid && ds4_session_is_ds41(s) && s->ds41_graph_ready) {
+        ds41_gpu_graph *g = &s->ds41_graph;
+        const int snap = ds41_frontier_restore(g, pos, s->logits);
+        if (snap >= 0) {
+            /* The snapshot replaces the compressor frontier and SWA window
+             * a truncation cannot rewind. The token branch is unchanged, so
+             * the checkpoint only shrinks to the snapshot boundary and the
+             * caller re-prefills the suffix from there. */
+            ds4_engram_history_reset(&g->history);
+            for (uint32_t i = 0; i < 3u && i < (uint32_t)snap; i++)
+                g->history.tail[i] =
+                    (int32_t)g->token_map[s->checkpoint.v[snap - 1 - (int)i]];
+            g->pos = (uint32_t)snap;
+            g->valid = true;
+            pos = snap;
+            state_ok = true;
+        }
+        /* Without a covering snapshot the tail below invalidates the
+         * checkpoint and the caller rebuilds this prefix as before. */
+    }
+#endif
 #endif
     s->checkpoint.len = pos;
     /* DeepSeek compressors cannot be rolled back by truncating their row
