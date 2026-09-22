@@ -11723,6 +11723,20 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         return pr;
     }
 
+    /* DS41 frontier snapshots: any shared prefix shorter than the live
+     * checkpoint restarts from the newest captured frontier instead of
+     * rebuilding the whole transcript.  Ordered after the specialized
+     * tiers, which keep more live state when they match (thinking-visible
+     * retains sampled hidden reasoning that a rewind would drop). */
+    if (common > 0 && common < live_pos && token_image_prefix) {
+        const int snap = ds4_session_frontier_hint(slot->session, common);
+        if (snap >= 0) {
+            pr.kind = REUSE_MEMORY_REWIND;
+            pr.reuse_tokens = snap;
+            return pr;
+        }
+    }
+
     return pr;
 }
 
@@ -12586,14 +12600,23 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
 static int server_generation_rewind(server *s, server_slot *slot,
                                      const request *r, int pos,
                                      char *err, size_t errlen) {
-    pthread_mutex_lock(&s->inference_mu);
-    ds4_session_rewind(slot->session, pos);
     ds4_tokens prefix = {0};
+    int rc = 0;
+    pthread_mutex_lock(&s->inference_mu);
+    /* Copy the token history before rewinding: a snapshot restart lands on
+     * an older frontier and the kept tokens must be replayed from there. */
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
-    bool rebuild = ds4_session_common_prefix(slot->session, &prefix) != prefix.len;
+    ds4_session_rewind(slot->session, pos);
+    const int live = ds4_session_pos(slot->session);
+    const bool rebuild = !ds4_session_checkpoint_valid(slot->session) || live != pos;
     pthread_mutex_unlock(&s->inference_mu);
-    int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
-        r->images, r->image_count, err, errlen) : 0;
+    if (rebuild) {
+        ds4_tokens target = {0};
+        tokens_copy_prefix(&target, &prefix, pos);
+        rc = server_session_sync_multimodal(s, slot, &target,
+            r->images, r->image_count, err, errlen);
+        ds4_tokens_free(&target);
+    }
     ds4_tokens_free(&prefix);
     return rc;
 }
@@ -13503,14 +13526,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     case REUSE_MEMORY_REWIND: {
         pthread_mutex_lock(&s->inference_mu);
         ds4_session_rewind(slot->session, reuse.reuse_tokens);
-        /* Rewinding mutates the session, so re-validate before trusting the
-         * frontier: the common prefix must land exactly on the rewind target
-         * and the vision state must still describe the request (upstream's
-         * multimodal hardening).  A failed validation falls through to the
-         * disk cache / cold prefill instead of reusing a bad frontier. */
+        /* Rewinding mutates the session and may restart from an older
+         * snapshot boundary than the probe hinted, so re-validate the actual
+         * frontier: the common prefix must land exactly on the restored
+         * position and the vision state must still describe the request
+         * (upstream's multimodal hardening).  A failed validation falls
+         * through to the disk cache / cold prefill instead of reusing a bad
+         * frontier. */
+        const int rewound = ds4_session_pos(slot->session);
         const bool rewind_valid =
-            ds4_session_common_prefix(slot->session, &j->req.prompt) ==
-                reuse.reuse_tokens &&
+            ds4_session_common_prefix(slot->session, &j->req.prompt) == rewound &&
             (!multimodal ||
              ds4_session_vision_state_matches(slot->session,
                                               j->req.images,
@@ -13518,16 +13543,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         pthread_mutex_unlock(&s->inference_mu);
         if (rewind_valid) {
             live_materialized = true;
+            cached = rewound;
             cache_source = "memory-rewind";
-            cache_diag.rewind_to = reuse.reuse_tokens;
+            cache_diag.rewind_to = rewound;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                       old_pos, reuse.reuse_tokens);
+                       "ds4-server: rewound live prefix from %d to %d; the suffix will be reevaluated",
+                       old_pos, rewound);
         } else {
             cached = 0;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
-                       old_pos, reuse.reuse_tokens);
+                       "ds4-server: live prefix rewind from %d to %d requires rebuild",
+                       old_pos, rewound);
         }
         break;
     }
@@ -13997,6 +14023,10 @@ decode_again:
                 finish = "error";
                 break;
             }
+            /* The speculative block committed accepted tokens; record the
+             * frontier so rewinds inside the generated region restart from a
+             * snapshot instead of the prompt end. */
+            ds4_session_decode_frontier_note(slot->session);
         } else if (s->batched_mode && s->qwen4_batch_mtp &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
@@ -14216,7 +14246,11 @@ decode_again:
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
                 pthread_mutex_lock(&s->inference_mu);
-                ds4_session_invalidate(slot->session);
+                /* Keep the prefill frontier instead of invalidating: the KV
+                 * rows past the visible stop boundary cannot match what the
+                 * client will replay, but rewinding to the generation start
+                 * lets the next request reuse the whole prompt prefix. */
+                ds4_session_rewind(slot->session, prompt_for_sync->len);
                 pthread_mutex_unlock(&s->inference_mu);
                 text_stop = true;
                 stop_decode = true;

@@ -59,6 +59,32 @@ SSD-streaming path.
 - ROCm 10.0 supports published V4.1 Flash Q2 text/vision, resident experts, SSD streaming and [two-machine TCP/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed.
 - SSD measurements: 128 GB Framework Desktop, Ryzen AI Max+ 395, Radeon `gfx1151`; SK hynix PC711 1 TB (PCIe 3.0 ×4, ext4) holds the model. Linux `7.2.5-100.fc43.x86_64`, ROCm SDK `10.0.0-4` / HIP `7.15.26333`, TuneD **`accelerator-performance`**.
 
+### Decode is storage-bound
+
+The SSD table below shows decode holding near 10.3 t/s at every context size.
+Context-independent decode is the signature of a storage-bound workload: each
+token fetches its routed experts from the SSD, and 13.5 GB/s divided by
+10.3 t/s means roughly 1.3 GB of expert weights stream off the RAID per
+token — the array is saturated by expert-cache misses. Levers, in order:
+
+- Verify the GPU-visible pool with `rocminfo`. A stock ~62 GiB pool silently
+  clamps an `--ssd-streaming-cache-experts 92GB` request and raises the miss
+  rate; the boot parameters above expose ~124 GiB.
+- Raise the expert-cache budget toward the pool limit while keeping RAM for
+  the OS. Miss rate, not compute, is the decode limiter.
+- While storage-bound, decode scales nearly linearly with array bandwidth:
+  a fourth drive or Gen5 NVMe moves decode about as far as the bandwidth
+  moves.
+- With a high hit rate, decode becomes bandwidth/compute-bound. The resident
+  ceiling on this hardware class is a few times the storage-bound number;
+  M5 Max resident measurements in [performance](PERFORMANCE.md) are the
+  reference shape.
+
+Multi-turn agent dialogs add a second, avoidable cost: rebuilding the whole
+KV prefix after small divergences. The V4.1 frontier snapshot ring (see
+`ds41_frontier_*` in ds4.c) restores the live prefix at the divergence point
+instead, so only the divergent suffix is prefilled.
+
 ### SSD performance
 
 Native `ds4-bench`, 76 GiB expert-cache request, 34,816 allocated context, 128 greedy output tokens per frontier, no DSpark or images. First row is fresh prefill; subsequent rows append to restored prefixes. One run per row, startup excluded; no cold-cache claim. **Tokens/s**:
