@@ -81,6 +81,7 @@ GID=1                         # Choose this host's nonzero RoCE v2 GID for the c
 
 - RoCE transfers use buffers in system RAM. GPU-direct transfers are not implemented; RCCL is not required.
 - Explicit `tcp` or `rdma` fails if unavailable. `auto` negotiates configured RoCE, then TCP at connection setup; no mid-generation fallback.
+- Decoder SWA Bounded Replay is off by default. To enable it, set `DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY=1` on both coordinator and worker commands.
 
 ## Vision and first request
 

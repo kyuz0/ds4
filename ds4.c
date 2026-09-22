@@ -40305,7 +40305,7 @@ static uint32_t ds41_engram_host_capacity(uint32_t prefill, uint32_t carry) {
     X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
 
 typedef struct {
-    uint32_t ctx, pos, prefill_cap, carry_cap;
+    uint32_t ctx, pos, prefill_cap, carry_cap, swa_floor;
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
@@ -40455,6 +40455,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 
 static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
+    g->swa_floor = 0;
     g->valid = true;
     ds4_engram_history_reset(&g->history);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
@@ -40958,6 +40959,7 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, bool projected) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
+    if (pos < g->swa_floor) return false;
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
@@ -40972,7 +40974,8 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
                                          g->selected_comp, n_comp, attended)) return false;
-    const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
+    const uint32_t available = pos + 1u - g->swa_floor;
+    const uint32_t n_raw = available < 128u ? available : 128u;
     if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
@@ -41383,9 +41386,11 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t il, uint32_t count) {
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
+    if (start < g->swa_floor) return false;
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (start + count) / ratio : 0;
-    const uint32_t previous = start < 127u ? start : 127u;
+    const uint32_t available = start - g->swa_floor;
+    const uint32_t previous = available < 127u ? available : 127u;
     const uint32_t raw_start = (start - previous) % 128u;
     const uint32_t first = previous < 128u - raw_start ? previous : 128u - raw_start;
     const uint32_t n_raw = previous + count;
@@ -41796,6 +41801,14 @@ static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC"));
 }
 
+static bool ds41_decoder_bounded_replay_enabled(const ds41_gpu_graph *g, uint32_t count) {
+    /* SSD layer sweeps still stage each decoder layer even for 128 rows, so
+     * bounded replay loses the exact path's sequential staging without
+     * avoiding its dominant I/O. Keep SSD arithmetic and throughput exact. */
+    return metal_graph_tp_env_flag("DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY", false) &&
+        !g->streaming && count > 128u && g->carry_cap >= count;
+}
+
 static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) {
     /* TP batches use the bulk protocol; row-gate ablations stay token-major. */
     if (!ds41_tp_batch_enabled(g) || g->imatrix ||
@@ -41816,6 +41829,10 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
         minimum = 1024u;
 #endif
     if (remaining < minimum) return 1;
+    /* Decoder bounded replay needs only the final 128 encoder outputs. Keep a
+     * complete admitted append in one encoder sweep instead of rebuilding the
+     * decoder window after each artificial 2K scheduler chunk. */
+    if (ds41_decoder_bounded_replay_enabled(g, remaining)) return remaining;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     /* Keep a medium SSD append in one layer sweep without changing its
      * 2048-row arithmetic partitions. Tiny tails retain the exact row path. */
@@ -42218,9 +42235,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     const bool batch_core = batch_attention && !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE");
     const bool batch_hc = batch_attention && batch_moe &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
-    const bool decoder_suffix = wide && total_count >= 8192u &&
+    const bool bounded_replay = ds41_decoder_bounded_replay_enabled(g, total_count);
+    const bool decoder_suffix = !bounded_replay && wide && total_count >= 8192u &&
         !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
-    if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
+    if ((encoder_only || resume_encoder) && !decoder_suffix && !bounded_replay) return false;
 #ifdef DS4_ROCM_BUILD
     if (g->streaming && g->quality) return false;
 #endif
@@ -42229,6 +42247,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     if (!ds41_hash_tokens(g, &next_history, tokens, total_count, &ids[0][0][0]))
         return false;
     const uint32_t initial_start = g->pos;
+    g->swa_floor = 0;
     g->valid = false;
     ds41_gpu_graph row = *g;
     /* The complete current layer is mapped for prefill. Refresh the bounded
@@ -42314,7 +42333,13 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #endif
         const double t_map = profile ? now_sec() : 0;
         uint32_t first = 0;
-        if (ok && decoder_suffix && il >= 20u) {
+        if (ok && bounded_replay && il >= 20u) {
+            if (il == 20u)
+                ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
+                    0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
+            first = total_count - 128u;
+            g->swa_floor = initial_start + first;
+        } else if (ok && decoder_suffix && il >= 20u) {
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
@@ -42387,7 +42412,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                                         tokens[off + t], start + t);
                     }
                 }
-            } else if (wide) {
+            } else if (wide || (bounded_replay && il >= 20u)) {
                 if (ok) ok = ds41_carry_copy(g, off, count, false);
             }
             if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
@@ -42450,6 +42475,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                 row.pos = start + t;
+                row.swa_floor = g->swa_floor;
 #define DS41_USE_ROW(name, width) row.name = g->rows_view[t].name;
                 DS41_PREFILL_ROWS(DS41_USE_ROW)
 #undef DS41_USE_ROW
@@ -42534,7 +42560,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             DS41_STAGE("hc expand");
 #undef DS41_STAGE
-            if (ok && wide && il + 1u < DS4_N_LAYER) {
+            if (ok && (wide || (bounded_replay && il >= 19u)) && il + 1u < DS4_N_LAYER) {
                 ok = ds41_carry_copy(g, off, count, true);
             }
             const double t_encoded = profile ? now_sec() : 0;
@@ -42576,6 +42602,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     }
     if (!ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
+    g->swa_floor = 0;
 #ifdef DS4_ROCM_BUILD
     if (g->streaming && !ds41_stream_sweep_finish(&prepare)) ok = false;
     if (g->streaming && !ok) (void)ds4_gpu_synchronize();

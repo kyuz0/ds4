@@ -58,6 +58,7 @@ static int check_batch_admission(void) {
     REQUIRE(!ds41_sessions_batch_supported(items, 8, &engine));
     REQUIRE(unsetenv("DS4_METAL_DISABLE_V41_SESSION_BATCH") == 0);
     REQUIRE(ds41_sessions_batch_supported(items, 8, &engine));
+#ifndef DS4_ROCM_BUILD
     ds41_gpu_graph *graphs[] = {&sessions[0].ds41_graph, &sessions[1].ds41_graph};
     graphs[0]->prefill_cap = graphs[1]->prefill_cap = 8192;
     graphs[0]->ctx = 65536;
@@ -67,6 +68,7 @@ static int check_batch_admission(void) {
     REQUIRE(ds41_batch_workspace(graphs, 2) == graphs[0]);
     graphs[0]->prefill_cap = 1;
     REQUIRE(!ds41_batch_workspace(graphs, 2));
+#endif
     puts("V4.1 native batch admission and bounded-workspace fallback: PASS");
     rc = 0;
 done:
@@ -1382,21 +1384,30 @@ static int check_attention_batches(const char *path, bool batch_index) {
     int rc = 1;
     setenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS", "1", 1);
     if (!batch_index) setenv("DS4_METAL_DISABLE_V41_BATCH_INDEX", "1", 1);
-    ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
+    ds4_engine_options opt = {.model_path = path,
+#ifdef DS4_ROCM_BUILD
+        .backend = DS4_BACKEND_CUDA,
+#else
+        .backend = DS4_BACKEND_METAL,
+#endif
         .context_size = 19000, .power_percent = 100, .ssd_streaming = true,
         .ssd_streaming_cache_bytes = UINT64_C(32) * 1024 * 1024 * 1024};
     REQUIRE(ds4_engine_open(&engine, &opt) == 0);
     REQUIRE(ds4_session_create(&a, engine, 19000) == 0);
     REQUIRE(ds4_session_create(&b, engine, 19000) == 0);
     ds41_gpu_graph *old = &a->ds41_graph, *fast = &b->ds41_graph;
-    const struct { uint32_t start, count; } shapes[] = {
-        {0, 31}, {127, 129}, {129, 513}, {16383, 1025}};
+    const struct { uint32_t start, count, swa_floor; } shapes[] = {
+        {0, 31, 0}, {127, 129, 0}, {129, 513, 0}, {16383, 1025, 0},
+        {1024, 128, 1024}, {8192, 128, 8192}};
     const uint32_t layers[] = {0, 2, 3, 20, 24, 39};
     for (size_t shape = 0; shape < sizeof(shapes) / sizeof(*shapes); shape++) {
         const uint32_t start = shapes[shape].start, count = shapes[shape].count;
+        const uint32_t swa_floor = shapes[shape].swa_floor;
         for (size_t li = 0; li < sizeof(layers) / sizeof(*layers); li++) {
             const uint32_t il = layers[li], ratio = ds4_layer_compress_ratio(il);
+            if (swa_floor && il < 20u) continue;
             old->pos = fast->pos = start;
+            old->swa_floor = fast->swa_floor = swa_floor;
             ds41_state_span sa[64], sb[64];
             const uint32_t spans = ds41_state_spans(old, start + count, sa);
             REQUIRE(spans == ds41_state_spans(fast, start + count, sb));
@@ -1407,6 +1418,12 @@ static int check_attention_batches(const char *path, bool batch_index) {
                 for (uint64_t i = 0; i < sa[j].bytes / sizeof(float); i++)
                     x[i] = (float)((int)((i * 13u + j * 7u) % 101u) - 50) / 128.0f;
                 memcpy(ds4_gpu_tensor_contents(sb[j].tensor), x, (size_t)sa[j].bytes);
+            }
+            if (swa_floor) {
+                float *stale = ds4_gpu_tensor_contents(fast->window[il]);
+                REQUIRE(stale);
+                for (uint64_t i = 0; i < ds4_gpu_tensor_bytes(fast->window[il]) / sizeof(float); i++)
+                    stale[i] = (float)((int)(i % 37u) - 18) / 11.0f;
             }
             ds4_gpu_tensor *inputs[] = {old->batch.norm, old->batch.qr, old->batch.q, old->batch.kv};
             ds4_gpu_tensor *copies[] = {fast->batch.norm, fast->batch.qr, fast->batch.q, fast->batch.kv};
@@ -1467,8 +1484,8 @@ static int check_attention_batches(const char *path, bool batch_index) {
                 worst = fmax(worst, fabs(d));
             }
             const double relative = sqrt(error / fmax(norm, 1e-30));
-            fprintf(stderr, "V4.1 batched attention layer=%u start=%u count=%u RMS=%.9g max=%.9g\n",
-                    il, start, count, relative, worst);
+            fprintf(stderr, "V4.1 batched attention layer=%u start=%u count=%u floor=%u RMS=%.9g max=%.9g\n",
+                    il, start, count, swa_floor, relative, worst);
             REQUIRE(relative < 0.002);
         }
     }

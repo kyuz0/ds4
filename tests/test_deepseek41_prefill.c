@@ -2,6 +2,14 @@
 #include "../ds4.c"
 #include <assert.h>
 
+#ifdef DS4_ROCM_BUILD
+static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weights *w,
+                                         uint32_t remaining) {
+    (void)g; (void)w; (void)remaining;
+    return 0;
+}
+#endif
+
 #define CHECK(x) do { if (!(x)) { \
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); goto done; \
 } } while (0)
@@ -47,7 +55,7 @@ static int check_dispatch(void) {
                         remaining[i], expected, ds41_prefill_count(&g, remaining[i]));
                 CHECK(ds41_prefill_count(&g, remaining[i]) == expected);
                 uint32_t small = 0;
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
                 if (remaining[i] >= 2 && remaining[i] < 256)
                     small = remaining[i] < 8 ? remaining[i] : 8;
 #endif
@@ -55,6 +63,10 @@ static int check_dispatch(void) {
             }
         }
     }
+    CHECK(!ds41_decoder_bounded_replay_enabled(&g, 4096));
+    CHECK(setenv("DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY", "0", 1) == 0);
+    CHECK(!ds41_decoder_bounded_replay_enabled(&g, 4096));
+    CHECK(setenv("DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY", "1", 1) == 0);
     g.pos = 0;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     CHECK(ds41_prefill_count(&g, 2303) == 2048);
@@ -71,7 +83,9 @@ static int check_dispatch(void) {
     g.streaming = false;
     for (size_t i = 0; i < sizeof(remaining) / sizeof(*remaining); i++) {
         uint32_t expected = cold[i], small = 0;
-#ifdef __APPLE__
+        if (remaining[i] >= 129 && remaining[i] <= g.carry_cap)
+            expected = remaining[i];
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
         if (remaining[i] >= 32 && remaining[i] < 256) expected = remaining[i];
 #else
         if (remaining[i] >= 2 && remaining[i] < 256)
@@ -95,9 +109,17 @@ static int check_dispatch(void) {
     g.tp_world = 1;
     CHECK(ds41_prefill_count(&g, 7) == 1);
     CHECK(ds41_prefill_count(&g, 8) == 8);
-    for (size_t i = 0; i < sizeof(remaining) / sizeof(*remaining); i++)
-        CHECK(ds41_prefill_count(&g, remaining[i]) ==
-            (remaining[i] >= 8 && remaining[i] < 256 ? remaining[i] : cold[i]));
+    for (size_t i = 0; i < sizeof(remaining) / sizeof(*remaining); i++) {
+        uint32_t expected = remaining[i] >= 8 && remaining[i] < 256 ? remaining[i] : cold[i];
+        if (remaining[i] >= 129 && remaining[i] <= g.carry_cap)
+            expected = remaining[i];
+        CHECK(ds41_prefill_count(&g, remaining[i]) == expected);
+    }
+    CHECK(!ds41_decoder_bounded_replay_enabled(&g, 128));
+    CHECK(ds41_decoder_bounded_replay_enabled(&g, 129));
+    CHECK(ds41_decoder_bounded_replay_enabled(&g, g.carry_cap));
+    CHECK(!ds41_decoder_bounded_replay_enabled(&g, g.carry_cap + 1u));
+    CHECK(ds41_prefill_count(&g, 4096) == 4096);
     ds4_imatrix_collector imatrix = {0};
     g.imatrix = &imatrix;
     CHECK(ds41_prefill_count(&g, 65536) == 1);
@@ -114,6 +136,7 @@ static int check_dispatch(void) {
     puts("V4.1 cold/warm and TP prefill dispatch, tile boundaries and debug/imatrix fallbacks: PASS");
     rc = 0;
 done:
+    unsetenv("DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY");
     ds4_gpu_set_streaming_expert_cache_budget(saved);
     ds4_gpu_set_ssd_streaming(false);
     return rc;
