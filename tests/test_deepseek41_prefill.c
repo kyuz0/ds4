@@ -64,6 +64,9 @@ static int check_dispatch(void) {
         }
     }
     CHECK(!ds41_decoder_bounded_replay_enabled(&g, 4096));
+    CHECK(setenv("DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY", "0", 1) == 0);
+    CHECK(!ds41_decoder_bounded_replay_enabled(&g, 4096));
+    CHECK(setenv("DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY", "1", 1) == 0);
     g.pos = 0;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     CHECK(ds41_prefill_count(&g, 2303) == 2048);
@@ -133,6 +136,7 @@ static int check_dispatch(void) {
     puts("V4.1 cold/warm and TP prefill dispatch, tile boundaries and debug/imatrix fallbacks: PASS");
     rc = 0;
 done:
+    unsetenv("DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY");
     ds4_gpu_set_streaming_expert_cache_budget(saved);
     ds4_gpu_set_ssd_streaming(false);
     return rc;

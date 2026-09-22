@@ -97,6 +97,12 @@ VISION=gguf/DeepSeek-V4.1-Flash-Vision.gguf
 
 For sufficient RAM to keep experts resident, omit both SSD options. Keep `--vision` for images and set `--ctx` to the required allocation. See [image requests](MODELS.md#vision).
 
+For resident V4.1 inference, opt in to Decoder SWA Bounded Replay with `DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY=1`. It is off by default, replays only the final 128 prompt tokens through decoder layers, and does not apply to SSD streaming:
+
+```bash
+DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY=1 ./ds4 --rocm -m "$MODEL" --ctx 34816
+```
+
 ### Reproduce SSD measurements
 
 Prepare `bench-prompt.txt` as in the [cluster benchmark](CLUSTERING_ROCM.md#reproduce-the-table), then run from the engine build directory:

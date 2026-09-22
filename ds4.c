@@ -41805,7 +41805,8 @@ static bool ds41_decoder_bounded_replay_enabled(const ds41_gpu_graph *g, uint32_
     /* SSD layer sweeps still stage each decoder layer even for 128 rows, so
      * bounded replay loses the exact path's sequential staging without
      * avoiding its dominant I/O. Keep SSD arithmetic and throughput exact. */
-    return !g->streaming && count > 128u && g->carry_cap >= count;
+    return metal_graph_tp_env_flag("DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY", false) &&
+        !g->streaming && count > 128u && g->carry_cap >= count;
 }
 
 static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) {
