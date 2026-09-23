@@ -5782,6 +5782,11 @@ static bool parse_completion_request_with_vocab(ds4_engine *e, int vocab_size,
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "ignore_eos")) {
+            if (!parse_ignore_eos_value(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             bool ignored = false;
             if (!parse_thinking_control_value(&p, &ignored)) {
@@ -5821,6 +5826,11 @@ static bool parse_completion_request_with_vocab(ds4_engine *e, int vocab_size,
         request_free(r);
         return false;
     }
+    if (!request_validate_ignore_eos(r, err, errlen)) {
+        completion_prompt_free(&prompt);
+        request_free(r);
+        return false;
+    }
     r->think_mode = DS4_THINK_NONE;
     if (!completion_prompt_build(e, vocab_size, &prompt, r,
                                  err, errlen)) {
@@ -5848,6 +5858,12 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
 static bool request_token_is_stop(ds4_engine *e, const request *r, int token) {
     return r->kind == REQ_COMPLETION ? ds4_token_is_stop(e, token) :
         ds4_token_is_stop_for_think_mode(e, token, r->think_mode);
+}
+
+/* Raw completions may emit thinking tags; fixed-length decode only excludes
+ * generation stops, including in speculative drafts. */
+static ds4_think_mode request_ignore_eos_filter_mode(const request *r) {
+    return r->kind == REQ_COMPLETION ? DS4_THINK_HIGH : r->think_mode;
 }
 
 static long long wall_ms(void) {
@@ -14133,7 +14149,7 @@ decode_again:
         const int eos_token = ds4_token_eos(s->engine);
         int token = j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
-                                            j->req.think_mode) :
+                                            request_ignore_eos_filter_mode(&j->req)) :
             ds4_session_sample(slot->session, temperature, top_k,
                                top_p, min_p, &rng);
         if (token < 0) {
@@ -14158,7 +14174,7 @@ decode_again:
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
                     slot->session, token, max_tokens - completion,
-                    eos_token, j->req.think_mode,
+                    eos_token, request_ignore_eos_filter_mode(&j->req),
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
             } else {

@@ -333,10 +333,14 @@ static void test_raw_disk_prefix(ds4_engine *e) {
 
 static void test_raw_stop_tokens(ds4_engine *e) {
     request r = {.kind = REQ_COMPLETION, .think_mode = DS4_THINK_NONE};
+    TEST_ASSERT(request_ignore_eos_filter_mode(&r) == DS4_THINK_HIGH);
+    TEST_ASSERT(!fixture_is_stop_for_think_mode(
+        e, THINK, request_ignore_eos_filter_mode(&r)));
     TEST_ASSERT(!request_token_is_stop(e, &r, THINK));
     TEST_ASSERT(!request_token_is_stop(e, &r, END_THINK));
     TEST_ASSERT(request_token_is_stop(e, &r, EOS));
     r.kind = REQ_CHAT;
+    TEST_ASSERT(request_ignore_eos_filter_mode(&r) == DS4_THINK_NONE);
     TEST_ASSERT(request_token_is_stop(e, &r, THINK));
     TEST_ASSERT(request_token_is_stop(e, &r, END_THINK));
     TEST_ASSERT(request_token_is_stop(e, &r, EOS));
@@ -344,6 +348,41 @@ static void test_raw_stop_tokens(ds4_engine *e) {
     TEST_ASSERT(!request_token_is_stop(e, &r, THINK));
     TEST_ASSERT(!request_token_is_stop(e, &r, END_THINK));
     TEST_ASSERT(request_token_is_stop(e, &r, EOS));
+}
+
+static void test_raw_ignore_eos(ds4_engine *e) {
+    const char *valid[] = {
+        "{\"prompt\":\"ab\",\"temperature\":0,\"max_tokens\":128,\"ignore_eos\":true}",
+        "{\"prompt\":[97],\"temperature\":0,\"max_tokens\":128,\"ignore_eos\":true}"
+    };
+    for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+        request r;
+        char err[160] = {0};
+        bool ok = parse_completion_request(e, valid[i], 128, 4096,
+                                           &r, err, sizeof(err));
+        TEST_ASSERT(ok);
+        if (ok) {
+            TEST_ASSERT(r.ignore_eos);
+            TEST_ASSERT(r.temperature_set && r.temperature == 0.0f);
+            TEST_ASSERT(r.max_tokens == 128);
+            request_free(&r);
+        }
+    }
+    const char *invalid[] = {
+        "{\"prompt\":\"ab\",\"ignore_eos\":true}",
+        "{\"prompt\":\"ab\",\"temperature\":1,\"ignore_eos\":true}",
+        "{\"prompt\":\"ab\",\"temperature\":0,\"ignore_eos\":\"true\"}",
+        "{\"prompt\":[97],\"temperature\":0,\"ignore_eos\":null}"
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        request r;
+        char err[160] = {0};
+        bool ok = parse_completion_request(e, invalid[i], 128, 4096,
+                                           &r, err, sizeof(err));
+        TEST_ASSERT(!ok);
+        TEST_ASSERT(err[0] != '\0');
+        if (ok) request_free(&r);
+    }
 }
 
 int main(void) {
@@ -354,6 +393,7 @@ int main(void) {
         test_raw_live_prefix(&engine);
         test_raw_disk_prefix(&engine);
         test_raw_stop_tokens(&engine);
+        test_raw_ignore_eos(&engine);
     }
     if (test_failures) {
         fprintf(stderr, "raw completion tests: %d failure(s)\n", test_failures);
