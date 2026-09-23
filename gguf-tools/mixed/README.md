@@ -38,3 +38,21 @@ Layer ranges can be changed without editing the script:
 ```bash
 --q4-layers 0-2,40-42
 ```
+
+## GLM-5.3 Flash Q2/Q4
+
+To build the 137.9 GB mixed model for a 192 GB Strix Halo system, use the
+published Q4_K GGUF as the base and copy routed gate, up, and down experts in
+blocks `3-28` from the published Q2 GGUF:
+
+```bash
+python3 gguf-tools/mixed/splice_mixed_expert_layers_gguf.py \
+  --base /path/to/GLM-5.3-Flash-Q4_K.gguf \
+  --donor /path/to/GLM-5.3-Flash-Q2.gguf \
+  --donor-layers 3-28 \
+  --out /path/to/GLM-5.3-Flash-Mixed-L03-28.gguf
+```
+
+All other tensors, including the embedded MTP block, come from the Q4_K base.
+The output is a GGUF model file; use the matching GLM-5.3 Flash vision encoder
+GGUF for image inputs.

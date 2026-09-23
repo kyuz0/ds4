@@ -304,6 +304,10 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+/* Routed MoE sorting remains live while the caller reuses g_cuda_tmp for
+ * gate/up/down activations. Keep its bucket table in a separate allocation. */
+static void *g_cuda_moe_sorted_tmp;
+static uint64_t g_cuda_moe_sorted_tmp_bytes;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -627,6 +631,27 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     g_cuda_tmp = ptr;
     g_cuda_tmp_bytes = bytes;
     return g_cuda_tmp;
+}
+
+static void *cuda_moe_sorted_tmp_alloc(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    if (g_cuda_moe_sorted_tmp_bytes >= bytes) return g_cuda_moe_sorted_tmp;
+    if (g_cuda_moe_sorted_tmp) {
+        (void)cudaFree(g_cuda_moe_sorted_tmp);
+        g_cuda_moe_sorted_tmp = NULL;
+        g_cuda_moe_sorted_tmp_bytes = 0;
+    }
+    void *ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "MoE sorted scratch alloc failed (%.2f MiB): %s\n",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    g_cuda_moe_sorted_tmp = ptr;
+    g_cuda_moe_sorted_tmp_bytes = bytes;
+    return ptr;
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -6481,6 +6506,11 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
+    if (g_cuda_moe_sorted_tmp) {
+        (void)cudaFree(g_cuda_moe_sorted_tmp);
+        g_cuda_moe_sorted_tmp = NULL;
+        g_cuda_moe_sorted_tmp_bytes = 0;
+    }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -7062,7 +7092,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             (double)cuda_model_image_bytes() / 1073741824.0,
             (double)g_model_range_bytes / 1073741824.0,
             (double)g_q8_f16_bytes / 1073741824.0,
-            (double)g_cuda_tmp_bytes / 1073741824.0);
+            (double)(g_cuda_tmp_bytes + g_cuda_moe_sorted_tmp_bytes) / 1073741824.0);
     fprintf(stderr, "\n");
 }
 

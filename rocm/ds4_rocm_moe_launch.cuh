@@ -774,7 +774,15 @@ static int routed_moe_launch(
             (!q4k_path || n_tokens >= 32u) &&
             !disable_resident_iq2_sorted;
         const uint32_t use_expert_tiles = use_sorted_pairs;
-        const uint32_t expert_tile_m = n_tokens <= 8u ? 4u : 8u;
+        const uint32_t use_glm_q4_row8 =
+            g_glm_model && q4k_path && !g_ssd_streaming_mode &&
+            ds4_rocm_is_gfx1151() && n_tokens >= 32u &&
+            n_total_expert == 288u && n_expert == 8u &&
+            expert_in_dim == 4096u && expert_mid_dim == 2048u &&
+            out_dim == 4096u &&
+            use_sorted_pairs;
+        const uint32_t expert_tile_m =
+            use_glm_q4_row8 ? 4u : (n_tokens <= 8u ? 4u : 8u);
         const uint32_t write_gate_up = 0u;
         const bool use_v41_wave_gate = g_deepseek41_model && iq2_gate_path &&
             n_tokens == 1u && n_total_expert == 384u && n_expert == 6u &&
@@ -1074,8 +1082,9 @@ static int routed_moe_launch(
             const uint64_t tile4_starts_off = tile4_experts_off + tile4_experts_bytes;
             const uint64_t tile4_starts_bytes = (uint64_t)tile4_capacity * sizeof(uint32_t);
             const uint64_t scratch_bytes = tile4_starts_off + tile4_starts_bytes;
-            uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(scratch_bytes,
-                                                         "routed_moe sorted pairs");
+            /* GLM keeps gate/down activations in cuda_tmp_alloc; sorted buckets
+             * must survive the later mid quantization into that same buffer. */
+            uint8_t *scratch = (uint8_t *)cuda_moe_sorted_tmp_alloc(scratch_bytes);
             if (!scratch) {
                 ok = 0;
             } else {
@@ -1407,21 +1416,31 @@ static int routed_moe_launch(
             dim3 mgrid((expert_mid_dim + 31u) / 32u, pair_count, 1);
             if (ok && sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts && tile_total && tile_experts && tile_starts) {
                 if (q4k_path) {
-                    dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
-                    if (expert_tile_m == 8u) {
-                        moe_gate_up_mid_q4K_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                    if (use_glm_q4_row8) {
+                        dim3 row8grid((expert_mid_dim + 7u) / 8u, tile_capacity, 1);
+                        moe_gate_up_mid_q4K_expert_tile4_row8_kernel<<<row8grid, 64>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
                             0u, write_gate_up, clamp);
                     } else {
-                        moe_gate_up_mid_q4K_expert_tile4_row32_kernel<<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            0u, write_gate_up, clamp);
+                        dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
+                        if (expert_tile_m == 8u) {
+                            moe_gate_up_mid_q4K_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                0u, write_gate_up, clamp);
+                        } else {
+                            moe_gate_up_mid_q4K_expert_tile4_row32_kernel<<<tgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                0u, write_gate_up, clamp);
+                        }
                     }
                 } else if (mxfp4_path) {
                     if (use_mxfp4_tile32 && tile32_total && tile32_experts && tile32_starts) {
@@ -2000,19 +2019,28 @@ static int routed_moe_launch(
             } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
                 down_tile_total && down_tile_experts && down_tile_starts) {
                 if (q4k_path) {
-                    dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
-                    if (expert_tile_m == 8u) {
-                        moe_down_q4K_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                    if (use_glm_q4_row8) {
+                        dim3 row8grid((out_dim + 7u) / 8u, down_tile_capacity, 1);
+                        moe_down_q4K_expert_tile4_row8_kernel<<<row8grid, 64>>>(
                             use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                             down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                             down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                             midq_blocks, out_dim, n_expert, use_atomic_down);
                     } else {
-                        moe_down_q4K_expert_tile4_row32_kernel<<<tgrid, 256>>>(
-                            use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
-                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                            down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
-                            midq_blocks, out_dim, n_expert, use_atomic_down);
+                        dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
+                        if (expert_tile_m == 8u) {
+                            moe_down_q4K_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                                use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
+                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                                down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
+                                midq_blocks, out_dim, n_expert, use_atomic_down);
+                        } else {
+                            moe_down_q4K_expert_tile4_row32_kernel<<<tgrid, 256>>>(
+                                use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
+                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                                down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
+                                midq_blocks, out_dim, n_expert, use_atomic_down);
+                        }
                     }
                 } else if (mxfp4_path) {
                     const uint32_t row_blocks = (out_dim + 31u) / 32u;

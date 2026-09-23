@@ -8515,7 +8515,14 @@ static void model_map_span_vec_include_layer_decode(
         uint32_t                il) {
     const ds4_layer_weights *l = &w->layer[il];
     model_map_span_vec_include_layer_decode_static(spans, l);
-    if (!weights_streaming_layer_experts_uniform(w, il) ||
+    bool offclass_selected_cache = false;
+#ifdef DS4_ROCM_BUILD
+    offclass_selected_cache =
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        glm_stream_selected_expert_cache_supported(l, il) &&
+        glm_stream_decode_expert_cache_ready(w, l, il);
+#endif
+    if ((!weights_streaming_layer_experts_uniform(w, il) && !offclass_selected_cache) ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
          !glm_stream_decode_experts_are_streamed(w, l, il)) ||
         glm_stream_resident_decode_layer_enabled(l, il)) {
