@@ -737,6 +737,7 @@ __global__ static void glm53_rocm_kda_prefill_prepare_kernel(
     }
 }
 
+template<uint32_t WAVES>
 __global__ static void glm53_rocm_kda_prefill_recurrence_kernel(
         float *out,
         float *state,
@@ -748,7 +749,7 @@ __global__ static void glm53_rocm_kda_prefill_recurrence_kernel(
         uint32_t n_heads,
         uint32_t n_tokens) {
     const uint32_t head = blockIdx.x;
-    const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
+    const uint32_t value = blockIdx.y * WAVES + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     if (head >= n_heads || value >= GLM53_ROCM_KDA_DIM) return;
     const uint32_t projection = n_heads * GLM53_ROCM_KDA_DIM;
@@ -950,12 +951,24 @@ extern "C" int ds4_gpu_glm53_kda_prefill(
                  "GLM-5.3 KDA prefill prepare launch")) {
         return 0;
     }
-    const dim3 recurrence_grid(n_heads, 32u, 1u);
-    glm53_rocm_kda_prefill_recurrence_kernel<<<recurrence_grid, 128u>>>(
-        (float *)out->ptr, (float *)recurrent_state->ptr,
-        (const float *)q->ptr, (const float *)k->ptr,
-        (const float *)v->ptr, (const float *)raw_gate->ptr,
-        (const float *)raw_beta->ptr, n_heads, n_tokens);
+#ifdef __HIP_PLATFORM_AMD__
+    if (ds4_rocm_is_gfx1151()) {
+        glm53_rocm_kda_prefill_recurrence_kernel<16><<<
+            dim3(n_heads, 8u, 1u), 512u>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (const float *)q->ptr, (const float *)k->ptr,
+                (const float *)v->ptr, (const float *)raw_gate->ptr,
+                (const float *)raw_beta->ptr, n_heads, n_tokens);
+    } else
+#endif
+    {
+        glm53_rocm_kda_prefill_recurrence_kernel<4><<<
+            dim3(n_heads, 32u, 1u), 128u>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (const float *)q->ptr, (const float *)k->ptr,
+                (const float *)v->ptr, (const float *)raw_gate->ptr,
+                (const float *)raw_beta->ptr, n_heads, n_tokens);
+    }
     if (!cuda_ok(cudaGetLastError(),
                  "GLM-5.3 KDA prefill recurrence launch")) {
         return 0;
