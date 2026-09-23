@@ -260,6 +260,35 @@ __global__ static void glm53_rocm_matvec_bf16_f32_kernel(
     }
 }
 
+// Read adjacent BF16 elements together on the large decode projections.
+// The two values share the same input row and the same output accumulator.
+__global__ static void glm53_rocm_matvec_bf16_pair_f32_kernel(
+        float *out,
+        const uint16_t *weights,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x * 4u + warp;
+    const uint32_t row = blockIdx.y;
+    float sum = 0.0f;
+    if (col < out_dim) {
+        const uint16_t *wrow = weights + (uint64_t)col * in_dim;
+        const float *xrow = x + (uint64_t)row * in_dim;
+        for (uint32_t i = lane * 2u; i < in_dim; i += 64u) {
+            const float w0 = __uint_as_float((uint32_t)wrow[i] << 16);
+            const float w1 = __uint_as_float((uint32_t)wrow[i + 1u] << 16);
+            sum = fmaf(w0, xrow[i], sum);
+            sum = fmaf(w1, xrow[i + 1u], sum);
+        }
+    }
+    sum = warp_sum_f32(sum);
+    if (lane == 0u && col < out_dim) {
+        out[(uint64_t)row * out_dim + col] = sum;
+    }
+}
+
 __global__ static void glm53_rocm_matvec_bf16_row_f32_kernel(
         float *out,
         const uint16_t *weights,
@@ -362,6 +391,17 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
         "GLM-5.3 BF16 matrix");
     if (!weights) return 0;
     if (n_rows <= 8u) {
+        if (g_glm_model && ds4_rocm_is_gfx1151() &&
+            out_dim >= 4096u && in_dim >= 4096u &&
+            (in_dim & 1u) == 0u &&
+            getenv("DS4_ROCM_GLM_DISABLE_BF16_PAIR_MATVEC") == NULL) {
+            const dim3 pair_grid((out_dim + 3u) / 4u, n_rows, 1u);
+            glm53_rocm_matvec_bf16_pair_f32_kernel<<<pair_grid, 128u>>>(
+                (float *)out->ptr, (const uint16_t *)weights,
+                (const float *)x->ptr, in_dim, out_dim);
+            return cuda_ok(cudaGetLastError(),
+                           "GLM-5.3 BF16/F32 paired matvec launch");
+        }
         if (out_dim <= 128u && in_dim >= 4096u &&
             getenv("DS4_ROCM_GLM_DISABLE_BF16_ROW_MATVEC") == NULL) {
             const dim3 row_grid(out_dim, n_rows, 1u);
