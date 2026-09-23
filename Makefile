@@ -659,10 +659,13 @@ test-qwen4-vision: tests/test_qwen4_vision
 	  { echo "set DS4_QWEN4_SNAPSHOT, DS4_QWEN4_MMPROJ and DS4_QWEN4_IMAGE"; exit 1; }
 	python3 tests/qwen4_vision_ref.py --snapshot "$(DS4_QWEN4_SNAPSHOT)" --mmproj "$(DS4_QWEN4_MMPROJ)" --image "$(DS4_QWEN4_IMAGE)"
 
+tests/test_rocm_engine_stub.o: tests/test_rocm_engine_stub.c ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
 tests/test_glm53_kda_rocm.o: tests/test_glm53_kda.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-$(GLM53_KDA_ROCM_TEST): tests/test_glm53_kda_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS)
+$(GLM53_KDA_ROCM_TEST): tests/test_glm53_kda_rocm.o ds4_rocm.o ds4_image.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-glm53-kda-rocm: $(GLM53_KDA_ROCM_TEST)
@@ -671,7 +674,7 @@ test-glm53-kda-rocm: $(GLM53_KDA_ROCM_TEST)
 tests/test_glm_attention_rocm.o: tests/test_glm_attention.c ds4.h ds4_gpu.h ds4_linux_memory.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_glm_attention_rocm: tests/test_glm_attention_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS)
+tests/test_glm_attention_rocm: tests/test_glm_attention_rocm.o ds4_rocm.o ds4_image.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 .PHONY: test-glm-attention-rocm
@@ -853,7 +856,7 @@ tests/test_deepseek41_tp_rocm.o: tests/test_deepseek41_tp_rocm.c ds4_gpu.h ds4_d
 tests/test_deepseek41_tp_moe_rocm.o: tests/test_deepseek41_tp_moe_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-ds4-kernel-v41-tp-moe: tests/test_deepseek41_tp_moe_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp-moe: tests/test_deepseek41_tp_moe_rocm.o ds4_rocm.o ds4_image.rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 tests/test_rocm_tp_bind_failure.o: tests/test_rocm_tp_bind_failure.c ds4.c ds4.h ds4_gpu.h ds4_tp.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
@@ -865,38 +868,38 @@ ds4-kernel-v41-tp-bind-failure: tests/test_rocm_tp_bind_failure.o ds4_image.o ds
 tests/test_rocm_tp_gates.o: tests/test_rocm_tp_gates.c ds4_gpu.h ds4_tp.c ds4_tp_io.h ds4_tp_roce.h ds4_tp.h ds4.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -I. -c -o $@ $<
 
-ds4-kernel-v41-tp-gates: tests/test_rocm_tp_gates.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp-gates: tests/test_rocm_tp_gates.o ds4_rocm.o ds4_image.rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
 
 tests/test_deepseek41_tp_mmq_rocm.o: tests/test_deepseek41_tp_mmq_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-ds4-kernel-v41-tp-mmq: tests/test_deepseek41_tp_mmq_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp-mmq: tests/test_deepseek41_tp_mmq_rocm.o ds4_rocm.o ds4_image.rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 tests/test_deepseek41_tp_down_rocm.o: tests/test_deepseek41_tp_down_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-ds4-kernel-v41-tp-down: tests/test_deepseek41_tp_down_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp-down: tests/test_deepseek41_tp_down_rocm.o ds4_rocm.o ds4_image.rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
-ds4-kernel-v41-tp-attention: tests/test_deepseek41_tp_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp-attention: tests/test_deepseek41_tp_rocm.o ds4_rocm.o ds4_image.rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
-ds4-kernel-v41: tests/test_deepseek41_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41: tests/test_deepseek41_rocm.o ds4_rocm.o ds4_image.rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 .PHONY: test-deepseek41-rocm
 test-deepseek41-rocm: ds4-kernel-v41
 	./ds4-kernel-v41
 
-tests/test_mxfp4_rocm: tests/test_mxfp4_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS)
+tests/test_mxfp4_rocm: tests/test_mxfp4_rocm.o ds4_rocm.o ds4_image.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 tests/bench_mxfp4_rocm.o: tests/bench_mxfp4_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/bench_mxfp4_rocm: tests/bench_mxfp4_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS)
+tests/bench_mxfp4_rocm: tests/bench_mxfp4_rocm.o ds4_rocm.o ds4_image.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-mxfp4-rocm: tests/test_mxfp4_rocm
@@ -1199,7 +1202,7 @@ tests/test_qwen4_rocm.o: tests/test_qwen4_kernels.c ds4_gpu.h ds4.h ds4_qwen4_vi
 tests/qwen4_image_rocm.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
 	$(CC) $(CFLAGS) $(ROCM_HOST_CFLAGS) -c -o $@ $<
 
-tests/test_qwen4_rocm: tests/test_qwen4_rocm.o ds4_rocm.o tests/qwen4_image_rocm.o $(ROCM_MMQ_OBJS)
+tests/test_qwen4_rocm: tests/test_qwen4_rocm.o ds4_rocm.o tests/qwen4_image_rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 .PHONY: test-qwen4-rocm
@@ -1210,7 +1213,7 @@ test-qwen4-rocm: tests/test_qwen4_rocm
 tests/test_qwen4_rocm_production.o: tests/test_qwen4_rocm_production.c tests/test_qwen4_kernels.c ds4_gpu.h ds4.h
 	$(CC) $(QUALITY_CFLAGS) $(ROCM_HOST_CFLAGS) -D_GNU_SOURCE -DDS4_ROCM_BUILD -Wno-unused-function -I. -c -o $@ $<
 
-ds4-kernel-qwen-production: tests/test_qwen4_rocm_production.o ds4_rocm.o tests/qwen4_image_rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-qwen-production: tests/test_qwen4_rocm_production.o ds4_rocm.o tests/qwen4_image_rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 .PHONY: test-qwen4-rocm-production
