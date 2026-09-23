@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a mixed DeepSeek V4 Flash GGUF by splicing routed-expert layers.
+"""Build a mixed GGUF by splicing routed-expert layers.
 
 The base GGUF supplies metadata and all tensors by default.  For selected layer
 IDs, this copies the routed expert tensors from a donor GGUF, rewriting the GGUF
@@ -51,8 +51,8 @@ GGUF_SCALAR_SIZES = {
 }
 
 # GGML quant type -> (block elements, bytes per block, display name).
-# This intentionally includes the formats used by the current DeepSeek V4 Flash
-# GGUFs.  Add entries here if future recipes introduce new tensor types.
+# Includes the formats used by the current DeepSeek and GLM GGUFs. Add entries
+# here if future recipes introduce new tensor types.
 GGML_QUANT_SIZES = {
     0: (1, 4, "F32"),
     1: (1, 2, "F16"),
@@ -61,6 +61,7 @@ GGML_QUANT_SIZES = {
     12: (256, 144, "Q4_K"),
     16: (256, 66, "IQ2_XXS"),
     26: (1, 4, "I32"),
+    30: (1, 2, "BF16"),
 }
 
 EXPERT_TENSOR_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
@@ -244,16 +245,16 @@ def parse_layer_set(spec: str) -> set[int]:
     return layers
 
 
-def should_take_donor(name: str, q4_layers: set[int]) -> bool:
+def should_take_donor(name: str, donor_layers: set[int]) -> bool:
     match = EXPERT_TENSOR_RE.match(name)
-    return match is not None and int(match.group(1)) in q4_layers
+    return match is not None and int(match.group(1)) in donor_layers
 
 
 def qtype_name(ggml_type: int) -> str:
     return GGML_QUANT_SIZES.get(ggml_type, (0, 0, f"type_{ggml_type}"))[2]
 
 
-def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int]) -> list[SplicePlan]:
+def build_plan(base: GGUFInfo, donor: GGUFInfo, donor_layers: set[int]) -> list[SplicePlan]:
     if base.version != donor.version:
         raise ValueError(f"GGUF version mismatch: base={base.version} donor={donor.version}")
     if base.tensor_count != donor.tensor_count:
@@ -269,7 +270,7 @@ def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int]) -> list[Spl
             raise ValueError(f"donor is missing tensor {base_tensor.name}")
         if base_tensor.dims != donor_tensor.dims:
             raise ValueError(f"shape mismatch for {base_tensor.name}: {base_tensor.dims} vs {donor_tensor.dims}")
-        use_donor = should_take_donor(base_tensor.name, q4_layers)
+        use_donor = should_take_donor(base_tensor.name, donor_layers)
         source_tensor = donor_tensor if use_donor else base_tensor
         plan.append(SplicePlan(
             name=base_tensor.name,
@@ -369,21 +370,22 @@ def summarize(base: GGUFInfo, donor: GGUFInfo, plan: list[SplicePlan]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Splice selected DeepSeek V4 Flash routed-expert layers from a donor GGUF.")
+    parser = argparse.ArgumentParser(description="Splice selected routed-expert layers from a donor GGUF.")
     parser.add_argument("--base", required=True, type=Path, help="base GGUF used for metadata and default tensors")
     parser.add_argument("--donor", required=True, type=Path, help="donor GGUF used for selected routed expert layers")
     parser.add_argument("--out", required=True, type=Path, help="output mixed GGUF")
-    parser.add_argument("--q4-layers", required=True, help="comma-separated layer IDs/ranges to take from donor, e.g. 37-42")
+    parser.add_argument("--donor-layers", "--q4-layers", dest="donor_layers", required=True,
+                        help="comma-separated layer IDs/ranges to take from donor, e.g. 3-22")
     parser.add_argument("--dry-run", action="store_true", help="print the plan without writing the output")
     parser.add_argument("--force", action="store_true", help="overwrite --out if it already exists")
     args = parser.parse_args()
 
-    q4_layers = parse_layer_set(args.q4_layers)
-    print("q4 layers:", ",".join(str(x) for x in sorted(q4_layers)))
+    donor_layers = parse_layer_set(args.donor_layers)
+    print("donor layers:", ",".join(str(x) for x in sorted(donor_layers)))
 
     base = parse_gguf(args.base)
     donor = parse_gguf(args.donor)
-    plan = build_plan(base, donor, q4_layers)
+    plan = build_plan(base, donor, donor_layers)
     summarize(base, donor, plan)
 
     if args.dry_run:
