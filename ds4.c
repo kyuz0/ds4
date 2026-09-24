@@ -76120,6 +76120,30 @@ static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
     if (accepted_first) s->qwen4_depth_accepted++;
 }
 
+static int qwen4_spec_target_argmax(ds4_session *s, const float *logits,
+                                    bool ignore_eos,
+                                    ds4_think_mode think_mode) {
+    const int top = sample_argmax(logits, DS4_N_VOCAB);
+    if (!ignore_eos ||
+        !ds4_token_is_stop_for_think_mode(s->engine, top, think_mode)) {
+        return top;
+    }
+    int best = -1;
+    float best_logit = DS4_NEG_INF;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        if (ds4_token_is_stop_for_think_mode(s->engine, (int)i,
+                                             think_mode)) {
+            continue;
+        }
+        const float value = logits[i];
+        if (best < 0 || value > best_logit) {
+            best = (int)i;
+            best_logit = value;
+        }
+    }
+    return best;
+}
+
 /* One Qwen3.8 MTP cycle: evaluate first_token, or verify [first_token, draft]
  * — plus a second chained draft when the depth policy engages it — in one
  * 2- or 3-row pass.  Greedy and opportunistic sampling accept a draft when
@@ -76128,6 +76152,7 @@ static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
  * depth 2. */
 static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float temperature, int top_k,
                                         float top_p, float min_p, uint64_t *rng, bool exact_sampling,
+                                        bool ignore_eos, ds4_think_mode think_mode,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     ds4_engine *e = s->engine;
@@ -76153,7 +76178,8 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
         s->glm_spec_inside = 0;
         if (rc != 0) return -1;
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = qwen4_spec_target_argmax(s, s->logits,
+                                                    ignore_eos, think_mode);
         int draft = -1;
         s->glm_mtp_have2 = false;
         if (qwen4_graph_mtp_step(&s->qwen4_graph, m, w, 0, parent, pos, true, NULL, &draft)) {
@@ -76217,10 +76243,19 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     token_vec_push(&s->checkpoint, first_token);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
-    bool accept = sample_argmax(rows, V) == d || qwen4_spec_force_accept();
+    const bool force_accept = qwen4_spec_force_accept();
+    const bool draft_allowed = !ignore_eos ||
+        !ds4_token_is_stop_for_think_mode(s->engine, d, think_mode);
+    bool accept = draft_allowed &&
+        (qwen4_spec_target_argmax(s, rows, ignore_eos, think_mode) == d ||
+         force_accept);
     bool accept2 = false;
     if (deep) {
-        accept2 = accept && (sample_argmax(rows + V, V) == d2 || qwen4_spec_force_accept());
+        const bool draft2_allowed = !ignore_eos ||
+            !ds4_token_is_stop_for_think_mode(s->engine, d2, think_mode);
+        accept2 = accept && draft2_allowed &&
+            (qwen4_spec_target_argmax(s, rows + V, ignore_eos,
+                                      think_mode) == d2 || force_accept);
     }
     int replacement = -1;
     if (exact_sampling && temperature > 0.0f) {
@@ -76253,7 +76288,8 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         token_vec_push(&s->checkpoint, d);
         if (deep) token_vec_push(&s->checkpoint, d2);
         memcpy(s->logits, rows + (T - 1u) * V, (size_t)V * sizeof(float));
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = qwen4_spec_target_argmax(s, s->logits,
+                                                    ignore_eos, think_mode);
         bool have_next = false;
         int draft = -1;
         if (deep) {
@@ -76297,7 +76333,8 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         s->checkpoint.len = pos + 1;
         token_vec_push(&s->checkpoint, d);
         memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = qwen4_spec_target_argmax(s, s->logits,
+                                                    ignore_eos, think_mode);
         const int next_tokens[2] = {d, parent};
         int draft = -1;
         if (qwen4_graph_mtp_steps(g, m, w, 0, next_tokens, 2u, pos, true, NULL, &draft)) {
@@ -76330,14 +76367,18 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
             return -1;
         }
         token_vec_push(&s->checkpoint, replacement);
-        qwen4_session_draft(s, 0, sample_argmax(s->logits, V), pos + 1u);
+        qwen4_session_draft(s, 0,
+                            qwen4_spec_target_argmax(s, s->logits,
+                                                    ignore_eos, think_mode),
+                            pos + 1u);
         accepted[0] = first_token;
         accepted[1] = replacement;
         return 2;
     }
     memcpy(s->logits, rows, (size_t)V * sizeof(float));
     {
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = qwen4_spec_target_argmax(s, s->logits,
+                                                    ignore_eos, think_mode);
         int draft = -1;
         if (qwen4_graph_mtp_step(g, m, w, 0, parent, pos, true, NULL, &draft)) {
             s->glm_mtp_draft = draft;
@@ -86619,6 +86660,7 @@ static int ds4_session_eval_speculative_argmax_impl(
 #ifdef DS4_HAS_QWEN4_GPU
         if (s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && s->qwen4_graph_ready) {
             return ds4_session_qwen4_spec_cycle(s, first_token, 0.0f, 0, 0.0f, 0.0f, NULL, false,
+                                                ignore_eos, think_mode,
                                                 accepted, accepted_cap, err, errlen);
         }
 #endif
@@ -87495,6 +87537,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
         if (s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && s->qwen4_graph_ready) {
             return ds4_session_qwen4_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng,
                                                 s->engine->dspark_exact_sampling,
+                                                false, DS4_THINK_HIGH,
                                                 accepted, accepted_cap, err, errlen);
         }
 #endif
