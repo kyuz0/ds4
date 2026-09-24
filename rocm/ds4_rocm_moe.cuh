@@ -1595,6 +1595,134 @@ __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
     }
 }
 
+// Expand each IQ2 sub-block once before dotting the participating token rows.
+__device__ static void dev_dot_iq2_xxs_q8_K_block4_deq_lut(
+        const cuda_block_iq2_xxs *x,
+        const cuda_block_q8_K *y0,
+        const cuda_block_q8_K *y1,
+        const cuda_block_q8_K *y2,
+        const cuda_block_q8_K *y3,
+        uint32_t n,
+        float acc[4],
+        const uint64_t *grid,
+        const uint8_t *signs) {
+    const float xd = dev_f16_to_f32(x->d);
+    const uint16_t *q2 = x->qs;
+    int32_t bsum[4] = {0, 0, 0, 0};
+    const int8_t *q8[4] = {
+        y0 ? y0->qs : NULL, y1 ? y1->qs : NULL, y2 ? y2->qs : NULL, y3 ? y3->qs : NULL,
+    };
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
+        int32_t w[8];
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
+        for (uint32_t p = 0; p < n; p++) {
+            const int8_t *q = q8[p] + ib32 * 32;
+            int32_t sumi = 0;
+            sumi = __dp4a(w[0], *(const int32_t *)(q + 0),  sumi);
+            sumi = __dp4a(w[1], *(const int32_t *)(q + 4),  sumi);
+            sumi = __dp4a(w[2], *(const int32_t *)(q + 8),  sumi);
+            sumi = __dp4a(w[3], *(const int32_t *)(q + 12), sumi);
+            sumi = __dp4a(w[4], *(const int32_t *)(q + 16), sumi);
+            sumi = __dp4a(w[5], *(const int32_t *)(q + 20), sumi);
+            sumi = __dp4a(w[6], *(const int32_t *)(q + 24), sumi);
+            sumi = __dp4a(w[7], *(const int32_t *)(q + 28), sumi);
+            bsum[p] += sumi * ls;
+        }
+    }
+    const cuda_block_q8_K *ys[4] = { y0, y1, y2, y3 };
+    for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
+}
+
+// GLM two-token IQ2 verification: reuse each expanded weight across token rows.
+// One wave covers four output rows; the small lookup tables stay in LDS.
+// Integer dots, Q8_K scales, quarter-wave reductions and SwiGLU are unchanged.
+__global__ static void glm53_rocm_iq2_gate_up_verify_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t max_count,
+        uint32_t write_aux,
+        float clamp) {
+    uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 4u + (threadIdx.x >> 3u);
+    uint32_t expert = tile_experts[tile];
+    uint32_t count = counts[expert];
+    if (max_count != 0u && count >= max_count) return;
+    uint32_t local_start = tile_starts[tile];
+    __shared__ uint64_t grids[256];
+    __shared__ uint8_t signs[128];
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) grids[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+    uint32_t pair[4] = {0, 0, 0, 0};
+    uint32_t tok[4] = {0, 0, 0, 0};
+    uint32_t slot[4] = {0, 0, 0, 0};
+    const cuda_block_q8_K *xqb[4] = {NULL, NULL, NULL, NULL};
+    uint32_t np = 0;
+    for (; np < 4u; np++) {
+        uint32_t local_pair = local_start + np;
+        if (local_pair >= count) break;
+        pair[np] = sorted_pairs[offsets[expert] + local_pair];
+        tok[np] = pair[np] / n_expert;
+        slot[np] = pair[np] - tok[np] * n_expert;
+        xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
+    }
+    if (row >= expert_mid_dim) return;
+    const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    float gate[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float up[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll 1
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        dev_dot_iq2_xxs_q8_K_block4_deq_lut(gr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL, np, gate, grids, signs);
+        dev_dot_iq2_xxs_q8_K_block4_deq_lut(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL, np, up, grids, signs);
+    }
+    for (uint32_t p = 0; p < np; p++) {
+        gate[p] = quarter_warp_sum_f32(gate[p], lane);
+        up[p] = quarter_warp_sum_f32(up[p], lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate[p] > clamp) gate[p] = clamp;
+                if (up[p] > clamp) up[p] = clamp;
+                if (up[p] < -clamp) up[p] = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate[p];
+                up_out[off] = up[p];
+            }
+            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+        }
+    }
+}
+
+
 __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
         float *gate_out,
         float *up_out,

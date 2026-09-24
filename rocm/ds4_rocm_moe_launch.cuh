@@ -1582,6 +1582,16 @@ static int routed_moe_launch(
                         tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                         gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
                         iq2_gate_scalar_max, write_gate_up, clamp);
+                } else if (g_glm_model && ds4_rocm_is_gfx1151() && n_tokens == 2u &&
+                           expert_in_dim == 4096u && expert_mid_dim == 2048u) {
+                    // The number of nonempty tiles cannot exceed the routed token/expert pairs.
+                    dim3 tgrid((expert_mid_dim + 3u) / 4u, n_tokens * n_expert, 1);
+                    glm53_rocm_iq2_gate_up_verify_kernel<<<tgrid, 32>>>(
+                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                        gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                        tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                        gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        iq2_gate_scalar_max, write_gate_up, clamp);
                 } else {
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
                     moe_gate_up_mid_expert_tile4_row32_kernel<<<tgrid, 256>>>(
