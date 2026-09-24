@@ -74765,6 +74765,9 @@ static int ds4_session_glm_spec_cycle_impl(
     int toks[2] = { first_token, d };
     bool verified = false;
     bool state_saved = false;
+#ifdef DS4_ROCM_BUILD
+    const uint32_t dense_limit = glm_graph_dense_compact_attention_limit(g);
+#endif
     if (g->glm53) {
         state_saved = glm_graph_mtp_ensure(g) &&
                     glm53_graph_copy_spec_state(g, true);
@@ -74788,6 +74791,28 @@ static int ds4_session_glm_spec_cycle_impl(
                                                      0,
                                                      2);
             } else {
+#ifdef DS4_ROCM_BUILD
+                /* ROCm indexed prefill cannot cross the dense-to-sparse
+                 * selection boundary in one batch. Verify each row on its
+                 * side of the boundary while preserving both hidden rows. */
+                if (pos < dense_limit && pos + 2u > dense_limit) {
+                    verified =
+                        glm_graph_forward_indexed_tokens(g, &e->model,
+                                                         &e->weights, toks,
+                                                         NULL, NULL, 0,
+                                                         pos, 1,
+                                                         s->glm_mtp_hc,
+                                                         NULL, NULL, NULL,
+                                                         pos, 0, 2) &&
+                        glm_graph_forward_indexed_tokens(g, &e->model,
+                                                         &e->weights, toks + 1,
+                                                         NULL, NULL, 0,
+                                                         pos + 1u, 1,
+                                                         s->glm_mtp_hc + hc_row_values,
+                                                         s->logits, NULL, NULL,
+                                                         pos, 1, 2);
+                } else
+#endif
                 verified = glm_graph_forward_indexed_tokens(g,
                                                              &e->model,
                                                              &e->weights,
