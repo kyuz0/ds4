@@ -1520,24 +1520,42 @@ __global__ void vis_qkv(float *q, float *k, float *v, const float *qkv, const fl
     for (unsigned i = tid; i < E; i += blockDim.x) v[off+i] = src[2*E+i] + bias[2*E+i];
 }
 
+static constexpr unsigned VIS_ATTN_WAVES = 32;
+static constexpr unsigned VIS_ATTN_KEY_TILE = 48;
+
 __global__ void vis_attention(float *out, const float *q, const float *k, const float *v,
         unsigned N, unsigned H, unsigned D) {
-    const unsigned row = blockIdx.x, h = blockIdx.y, lane = threadIdx.x, E = H*D;
+    extern __shared__ float kv[];
+    const unsigned row = blockIdx.x*VIS_ATTN_WAVES + threadIdx.x/32, h = blockIdx.y;
+    const unsigned lane = threadIdx.x & 31, E = H*D;
+    const bool active = row < N;
     const uint64_t qb = (uint64_t)row*E + h*D;
     float query[3] = {}, acc[3] = {};
-    for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) query[j] = q[qb+lane+j*32];
+    for (unsigned j = 0; active && j < 3; j++) if (lane+j*32 < D) query[j] = q[qb+lane+j*32];
     float mx = -INFINITY, denom = 0;
-    for (unsigned p = 0; p < N; p++) {
-        const uint64_t kb = (uint64_t)p*E + h*D;
-        float score = 0;
-        for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) score += query[j]*k[kb+lane+j*32];
-        score = sum(score) * rsqrtf((float)D);
-        const float nm = fmaxf(mx, score), old = expf(mx-nm), prob = expf(score-nm);
-        denom = denom*old + prob;
-        for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) acc[j] = acc[j]*old + prob*v[kb+lane+j*32];
-        mx = nm;
+    for (unsigned p0 = 0; p0 < N; p0 += VIS_ATTN_KEY_TILE) {
+        const unsigned count = min(VIS_ATTN_KEY_TILE, N-p0), elems = count*D;
+        for (unsigned i = threadIdx.x; i < 2*elems; i += blockDim.x) {
+            const bool is_v = i >= elems;
+            const unsigned j = is_v ? i-elems : i;
+            const uint64_t src = (uint64_t)(p0+j/D)*E + h*D + j%D;
+            kv[i] = is_v ? v[src] : k[src];
+        }
+        __syncthreads();
+        if (active) for (unsigned p = 0; p < count; p++) {
+            const unsigned kb = p*D;
+            float score = 0;
+            for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) score += query[j]*kv[kb+lane+j*32];
+            score = sum(score) * rsqrtf((float)D);
+            const float nm = fmaxf(mx, score), old = expf(mx-nm), prob = expf(score-nm);
+            denom = denom*old + prob;
+            for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D)
+                acc[j] = acc[j]*old + prob*kv[elems+kb+lane+j*32];
+            mx = nm;
+        }
+        __syncthreads();
     }
-    for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) out[qb+lane+j*32] = acc[j]/denom;
+    for (unsigned j = 0; active && j < 3; j++) if (lane+j*32 < D) out[qb+lane+j*32] = acc[j]/denom;
 }
 
 __global__ void vis_add(float *x, const float *add, const float *bias, unsigned N, unsigned E, unsigned mode) {
@@ -2333,7 +2351,9 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
             const float *qb = wf(lw.qkv_b,3*E);
             if (!ok || !qb) { ok = false; break; }
             vis_qkv<<<N,256,0,0>>>(ptr(q),ptr(k),ptr(v),ptr(qkv),qb,H,D,grid_w);
-            vis_attention<<<dim3(N,H),32,0,0>>>(ptr(attn),ptr(q),ptr(k),ptr(v),N,H,D);
+            vis_attention<<<dim3((N + VIS_ATTN_WAVES - 1) / VIS_ATTN_WAVES, H),
+                32*VIS_ATTN_WAVES, 2*VIS_ATTN_KEY_TILE*D*sizeof(float), 0>>>(
+                    ptr(attn),ptr(q),ptr(k),ptr(v),N,H,D);
             ok = launched() && mm(tmp,attn,lw.out_w,lw.out_type,N,E,E) && add(x,tmp,lw.out_b,N,E,2) &&
                  norm(tmp,x,lw.ln2_w,lw.ln2_b) && mm(ffn,tmp,lw.up_w,lw.up_type,N,E,FF) &&
                  add(ffn,NULL,lw.up_b,N,FF,0) && mm(tmp,ffn,lw.down_w,lw.down_type,N,FF,E) &&
