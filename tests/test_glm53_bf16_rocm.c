@@ -102,5 +102,6 @@ int main(void) {
     check_shape(4096, 4096);
     check_shape(4098, 4097);
     check_shape(8192, 4096);
+    check_shape(4096, 8193);
     return 0;
 }

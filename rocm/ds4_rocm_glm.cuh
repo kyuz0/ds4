@@ -289,6 +289,60 @@ __global__ static void glm53_rocm_matvec_bf16_pair_f32_kernel(
     }
 }
 
+// Prefetch eight adjacent weight pairs per lane to cover memory latency.
+// Each token retains the paired matvec's FMA order and wave reduction.
+// Two-token verification shares the prefetched weights without extra storage.
+template<int TOKENS>
+__global__ static void glm53_rocm_matvec_bf16_prefetch_f32_kernel(
+        float *out,
+        const uint16_t *__restrict__ weights,
+        const float *__restrict__ x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    constexpr uint32_t PAIRS = 8u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x * 2u + (threadIdx.x >> 5u);
+    const uint16_t *wrow = weights + (uint64_t)col * in_dim;
+    float sum[TOKENS] = {};
+    for (uint32_t base = lane * 2u; base < in_dim; base += 64u * PAIRS) {
+        float weight[PAIRS][2];
+        float input[PAIRS][TOKENS][2];
+        #pragma unroll
+        for (uint32_t pair = 0; pair < PAIRS; pair++) {
+            const uint32_t i = base + 64u * pair;
+            if (i + 1u < in_dim && col < out_dim) {
+                const uint32_t packed = *(const uint32_t *)(wrow + i);
+                weight[pair][0] = __uint_as_float(packed << 16);
+                weight[pair][1] = __uint_as_float(packed & 0xffff0000u);
+            } else {
+                weight[pair][0] = weight[pair][1] = 0.0f;
+            }
+            #pragma unroll
+            for (int token = 0; token < TOKENS; token++) {
+                #pragma unroll
+                for (uint32_t j = 0; j < 2u; j++) {
+                    input[pair][token][j] = i + j < in_dim
+                        ? x[(uint64_t)token * in_dim + i + j] : 0.0f;
+                }
+            }
+        }
+        #pragma unroll
+        for (uint32_t pair = 0; pair < PAIRS; pair++) {
+            if (base + 64u * pair >= in_dim) continue;
+            #pragma unroll
+            for (int token = 0; token < TOKENS; token++) {
+                sum[token] = fmaf(weight[pair][0], input[pair][token][0], sum[token]);
+                sum[token] = fmaf(weight[pair][1], input[pair][token][1], sum[token]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int token = 0; token < TOKENS; token++) {
+        const float value = warp_sum_f32(sum[token]);
+        if (lane == 0u && col < out_dim) out[(uint64_t)token * out_dim + col] = value;
+    }
+}
+
 // Verify two tokens together, loading each BF16 weight once. Each token keeps
 // the paired matvec's FMA order and wave reduction, without a temporary buffer.
 __global__ static void glm53_rocm_matvec_bf16_pair_tok2_f32_kernel(
@@ -424,6 +478,22 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
             out_dim >= 4096u && in_dim >= 4096u &&
             (in_dim & 1u) == 0u &&
             getenv("DS4_ROCM_GLM_DISABLE_BF16_PAIR_MATVEC") == NULL) {
+            // Keep the lower-register two-token path for vocabulary-sized outputs.
+            if ((n_rows == 1u || (n_rows == 2u && out_dim <= 8192u)) &&
+                (weight_offset & 3u) == 0u) {
+                const dim3 grid((out_dim + 1u) / 2u, 1u, 1u);
+                if (n_rows == 1u) {
+                    glm53_rocm_matvec_bf16_prefetch_f32_kernel<1><<<grid, 64u>>>(
+                        (float *)out->ptr, (const uint16_t *)weights,
+                        (const float *)x->ptr, in_dim, out_dim);
+                } else {
+                    glm53_rocm_matvec_bf16_prefetch_f32_kernel<2><<<grid, 64u>>>(
+                        (float *)out->ptr, (const uint16_t *)weights,
+                        (const float *)x->ptr, in_dim, out_dim);
+                }
+                return cuda_ok(cudaGetLastError(),
+                               "GLM-5.3 BF16/F32 prefetch matvec launch");
+            }
             if (n_rows == 2u) {
                 glm53_rocm_matvec_bf16_pair_tok2_f32_kernel<<<out_dim, 32u>>>(
                     (float *)out->ptr, (const uint16_t *)weights,
