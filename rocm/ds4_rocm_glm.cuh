@@ -289,6 +289,35 @@ __global__ static void glm53_rocm_matvec_bf16_pair_f32_kernel(
     }
 }
 
+// Verify two tokens together, loading each BF16 weight once. Each token keeps
+// the paired matvec's FMA order and wave reduction, without a temporary buffer.
+__global__ static void glm53_rocm_matvec_bf16_pair_tok2_f32_kernel(
+        float *out,
+        const uint16_t *weights,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    const uint16_t *wrow = weights + (uint64_t)col * in_dim;
+    for (uint32_t i = lane * 2u; i < in_dim; i += 64u) {
+        const float w0 = __uint_as_float((uint32_t)wrow[i] << 16);
+        const float w1 = __uint_as_float((uint32_t)wrow[i + 1u] << 16);
+        sum0 = fmaf(w0, x[i], sum0);
+        sum0 = fmaf(w1, x[i + 1u], sum0);
+        sum1 = fmaf(w0, x[(uint64_t)in_dim + i], sum1);
+        sum1 = fmaf(w1, x[(uint64_t)in_dim + i + 1u], sum1);
+    }
+    sum0 = warp_sum_f32(sum0);
+    sum1 = warp_sum_f32(sum1);
+    if (lane == 0u) {
+        out[col] = sum0;
+        out[(uint64_t)out_dim + col] = sum1;
+    }
+}
+
 __global__ static void glm53_rocm_matvec_bf16_row_f32_kernel(
         float *out,
         const uint16_t *weights,
@@ -395,6 +424,13 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
             out_dim >= 4096u && in_dim >= 4096u &&
             (in_dim & 1u) == 0u &&
             getenv("DS4_ROCM_GLM_DISABLE_BF16_PAIR_MATVEC") == NULL) {
+            if (n_rows == 2u) {
+                glm53_rocm_matvec_bf16_pair_tok2_f32_kernel<<<out_dim, 32u>>>(
+                    (float *)out->ptr, (const uint16_t *)weights,
+                    (const float *)x->ptr, in_dim, out_dim);
+                return cuda_ok(cudaGetLastError(),
+                               "GLM-5.3 BF16/F32 two-token matvec launch");
+            }
             const dim3 pair_grid((out_dim + 3u) / 4u, n_rows, 1u);
             glm53_rocm_matvec_bf16_pair_f32_kernel<<<pair_grid, 128u>>>(
                 (float *)out->ptr, (const uint16_t *)weights,
