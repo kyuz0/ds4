@@ -1938,7 +1938,9 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
         uint32_t n_expert,
         uint32_t max_count,
         uint32_t write_aux,
-        float clamp) {
+        float clamp,
+        const char *const *gate_slots = NULL,
+        const char *const *up_slots = NULL) {
     uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     uint32_t lane = threadIdx.x & 7u;
@@ -1946,6 +1948,13 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
     uint32_t expert = tile_experts[tile];
     uint32_t count = counts[expert];
     if (max_count != 0u && count >= max_count) return;
+    /* Streaming cache: experts live in independent slots.  A NULL slot means
+     * the expert belongs to the other phase of a resident/missing split. */
+    const char *gate_e = gate_slots ? gate_slots[expert] :
+        gate_base + (uint64_t)expert * gate_expert_bytes;
+    const char *up_e = up_slots ? up_slots[expert] :
+        up_base + (uint64_t)expert * gate_expert_bytes;
+    if (!gate_e || !up_e) return;
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[8][16];
     __shared__ uint64_t s_iq2_grid[256];
@@ -1979,8 +1988,8 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
-        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_e + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_e + (uint64_t)row * gate_row_bytes);
         float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
@@ -4945,7 +4954,8 @@ __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
         uint32_t n_expert,
         uint32_t n_tokens = 0u,
         const uint32_t *active_count = NULL,
-        const uint32_t *active_experts = NULL) {
+        const uint32_t *active_experts = NULL,
+        const char *const *down_slots = NULL) {
     extern __shared__ float shmid[];
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -4959,7 +4969,10 @@ __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
     const uint32_t count = counts[expert];
     if (count == 0u || count < min_count || (max_count != 0u && count >= max_count)) return;
     const uint32_t first = offsets[expert];
-    const unsigned char *drow = (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)(row_valid ? row : 0u) * down_row_bytes;
+    const unsigned char *dexp = down_slots ? (const unsigned char *)down_slots[expert] :
+        (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
+    if (!dexp) return;
+    const unsigned char *drow = dexp + (uint64_t)(row_valid ? row : 0u) * down_row_bytes;
     const uint32_t nb = expert_mid_dim >> 8u;
     for (uint32_t p0 = 0; p0 < count; p0 += PAIR_TILE) {
         uint32_t pair[PAIR_TILE];
@@ -5112,7 +5125,10 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
         uint32_t expert_mid_dim,
         uint64_t gate_expert_bytes,
         uint64_t gate_row_bytes,
-        float clamp) {
+        float clamp,
+        uint32_t n_expert = 6u,
+        const char *const *gate_slots = NULL,
+        const char *const *up_slots = NULL) {
     extern __shared__ unsigned char raw_sh[];
     half *shA = reinterpret_cast<half *>(raw_sh);
     half *shBg0 = shA + MTILES * BM * BK;
@@ -5134,9 +5150,14 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
     const uint32_t wave = tid >> 5u;
     const uint32_t first = offsets[expert];
     __shared__ uint32_t shPair[MTILES * BM];
+    __shared__ uint32_t shTok[MTILES * BM];
     for (uint32_t j = tid; j < MTILES * BM; j += blockDim.x) {
         const uint32_t bucket_row = m_group0 + j;
-        shPair[j] = (bucket_row < count) ? pairs[first + bucket_row] : UINT32_MAX;
+        const uint32_t p = (bucket_row < count) ? pairs[first + bucket_row] : UINT32_MAX;
+        shPair[j] = p;
+        /* Pairs are token-major: pair = token * n_expert + slot (6 for
+         * DeepSeek V4, 8 for GLM 5.x). */
+        shTok[j] = p != UINT32_MAX ? p / n_expert : 0u;
     }
     __syncthreads();
 
@@ -5153,8 +5174,11 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
         rocwmma::fill_fragment(accu1, 0.0f);
     }
 
-    const unsigned char *gew = (const unsigned char *)gate_base + (uint64_t)expert * gate_expert_bytes;
-    const unsigned char *uew = (const unsigned char *)up_base + (uint64_t)expert * gate_expert_bytes;
+    const unsigned char *gew = gate_slots ? (const unsigned char *)gate_slots[expert] :
+        (const unsigned char *)gate_base + (uint64_t)expert * gate_expert_bytes;
+    const unsigned char *uew = up_slots ? (const unsigned char *)up_slots[expert] :
+        (const unsigned char *)up_base + (uint64_t)expert * gate_expert_bytes;
+    if (!gew || !uew) return;
     for (uint32_t k0 = 0; k0 < expert_in_dim; k0 += BK) {
         if (X_F16) {
             for (uint32_t j = tid; j < MTILES * BM * (BK / 2); j += blockDim.x) {
@@ -5163,7 +5187,7 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
                 const uint32_t pair = shPair[pair_row];
                 uint32_t v = 0u;
                 if (pair != UINT32_MAX) {
-                    const uint32_t token = pair / 6u;
+                    const uint32_t token = shTok[pair_row];
                     const uint64_t xoff = (uint64_t)token * expert_in_dim + k0 + kk2 * 2u;
                     v = *reinterpret_cast<const uint32_t *>(x_h + xoff);
                 }
@@ -5175,7 +5199,7 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
                 const uint32_t kk = j - pair_row * BK;
                 const uint32_t pair = shPair[pair_row];
                 shA[j] = pair != UINT32_MAX
-                    ? __float2half(x[(uint64_t)(pair / 6u) * expert_in_dim + k0 + kk])
+                    ? __float2half(x[(uint64_t)shTok[pair_row] * expert_in_dim + k0 + kk])
                     : __float2half(0.0f);
             }
         }
@@ -5496,7 +5520,8 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t n_expert,
-        uint32_t n_tokens = 0u) {
+        uint32_t n_tokens = 0u,
+        const char *const *down_slots = NULL) {
     extern __shared__ unsigned char raw_sh[];
     half *shA = reinterpret_cast<half *>(raw_sh);
     half *shB0 = shA + MTILES * BM * BK;
@@ -5535,7 +5560,9 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         rocwmma::fill_fragment(acc1, 0.0f);
     }
 
-    const unsigned char *dew = (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
+    const unsigned char *dew = down_slots ? (const unsigned char *)down_slots[expert] :
+        (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
+    if (!dew) return;
     for (uint32_t kb = 0; kb < expert_mid_dim; kb += 256u) {
         for (uint32_t j = tid; j < RAW_ROWS * RAW_DWORDS; j += blockDim.x) {
             const uint32_t row_local = j / RAW_DWORDS;

@@ -1282,7 +1282,10 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f32");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    if (g_cublas_ready && n_tok > 1) {
+    /* A few rows (MTP verification, short appends) are cheaper through the
+     * matvec kernel than through a tiny SGEMM (GLM router, 2 rows: 182 us vs
+     * ~2 x 36 us). */
+    if (g_cublas_ready && n_tok > 4) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasSgemm(g_cublas,

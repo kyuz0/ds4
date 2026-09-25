@@ -391,6 +391,29 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
             beta_fast, beta_slow);
 }
 
+extern "C" int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
+        ds4_gpu_tensor *heads, ds4_gpu_tensor *partial_lora,
+        ds4_gpu_tensor *partial_ms, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low, const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache, const void *model_map,
+        uint64_t model_size, uint64_t value_weight_offset,
+        uint32_t value_weight_type, const ds4_gpu_tensor *selected,
+        uint32_t n_selected, bool selected_rows_valid, uint32_t cache_cap,
+        bool cache_f16, uint32_t n_head, uint32_t kv_lora_dim,
+        uint32_t qk_nope, uint32_t qk_rope, uint32_t value_dim,
+        uint32_t n_ctx_orig, uint32_t block_rows, uint32_t n_blocks,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow) {
+    if (value_weight_type != 8u) return 0;
+    return ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
+            heads, partial_lora, partial_ms, q, qk_low, kv_lora_cache,
+            k_rope_cache, model_map, model_size, value_weight_offset,
+            selected, n_selected, selected_rows_valid, cache_cap, cache_f16,
+            n_head, kv_lora_dim, qk_nope, qk_rope, value_dim, n_ctx_orig,
+            block_rows, n_blocks, freq_base, freq_scale, ext_factor,
+            attn_factor, beta_fast, beta_slow);
+}
+
 extern "C" int ds4_gpu_glm_attention_indexed_batch_typed_tensor(
         ds4_gpu_tensor *heads, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *qk_low, const ds4_gpu_tensor *kv_lora_cache,

@@ -1590,12 +1590,46 @@ static int cuda_stream_resident_evict_at(size_t idx) {
     return 1;
 }
 
+/* Set while a prefill batch loads its experts. A prefill chunk sweeps every
+ * layer and needs nearly every expert of each, so with a cache slightly smaller
+ * than the model LRU evicts exactly the experts of the next layers and thrashes
+ * (measured on GLM 5.3: 9% hits with 93% of the experts cacheable). */
+static int g_stream_evict_cyclic_active;
+
+static int cuda_stream_evict_cyclic_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_EVICT_CYCLIC");
+        enabled = env == NULL || env[0] == '\0' || strcmp(env, "0") != 0;
+    }
+    return enabled;
+}
+
 static int cuda_stream_resident_evict_one(
         uint32_t layer,
         const int32_t *selected_ids,
         uint32_t n_selected) {
     size_t victim = (size_t)-1;
     uint64_t oldest = UINT64_MAX;
+    if (g_stream_evict_cyclic_active && cuda_stream_evict_cyclic_enabled()) {
+        /* Evict the expert whose next use in the cyclic sweep is furthest:
+         * unselected experts of the current layer, then earlier layers from
+         * the most recent one down, then later layers from the last one down. */
+        uint64_t best_key = 0;
+        for (size_t i = 0; i < g_stream_resident_experts.size(); i++) {
+            const cuda_stream_resident_expert &e = g_stream_resident_experts[i];
+            if (cuda_stream_selected_is_current(e, layer, selected_ids, n_selected)) continue;
+            const uint64_t key = e.layer <= layer ? (UINT64_C(1) << 32) + e.layer : (uint64_t)e.layer;
+            if (victim == (size_t)-1 || key > best_key ||
+                (key == best_key && e.last_used < oldest)) {
+                victim = i;
+                best_key = key;
+                oldest = e.last_used;
+            }
+        }
+        if (victim != (size_t)-1) return cuda_stream_resident_evict_at(victim);
+        oldest = UINT64_MAX;
+    }
     if (cuda_stream_evict_past_layers_first()) {
         for (size_t i = 0; i < g_stream_resident_experts.size(); i++) {
             const cuda_stream_resident_expert &e =
@@ -3848,6 +3882,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
     uint32_t resident_count = 0;
     uint32_t missing_count = 0;
 
+    g_stream_evict_cyclic_active = 1;
     for (uint32_t u = 0; ok && u < unique_count; u++) {
         const int32_t expert_i = unique_ids[u];
         const uint64_t expert = (uint64_t)(uint32_t)expert_i;
@@ -3977,6 +4012,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
             }
         }
     }
+    g_stream_evict_cyclic_active = 0;
 
     if (ok) {
         for (uint64_t i = 0; i < n_ids64; i++) {
@@ -4355,6 +4391,7 @@ static int cuda_stream_layer_expert_cache_prepare_batch(
     const char *gate_host[DS4_ROCM_MAX_N_EXPERT] = {0};
     const char *up_host[DS4_ROCM_MAX_N_EXPERT] = {0};
     const char *down_host[DS4_ROCM_MAX_N_EXPERT] = {0};
+    g_stream_evict_cyclic_active = 1;
     for (uint32_t u = 0; ok && u < unique_count; u++) {
         const uint64_t expert = (uint64_t)(uint32_t)unique_ids[u];
         uint64_t gate_rel = 0;
@@ -4368,6 +4405,7 @@ static int cuda_stream_layer_expert_cache_prepare_batch(
         up_host[u] = layer_up + gate_rel;
         down_host[u] = layer_down + down_rel;
     }
+    g_stream_evict_cyclic_active = 0;
 
     if (ok) {
         cudaError_t err = cudaMemcpyAsync(g_stream_batch_selected_cache.selected_ids,
@@ -4564,6 +4602,7 @@ static int cuda_stream_layer_expert_cache_seed_selected(
         ok = 0;
     }
 
+    g_stream_evict_cyclic_active = 1;
     for (uint32_t u = 0; ok && u < unique_count; u++) {
         const int32_t expert_i32 = unique[u];
         int idx = cuda_stream_resident_find(model_map,
@@ -4634,6 +4673,7 @@ static int cuda_stream_layer_expert_cache_seed_selected(
             break;
         }
     }
+    g_stream_evict_cyclic_active = 0;
 
     if (ok && unique_count != 0) {
         cudaError_t err = cudaStreamSynchronize(g_stream_selected_upload_stream);
@@ -6912,7 +6952,11 @@ extern "C" int ds4_gpu_set_model_map_spans(
      * slices once, but split sparse coordinator layer+head selections into
      * separate device images instead of allocating their huge file envelope. */
     const uint64_t bbox = max_end - min_offset;
-    if (bbox <= span_bytes + span_bytes / 10u) {
+    /* A single envelope is fine for small holes, but not for a whole skipped
+     * block: GLM 5.3 without --mtp leaves out its 2.1 GiB nextn layer, which
+     * sits between the last trunk layer and the output head. */
+    if (bbox <= span_bytes + span_bytes / 10u &&
+        bbox - span_bytes <= (UINT64_C(256) << 20)) {
         return cuda_model_copy_chunked(model_map, model_size,
                                        min_offset, bbox);
     }
