@@ -74735,10 +74735,30 @@ static int ds4_session_glm_spec_cycle_impl(
     if (s->glm_mtp_have && first_token != s->glm_mtp_parent) {
         s->glm_mtp_have = 0;
     }
-    if (!s->glm_mtp_have || accepted_cap < 2 ||
+    bool skip_uncertain = false;
+#ifdef DS4_ROCM_BUILD
+    /* Below 0.9 draft probability, two-row verification plus rejection
+     * replay usually costs more than ordinary decode on gfx1151. The draft
+     * logits are already on the host; stop once this threshold is crossed. */
+    if (s->glm_mtp_have &&
+        g->glm53 && !g->ssd_streaming && !g->placement && g->tp_world <= 1 &&
+        !exact_sampling && temperature <= 0.0f &&
+        ds4_gpu_dspark_gfx1151_fast_path() != 0 && g->mtp_logits_host) {
+        const float best = g->mtp_logits_host[s->glm_mtp_draft];
+        double mass = 0.0;
+        const double limit = 1.0 / 0.9f;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; ++i) {
+            mass += expf(g->mtp_logits_host[i] - best);
+            if (mass > limit) { skip_uncertain = true; break; }
+        }
+        if (timing && skip_uncertain)
+            fprintf(stderr, "ds4: glm confidence skip pos=%u threshold=0.9\n", pos);
+    }
+#endif
+    if (skip_uncertain || !s->glm_mtp_have || accepted_cap < 2 ||
         pos + 2 > g->ctx_size ||
         (g->compact_cache_cap != 0 && pos + 1 >= g->compact_cache_cap)) {
-        /* Plain step, then seed the first draft from g->cur. */
+        /* Plain target step, then update the private draft cache from g->cur. */
         s->glm_spec_inside = 1;
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
         s->glm_spec_inside = 0;
@@ -74749,8 +74769,17 @@ static int ds4_session_glm_spec_cycle_impl(
         }
         int d = -1;
         s->glm_mtp_have = 0;
-        if (glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
-                               s->glm_mtp_min_pos, &d)) {
+        /* After declining an uncertain proposal, keep its required private
+         * KV row but defer another full draft until the next ordinary step. */
+        const bool draft_ok = skip_uncertain
+            ? glm_graph_mtp_accepted_first_step(g, &e->model, &e->weights,
+                                                n1, pos, s->glm_mtp_min_pos,
+                                                &d, true)
+            : glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
+                                s->glm_mtp_min_pos, &d);
+        if (timing && skip_uncertain)
+            fprintf(stderr, "ds4: glm confidence cache-only pos=%u\n", pos);
+        if (draft_ok && !skip_uncertain) {
             s->glm_mtp_draft = d;
             s->glm_mtp_parent = n1;
             s->glm_mtp_have = 1;
