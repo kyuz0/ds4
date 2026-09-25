@@ -558,10 +558,84 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
     if (!(threadIdx.x & 31)) out[pair * M + row] = DOWN ? a : silu(a) * b;
 }
 
+template<unsigned TYPE,bool DOWN,unsigned OR,unsigned STEPS>
+__global__ void moe_mv_reuse(float*out,const float*x,const int*selected,const char*w0,const char*w1,const char*sh0,const char*sh1,unsigned st,unsigned NE,unsigned NS,unsigned K,unsigned M,uint64_t rb,uint64_t srb,unsigned T){
+ constexpr unsigned WAVES=1; constexpr bool TABLE=false, REUSE=true;
+ const unsigned lane=threadIdx.x&31,row0=(blockIdx.x*WAVES+threadIdx.x/32)*OR;
+ const unsigned slot=blockIdx.y%(NS+1),token=blockIdx.y/(NS+1),stride=NS+1;
+ const bool shared=slot==NS;
+ int e=shared?-1:selected[token*NS+slot];
+ if constexpr(REUSE){
+  if(shared&&token)return;
+  if(!shared&&e>=0&&(unsigned)e<NE)for(unsigned t=0;t<token;t++)for(unsigned s=0;s<NS;s++)if(selected[t*NS+s]==e)return;
+ }
+ __shared__ uint64_t grid_table[TYPE==16&&TABLE?256:1];__shared__ uint8_t sign_table[TYPE==16&&TABLE?128:1];
+ if constexpr(TYPE==16&&TABLE){for(unsigned i=threadIdx.x;i<256;i+=blockDim.x)grid_table[i]=cuda_iq2xxs_grid[i];for(unsigned i=threadIdx.x;i<128;i+=blockDim.x)sign_table[i]=cuda_ksigns_iq2xs[i];__syncthreads();}
+ if(row0>=M)return;
+ int pairs[3]={-1,-1,-1};pairs[token]=token*stride+slot;
+ if constexpr(REUSE){for(unsigned t=token+1;t<T;t++){
+  if(shared)pairs[t]=t*stride+NS;
+  else if(e>=0&&(unsigned)e<NE)for(unsigned s=0;s<NS;s++)if(selected[t*NS+s]==e){pairs[t]=t*stride+s;break;}
+ }}
+ float a[OR][3]={},b[OR][3]={};
+ if(shared){
+  for(unsigned i=lane;i<K;i+=32){
+   #pragma unroll
+   for(unsigned j=0;j<OR;j++)if(row0+j<M){const float av=scalar(sh0+(uint64_t)(row0+j)*srb,i,st);float bv=0;if constexpr(!DOWN)bv=scalar(sh1+(uint64_t)(row0+j)*srb,i,st);
+    #pragma unroll
+    for(unsigned t=0;t<3;t++)if(pairs[t]>=0){float v=x[(uint64_t)(DOWN?pairs[t]:t)*K+i];a[j][t]=__fmaf_rn(av,v,a[j][t]);if constexpr(!DOWN)b[j][t]=__fmaf_rn(bv,v,b[j][t]);}
+   }
+  }
+ }else if(e>=0&&(unsigned)e<NE){
+  for(unsigned base=lane*4;base<K;base+=128*STEPS){
+   float4 av[STEPS][OR],bv[STEPS][OR],xv[STEPS][3];
+   #pragma unroll
+   for(unsigned s=0;s<STEPS;s++)if(base+s*128<K){unsigned i=base+s*128;
+    #pragma unroll
+    for(unsigned t=0;t<3;t++)if(pairs[t]>=0)xv[s][t]=*(const float4*)(x+(uint64_t)(DOWN?pairs[t]:t)*K+i);
+    #pragma unroll
+    for(unsigned j=0;j<OR;j++)if(row0+j<M){uint64_t off=((uint64_t)e*M+row0+j)*rb;
+     av[s][j]=value4<TYPE>(w0+off,i,TABLE?grid_table:cuda_iq2xxs_grid,TABLE?sign_table:cuda_ksigns_iq2xs);
+     if constexpr(!DOWN)bv[s][j]=value4<TYPE>(w1+off,i,TABLE?grid_table:cuda_iq2xxs_grid,TABLE?sign_table:cuda_ksigns_iq2xs);
+    }
+   }
+   #pragma unroll
+   for(unsigned s=0;s<STEPS;s++)if(base+s*128<K){
+    #pragma unroll
+    for(unsigned j=0;j<OR;j++)if(row0+j<M){
+     #pragma unroll
+     for(unsigned t=0;t<3;t++)if(pairs[t]>=0){const float4 u=av[s][j],v=xv[s][t];a[j][t]=__fmaf_rn(u.x,v.x,a[j][t]);a[j][t]=__fmaf_rn(u.y,v.y,a[j][t]);a[j][t]=__fmaf_rn(u.z,v.z,a[j][t]);a[j][t]=__fmaf_rn(u.w,v.w,a[j][t]);
+      if constexpr(!DOWN){const float4 u=bv[s][j];b[j][t]=__fmaf_rn(u.x,v.x,b[j][t]);b[j][t]=__fmaf_rn(u.y,v.y,b[j][t]);b[j][t]=__fmaf_rn(u.z,v.z,b[j][t]);b[j][t]=__fmaf_rn(u.w,v.w,b[j][t]);}
+     }
+    }
+   }
+  }
+ }
+ #pragma unroll
+ for(unsigned j=0;j<OR;j++)if(row0+j<M){
+  #pragma unroll
+  for(unsigned t=0;t<3;t++)if(pairs[t]>=0){float u=sum(a[j][t]),v=sum(b[j][t]);if(!lane)out[(uint64_t)pairs[t]*M+row0+j]=DOWN?u:silu(u)*v;}
+ }
+}
+
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
+    if (ds4_rocm_is_gfx1151() && T >= 2 && T <= 3 && NS == 10 && NE == 512 && st == 8 && !((uintptr_t)x&15)) {
+        if (!down && K == 2560 && M == 640 && (type == 16 || type == 12)) {
+            const dim3 grouped(M,(NS+1)*T);
+            if (type == 16) moe_mv_reuse<16,false,1,2><<<grouped,32,0,0>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb,T);
+            else moe_mv_reuse<12,false,1,2><<<grouped,32,0,0>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb,T);
+            return launched();
+        }
+        if (down && K == 640 && M == 2560 && (type == 10 || type == 39)) {
+            const dim3 grouped((M+1)/2,(NS+1)*T);
+            if (type == 10) moe_mv_reuse<10,true,2,2><<<grouped,32,0,0>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb,T);
+            else moe_mv_reuse<39,true,2,1><<<grouped,32,0,0>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb,T);
+            return launched();
+        }
+    }
     const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T);
 #define QWEN_MOE(TYPE) case TYPE: \
     if (down) moe_mv<TYPE, true><<<grid,128,0,0>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); \
@@ -1055,11 +1129,129 @@ __global__ void matvec_f16_input_first(float *out, const char *w, const float *x
     }
 }
 
+template<unsigned TYPE,unsigned ROWS,unsigned WAVES,bool LDS=false,unsigned OUTROWS=1,unsigned STEPS=2>
+__global__ void matvec_prefetch(float* out,const char* w,const float* x,unsigned T,unsigned K,unsigned M,uint64_t stride){
+ extern __shared__ float sx[];
+ if constexpr(LDS){for(unsigned i=threadIdx.x;i<T*K;i+=blockDim.x)sx[i]=x[i];__syncthreads();x=sx;}
+ const unsigned lane=threadIdx.x&31,row0=(blockIdx.x*WAVES+threadIdx.x/32)*OUTROWS;
+ if(row0>=M)return;
+ float acc[OUTROWS][ROWS]={};
+ for(unsigned base=lane*4;base<K;base+=128*STEPS){
+  float4 xv[STEPS][ROWS]; float4 wv[STEPS][OUTROWS]; float scales[STEPS][OUTROWS];
+  #pragma unroll
+  for(unsigned s=0;s<STEPS;s++){
+   const unsigned i=base+128*s;
+   if(i<K){
+    #pragma unroll
+    for(unsigned t=0;t<ROWS;t++)if(t<T)xv[s][t]=*(const float4*)(x+(uint64_t)t*K+i);
+    #pragma unroll
+    for(unsigned j=0;j<OUTROWS;j++)if(row0+j<M){
+     const char* wr=w+(uint64_t)(row0+j)*stride;
+if constexpr(TYPE == 8) {
+     const char*b=wr+(i/32)*34;scales[s][j]=__half2float(*(const __half*)b);
+     const uint16_t*q=(const uint16_t*)(b+2+i%32);unsigned a=q[0],c=q[1];
+     wv[s][j]=make_float4(__fmul_rn((float)(int8_t)a,scales[s][j]),__fmul_rn((float)(int8_t)(a>>8),scales[s][j]),__fmul_rn((float)(int8_t)c,scales[s][j]),__fmul_rn((float)(int8_t)(c>>8),scales[s][j]));
+} else {
+     wv[s][j]=value4<1>(wr,i,NULL,NULL);
+}
+    }
+   }
+  }
+  #pragma unroll
+  for(unsigned s=0;s<STEPS;s++)if(base+128*s<K){
+   #pragma unroll
+   for(unsigned j=0;j<OUTROWS;j++)if(row0+j<M){
+    #pragma unroll
+    for(unsigned t=0;t<ROWS;t++)if(t<T){
+     const float4 v=wv[s][j],a=xv[s][t];
+if constexpr(TYPE == 8) {
+     acc[j][t]=__fmaf_rn(v.x,a.x,acc[j][t]);acc[j][t]=__fmaf_rn(v.y,a.y,acc[j][t]);acc[j][t]=__fmaf_rn(v.z,a.z,acc[j][t]);acc[j][t]=__fmaf_rn(v.w,a.w,acc[j][t]);
+} else {
+     acc[j][t]+=v.x*a.x;acc[j][t]+=v.y*a.y;acc[j][t]+=v.z*a.z;acc[j][t]+=v.w*a.w;
+}
+    }
+   }
+  }
+ }
+ #pragma unroll
+ for(unsigned j=0;j<OUTROWS;j++)if(row0+j<M){
+  #pragma unroll
+  for(unsigned t=0;t<ROWS;t++)if(t<T){float v=sum(acc[j][t]);if(!lane)out[(uint64_t)t*M+row0+j]=v;}
+ }
+}
+
+template<unsigned ROWS,unsigned WAVES,unsigned OUTROWS=1,unsigned STEPS=4,bool LDS=false>
+__global__ void matvec_f32_prefetch(float*out,const char*w,const float*x,unsigned T,unsigned K,unsigned M,uint64_t stride){
+ extern __shared__ float sx[];
+ if constexpr(LDS){for(unsigned i=threadIdx.x;i<T*K;i+=blockDim.x)sx[i]=x[i];__syncthreads();x=sx;}
+ const unsigned lane=threadIdx.x&31,row0=(blockIdx.x*WAVES+threadIdx.x/32)*OUTROWS;
+ if(row0>=M)return;
+ float acc[OUTROWS][ROWS]={};
+ for(unsigned base=lane;base<K;base+=32*STEPS){
+  float xv[STEPS][ROWS],wv[STEPS][OUTROWS];
+  #pragma unroll
+  for(unsigned s=0;s<STEPS;s++)if(base+32*s<K){
+   #pragma unroll
+   for(unsigned t=0;t<ROWS;t++)if(t<T)xv[s][t]=x[(uint64_t)t*K+base+32*s];
+   #pragma unroll
+   for(unsigned j=0;j<OUTROWS;j++)if(row0+j<M)wv[s][j]=value<0>(w+(uint64_t)(row0+j)*stride,base+32*s);
+  }
+  #pragma unroll
+  for(unsigned s=0;s<STEPS;s++)if(base+32*s<K){
+   #pragma unroll
+   for(unsigned j=0;j<OUTROWS;j++)if(row0+j<M){
+    #pragma unroll
+    for(unsigned t=0;t<ROWS;t++)if(t<T)acc[j][t]=__fmaf_rn(wv[s][j],xv[s][t],acc[j][t]);
+   }
+  }
+ }
+ #pragma unroll
+ for(unsigned j=0;j<OUTROWS;j++)if(row0+j<M){
+  #pragma unroll
+  for(unsigned t=0;t<ROWS;t++)if(t<T){float a=sum(acc[j][t]);if(!lane)out[(uint64_t)t*M+row0+j]=a;}
+ }
+}
+
 static int matvec_dispatch(float *out, const char *w, const float *x,
                            unsigned type, unsigned T, unsigned K, unsigned M) {
     const dim3 grid((M + 3) / 4, T);
     const uint64_t stride = row_bytes(type, K);
     if (!stride) return 0;
+    // Preserve the FP32 accumulation tree while overlapping four scalar loads.
+    if (ds4_rocm_is_gfx1151() && type == 0 && T >= 1 && T <= 3 && K == 2560 && (M == 48 || M == 512) && !((uintptr_t)x&15) && !((uintptr_t)w&3)) {
+#define QWEN_F32_PREFETCH(ROWS) \
+        if (M == 48) matvec_f32_prefetch<ROWS,4><<<(M+3)/4,128,0,0>>>(out,w,x,T,K,M,stride); \
+        else matvec_f32_prefetch<ROWS,2><<<(M+1)/2,64,0,0>>>(out,w,x,T,K,M,stride)
+        if (T == 1) { QWEN_F32_PREFETCH(1); }
+        else if (T == 2) { QWEN_F32_PREFETCH(2); }
+        else { QWEN_F32_PREFETCH(4); }
+#undef QWEN_F32_PREFETCH
+        return launched();
+    }
+    // Ordered prefetch shares each dequantized Q8 weight across MTP rows.
+    if (ds4_rocm_is_gfx1151() && T <= 3 && !((uintptr_t)x&15) && !((uintptr_t)w&7)) {
+        // The wide vocabulary projection amortizes its weight read across verification rows.
+        if (type == 8 && T > 1 && K == 2560 && M == 248320) {
+            if (T == 2) matvec_prefetch<8,2,1,false,1,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
+            else matvec_prefetch<8,4,1,false,2,4><<<(M+1)/2,32,0,0>>>(out,w,x,T,K,M,stride);
+            return launched();
+        }
+        if (type == 8 && T > 1 && ((K == 2560 && (M == 128 || M == 512 || M == 6144 || M == 10240 || M == 12288)) || ((K == 6144 || K == 5120) && M == 2560))) {
+            if (T == 2) matvec_prefetch<8,2,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
+            else matvec_prefetch<8,4,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
+            return launched();
+        }
+        if (type == 1 && T == 1 && M == 320 && K == 10240) {
+            matvec_prefetch<1,1,8,true><<<40,256,40960,0>>>(out,w,x,T,K,M,stride);
+            return launched();
+        }
+        if (type == 1 && M == 4 && K == 10240) {
+            if (T == 1) matvec_prefetch<1,1,2><<<2,64,0,0>>>(out,w,x,T,K,M,stride);
+            else if (T == 2) matvec_prefetch<1,2,2><<<2,64,0,0>>>(out,w,x,T,K,M,stride);
+            else matvec_prefetch<1,4,2><<<2,64,0,0>>>(out,w,x,T,K,M,stride);
+            return launched();
+        }
+    }
     if (type == 1 && T > 1 && T <= 8 && M == 320 && K == 10240 &&
         !((uintptr_t)x&15) && !((uintptr_t)w&7) && ds4_rocm_is_gfx1151()) {
         if (T == 2) matvec_f16_input_first<2,1,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
