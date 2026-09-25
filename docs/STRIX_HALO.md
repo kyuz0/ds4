@@ -113,6 +113,89 @@ DS4_BENCH_SNAPSHOT_MAX_BYTES=2147483648 ./ds4-bench --rocm -m "$MODEL" \
 
 Save CSV, full frontier files, printed output, revision/build flags, model filename/size, active power profile and memory/swap counters. Leave sufficient RAM for the 2 GiB snapshot cap.
 
+### Resident/missing expert split
+
+`DS4_ROCM_SELECTED_SPLIT=1` runs the cached experts of a decode step while the misses are still being read.
+It is now deterministic: when a miss layer fell back to the compact table, the generic kernels could read that
+table before the D2D compaction copies on the upload stream had finished. Together with bf16 rounding fused
+into kernel epilogues (−765 launches/token), the SSD sweep above gives prefill / decode tokens/s:
+
+| Context tokens | Appended tokens | Without | `DS4_ROCM_SELECTED_SPLIT=1` |
+|---:|---:|---:|---:|
+| 2,048 | 2,048 | 90.87 / 10.30 | 90.82 / 13.79 |
+| 4,096 | 2,048 | 147.64 / 10.33 | 147.67 / 13.88 |
+| 8,192 | 4,096 | 195.19 / 10.46 | 195.11 / 14.01 |
+| 16,384 | 8,192 | 306.46 / 10.41 | 305.82 / 13.93 |
+| 32,768 | 16,384 | 351.66 / 10.41 | 351.40 / 13.87 |
+
+Same protocol as above, but with a 72 GB cache request (the largest admitted on the measuring machine) and a
+WD SN850X (PCIe 4.0 ×4). Frontier logits are byte-identical between the two columns.
+
+### DSpark speculative decoding
+
+Build the support file from the official checkpoint's `mtp.*` tensors. These are shards 44-46 of 48 of
+`deepseek-ai/DeepSeek-V4.1-Flash`, about 8 GB. The conversion uses the gguf-tools of
+[antirez/ds4#1073](https://github.com/antirez/ds4/pull/1073); the wrapper skips the tokenizer metadata that only
+the main GGUF needs:
+
+```bash
+git fetch https://github.com/antirez/ds4 pull/1073/head:pr-1073 && git worktree add ../ds4-pr1073 pr-1073
+make -C ../ds4-pr1073/gguf-tools
+cp tools/strix-halo/dspark41_config.json /path/to/shards/config.json
+python3 tools/strix-halo/dspark41_support.py --gguf-tools ../ds4-pr1073/gguf-tools \
+  --hf /path/to/shards --dspark-out gguf/DeepSeek-V4.1-Flash-DSpark-Q2.gguf
+```
+
+Then add the support file to the server command:
+
+```bash
+DS4_ROCM_SELECTED_SPLIT=1 ./ds4-server --rocm -m "$MODEL" --vision "$VISION" \
+  --ssd-streaming --ssd-streaming-cache-experts 72GB --ctx 34816 --batched-session 1 \
+  --dspark --mtp-model gguf/DeepSeek-V4.1-Flash-DSpark-Q2.gguf
+```
+
+- **What stays resident.** The three draft stages (4.6 GB, 128 experts, top-3) stay resident; the trunk keeps
+  streaming its experts.
+- **How drafting runs.** Verify runs 2-6 rows through the same-session row batch, with per-row arithmetic
+  identical to decode. Greedy requests verify the drafts up to the first one whose confidence is below 0.5
+  (`--dspark-confidence` overrides it), with no proposal-rate adaptation (`DS4_DSPARK_V41_ADAPTIVE_DRAFTING=1`
+  restores it). Sampling keeps 0.7 and the adaptation.
+- **Batched sessions.** With `--batched-session 1` speculation runs directly on the one resident session.
+
+Measured on a 12k-token prompt with greedy chat requests and `tools/strix-halo/bench_server.sh`. Values are
+client-side decode tokens/s for the first and second identical request:
+
+| Workload | Without DSpark | With DSpark | Draft acceptance | Output |
+|---|---:|---:|---:|---|
+| Rewrite a 143-line C function (164 tokens) | 10.79 / 10.80 | 18.96 / 19.50 | 97.0%, 4.6 tokens/cycle | identical |
+| Italian prose analysis (256 tokens) | 11.49 / 11.62 | 13.06 / 13.17 | 82.0%, 1.5 tokens/cycle | near-tie differences |
+
+- **Second requests without #1089.** Without live-session rewind the second request rebuilds its session, so
+  both requests run on caches refilled after a prefill.
+- **With #1089.** The draft ring must be clamped at the rewind frontier. The second request then reaches
+  31.7 tok/s on the code rewrite (13.8 without DSpark) and 16.6 on the prose (13.4).
+- **Near-tie differences on prose.** Verify rows use different attention and norm kernels than single-token
+  decode, so a near-tie token can change.
+- **Expert prefetch.** Next-layer expert prefetch (`DS4_V41_PREFETCH`, off) reaches 71% recall at top-6, but the
+  extra router pass costs what the reads save.
+
+The table above was measured with the earlier greedy defaults: threshold 0.7 and proposal-rate adaptation. With
+`DS4_DSPARK_SPEC_LOG=1` the log prints each draft position's confidence and the accepted length. On 1,180 cycles of
+Italian and English prose, the acceptance in each confidence band matched the head's probability in both
+languages (Italian 70/79/86/97% and English 64/74/82/98% for the 0.6/0.7/0.8/0.9 bands). An extra verify row costs
+about 18 ms against 73 ms for a decode step, so drafts pay from about 0.5.
+
+Four Italian and four English requests (a 12k-token code review answered in prose, an essay, an explanation and an
+email), a code-writing request and the code rewrite above, up to 384 tokens, expert cache 68GB, two rounds. Values are
+client-side decode tokens/s, averaged per language:
+
+| Greedy DSpark policy | Italian | English | Code writing | Code rewrite |
+|---|---:|---:|---:|---:|
+| Threshold 0.7, adaptation on | 14.36 / 14.27 | 14.32 / 14.53 | 19.86 / 19.87 | 19.9 |
+| Threshold 0.5, adaptation off (now the default) | 15.41 / 15.48 | 15.54 / 15.44 | 19.97 / 19.92 | 19.9-20.0 |
+
+The code rewrite output is byte-identical between the two; on prose a near-tie token can change.
+
 ## GLM 5.3 Flash
 
 The reference Q2 setup uses SSD streaming to leave room for its graph and KV

@@ -77,6 +77,36 @@ static void routed_moe_decode_profile_print(void) {
              p->down_ms) / calls);
 }
 
+/* DS4_ROCM_SELECTED_SPLIT=1 enables the one-token resident/missing split.
+ * Off by default: it is faster but not yet bit-reproducible (see the split
+ * site).  DS4_ROCM_SELECTED_SPLIT_DRAIN=0 removes the stream drain that
+ * separates the resident kernels from the miss upload. */
+/* DS4_ROCM_SELECTED_SPLIT: 0/unset = compact table (default); 1 = two-phase
+ * resident/missing split (non-deterministic across runs, kept for experiments);
+ * 2 = single-phase pointer path only for layers whose selected experts are all
+ * resident (no compaction copies, deterministic), compact table otherwise. */
+/* DS4_ROCM_SPLIT_COMPACT_WAIT=0 disables the upload-stream wait after the
+ * split-mode compaction (diagnostic only). */
+static int routed_moe_split_compact_wait_enabled(void) {
+    const char *env = getenv("DS4_ROCM_SPLIT_COMPACT_WAIT");
+    return !(env && env[0] == '0');
+}
+
+static int routed_moe_selected_split_mode(void) {
+    const char *env = getenv("DS4_ROCM_SELECTED_SPLIT");
+    if (env == NULL || env[0] == '\0' || env[0] == '0') return 0;
+    return env[0] == '2' ? 2 : 1;
+}
+
+static int routed_moe_selected_split_enabled(void) {
+    return routed_moe_selected_split_mode() != 0;
+}
+
+static int routed_moe_selected_split_drain(void) {
+    const char *env = getenv("DS4_ROCM_SELECTED_SPLIT_DRAIN");
+    return env == NULL || env[0] != '0';
+}
+
 static int routed_moe_decode_profile_enabled(void) {
     if (g_moe_decode_profile_enabled < 0) {
         const char *env = getenv("DS4_ROCM_MOE_DECODE_PROFILE");
@@ -594,6 +624,33 @@ static int routed_moe_launch(
     const int iq2_iq2_path = plan.iq2_iq2_path;
     const int iq2_gate_path = iq2_path || iq2_iq2_path;
     const int q2k_path = plan.q2k_path;
+    /* Halo DSpark verify: V4.1 batches of 2..8 rows run the decode wave kernels
+     * row by row on the compact batch table, so a verify row costs what a decode
+     * step's MoE costs and matches its arithmetic (DS4_ROCM_V41_ROWS_MOE=0 off). */
+    static int v41_rows_moe = -1;
+    if (v41_rows_moe < 0) {
+        const char *env = getenv("DS4_ROCM_V41_ROWS_MOE");
+        v41_rows_moe = !(env && env[0] == '0');
+    }
+    /* Rows grouped by expert (one DRAM read per shared expert), same per-row
+     * arithmetic; DS4_ROCM_V41_ROWS_DEDUP=0 keeps the one-launch-per-row path. */
+    static int v41_rows_dedup = -1;
+    static int32_t *v41_pairs = NULL;
+    if (v41_rows_dedup < 0) {
+        const char *env = getenv("DS4_ROCM_V41_ROWS_DEDUP");
+        v41_rows_dedup = !(env && env[0] == '0');
+        if (v41_rows_dedup && cudaMalloc((void **)&v41_pairs, 256u * sizeof(int32_t)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            v41_pairs = NULL;
+            v41_rows_dedup = 0;
+        }
+    }
+    const int v41_small_wave =
+        v41_rows_moe && g_deepseek41_model && iq2_path && !iq2_iq2_path &&
+        n_tokens >= 2u && n_tokens <= 8u &&
+        n_total_expert == 384u && n_expert == 6u &&
+        expert_in_dim == 5120u && expert_mid_dim == 2304u && out_dim == 5120u &&
+        ds4_rocm_is_gfx1151();
     const int mxfp4_path = plan.mxfp4_path;
     const uint64_t gate_bytes = plan.gate_bytes;
     const uint64_t down_bytes = plan.down_bytes;
@@ -691,10 +748,42 @@ static int routed_moe_launch(
                                            &up_slot_ptrs,
                                            &down_slot_ptrs,
                                            &stream_batch_unique);
-    /* The one-token resident/missing split can expose partially updated
-     * selected-expert state to the default stream. Keep the asynchronous
-     * read overlap, then use the deterministic compact table below. */
-    int split_selected = 0;
+    /* One-token resident/missing split: run the experts already resident in
+     * the cache while the misses are still in flight from the SSD, then run
+     * the misses.  The resident kernels are marked in flight before the
+     * upload, so any slot reuse waits for them, and the upload
+     * host-synchronizes its own stream, so the miss kernels launched after it
+     * observe complete expert data.  Opt-in: DS4_ROCM_SELECTED_SPLIT=1.
+     * Measured on gfx1151 at 12k context: decode 7.17 -> 7.47 t/s, but two
+     * runs of the same greedy prompt diverged after ~20 tokens, so the
+     * default stays on the deterministic compact table. */
+    int split_selected =
+        !stream_full_layer &&
+        n_tokens == 1u &&
+        routed_moe_selected_split_enabled() &&
+        cuda_stream_selected_apply_split(model_map,
+                                         layer_index,
+                                         n_total_expert,
+                                         n_expert,
+                                         gate_expert_bytes,
+                                         down_expert_bytes,
+                                         &selected_exec,
+                                         &gate_w,
+                                         &up_w,
+                                         &down_w,
+                                         &gate_slot_ptrs,
+                                         &up_slot_ptrs,
+                                         &down_slot_ptrs,
+                                         &stream_resident_mask,
+                                         &stream_missing_mask);
+    if (split_selected) {
+        static int logged_selected_split = 0;
+        if (!logged_selected_split) {
+            logged_selected_split = 1;
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "SSD streaming routed MoE running resident experts before the miss reads land\n");
+        }
+    }
     const int compact_selected =
         split_selected ||
         (!stream_full_layer &&
@@ -880,7 +969,59 @@ static int routed_moe_launch(
         }
         if (ok && (batch_stream_selected || batch_stream_split_selected)) {
             dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
-            if (batch_stream_split_selected) {
+            if (batch_stream_split_selected && v41_small_wave) {
+                /* Halo DSpark verify: resident experts run while the misses are
+                 * still in flight (#1083-style hit/miss split, same per-row wave
+                 * arithmetic). The tables hold NULL for the other half, which the
+                 * wave kernel skips. */
+                const int dedup = v41_rows_dedup && stream_batch_unique != 0u &&
+                    stream_batch_unique <= 64u && pair_count <= 64u;
+                if (dedup) {
+                    moe_v41_pairs_by_expert_kernel<<<1, 1>>>(v41_pairs, v41_pairs + 128,
+                        (const int32_t *)selected_exec->ptr, pair_count, stream_batch_unique);
+                    if (stream_batch_resident_count != 0u)
+                        moe_v41_gate_up_wave_dedup_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, stream_batch_unique), 128>>>(
+                            (float *)mid->ptr, resident_gate_slot_ptrs, resident_up_slot_ptrs, xq,
+                            v41_pairs, v41_pairs + 128, (const float *)weights->ptr,
+                            gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
+                }
+                for (uint32_t tok = 0; !dedup && ok && stream_batch_resident_count != 0u && tok < n_tokens; tok++) {
+                    const uint64_t pair0 = (uint64_t)tok * n_expert;
+                    moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
+                        (float *)gate->ptr + pair0 * expert_mid_dim,
+                        (float *)up->ptr + pair0 * expert_mid_dim,
+                        (float *)mid->ptr + pair0 * expert_mid_dim,
+                        resident_gate_slot_ptrs, resident_up_slot_ptrs, xq + (uint64_t)tok * xq_blocks,
+                        (const int32_t *)selected_exec->ptr + pair0,
+                        (const float *)weights->ptr + pair0,
+                        0, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        0u, (1u << n_expert) - 1u, clamp);
+                }
+                ok = ok && cuda_ok(cudaGetLastError(), "routed_moe small-batch resident wave launch");
+                if (!ok) {
+                    (void)cuda_stream_batch_selected_finish_pending_missing();
+                } else {
+                    ok = cuda_stream_batch_selected_finish_pending_missing();
+                }
+                if (dedup && ok && stream_batch_missing_count != 0u)
+                    moe_v41_gate_up_wave_dedup_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, stream_batch_unique), 128>>>(
+                        (float *)mid->ptr, missing_gate_slot_ptrs, missing_up_slot_ptrs, xq,
+                        v41_pairs, v41_pairs + 128, (const float *)weights->ptr,
+                        gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
+                for (uint32_t tok = 0; !dedup && ok && stream_batch_missing_count != 0u && tok < n_tokens; tok++) {
+                    const uint64_t pair0 = (uint64_t)tok * n_expert;
+                    moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
+                        (float *)gate->ptr + pair0 * expert_mid_dim,
+                        (float *)up->ptr + pair0 * expert_mid_dim,
+                        (float *)mid->ptr + pair0 * expert_mid_dim,
+                        missing_gate_slot_ptrs, missing_up_slot_ptrs, xq + (uint64_t)tok * xq_blocks,
+                        (const int32_t *)selected_exec->ptr + pair0,
+                        (const float *)weights->ptr + pair0,
+                        0, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        0u, (1u << n_expert) - 1u, clamp);
+                }
+                ok = ok && cuda_ok(cudaGetLastError(), "routed_moe small-batch missing wave launch");
+            } else if (batch_stream_split_selected) {
                 if (stream_batch_resident_count != 0u) {
                     moe_gate_up_mid_qwarp32_ptrs_split_kernel<<<qgrid, 256>>>(
                             (float *)gate->ptr,
@@ -928,6 +1069,30 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(),
                                  "routed_moe streaming batch missing gate/up launch");
                 }
+            } else if (v41_small_wave && v41_rows_dedup && stream_batch_unique != 0u &&
+                       stream_batch_unique <= 64u && pair_count <= 64u) {
+                moe_v41_pairs_by_expert_kernel<<<1, 1>>>(v41_pairs, v41_pairs + 128,
+                    (const int32_t *)selected_exec->ptr, pair_count, stream_batch_unique);
+                moe_v41_gate_up_wave_dedup_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, stream_batch_unique), 128>>>(
+                    (float *)mid->ptr, gate_slot_ptrs, up_slot_ptrs, xq,
+                    v41_pairs, v41_pairs + 128, (const float *)weights->ptr,
+                    gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
+                ok = cuda_ok(cudaGetLastError(), "routed_moe small-batch dedup gate/up launch");
+            } else if (v41_small_wave) {
+                for (uint32_t tok = 0; tok < n_tokens; tok++) {
+                    const uint64_t pair0 = (uint64_t)tok * n_expert;
+                    moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
+                        (float *)gate->ptr + pair0 * expert_mid_dim,
+                        (float *)up->ptr + pair0 * expert_mid_dim,
+                        (float *)mid->ptr + pair0 * expert_mid_dim,
+                        gate_slot_ptrs, up_slot_ptrs, xq + (uint64_t)tok * xq_blocks,
+                        (const int32_t *)selected_exec->ptr + pair0,
+                        (const float *)weights->ptr + pair0,
+                        0, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        0u, (1u << n_expert) - 1u, clamp);
+                }
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe streaming small-batch wave gate/up launch");
             } else {
                 moe_gate_up_mid_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
@@ -947,7 +1112,7 @@ static int routed_moe_launch(
                 ok = cuda_ok(cudaGetLastError(),
                              "routed_moe streaming batch gate/up launch");
             }
-            if (ok && !iq2_path) {
+            if (ok && (!iq2_path || v41_small_wave)) {
                 dim3 midq_grid(midq_blocks, pair_count, 1);
                 q8_K_quantize_kernel<<<midq_grid, 256>>>(
                         midq,
@@ -956,7 +1121,23 @@ static int routed_moe_launch(
                         pair_count);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe streaming batch mid quantize launch");
             }
-            if (ok) {
+            if (ok && v41_small_wave && v41_rows_dedup) {
+                moe_v41_down_wave_tokens_kernel<4><<<(out_dim + 3u) / 4u, 128>>>(
+                    (float *)out->ptr, down_slot_ptrs, midq, (const int32_t *)selected_exec->ptr,
+                    down_row_bytes, midq_blocks, out_dim, n_expert, n_tokens);
+                ok = cuda_ok(cudaGetLastError(), "routed_moe small-batch tokens down launch");
+            } else if (ok && v41_small_wave) {
+                for (uint32_t tok = 0; tok < n_tokens; tok++) {
+                    const uint64_t pair0 = (uint64_t)tok * n_expert;
+                    moe_v41_down_wave_ptrs_kernel<4><<<(out_dim + 3u) / 4u, 128>>>(
+                        (float *)out->ptr + (uint64_t)tok * out_dim, down_slot_ptrs,
+                        midq + pair0 * midq_blocks,
+                        (const int32_t *)selected_exec->ptr + pair0, 0,
+                        down_row_bytes, midq_blocks, out_dim, n_expert);
+                }
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe streaming small-batch wave down launch");
+            } else if (ok) {
                 dim3 dgrid((out_dim + 31u) / 32u, n_tokens, 1);
                 if (iq2_iq2_path) {
                     moe_down_iq2_sum_qwarp32_ptrs_batch_kernel<<<dgrid, 256>>>(
@@ -1289,7 +1470,16 @@ static int routed_moe_launch(
                 !q4k_path &&
                 !sorted_pairs &&
                 stream_resident_mask != 0 &&
-                stream_missing_mask != 0;
+                (stream_missing_mask == 0 ? 1 : routed_moe_selected_split_mode() == 1);
+            const int split_single_phase = split_supported && stream_missing_mask == 0;
+            if (split_single_phase) {
+                static int logged_single_phase = 0;
+                if (!logged_single_phase) {
+                    logged_single_phase = 1;
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX
+                            "SSD streaming routed MoE single-phase pointer path for all-resident layers\n");
+                }
+            }
             if (split_supported) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
                 if (use_v41_wave_gate) {
@@ -1334,6 +1524,29 @@ static int routed_moe_launch(
                         clamp);
                 }
                 ok = cuda_ok(cudaGetLastError(), "routed_moe split resident gate/up launch");
+                cuda_split_debug_sync(16);
+                /* The upload below writes expert slots from its own stream
+                 * while these kernels still read theirs.  Mark them in flight
+                 * so any slot reuse waits, and drain the default stream so no
+                 * upload can land in a slot a resident kernel is still
+                 * reading.  The SSD reads keep running during the drain, which
+                 * is where the overlap comes from. */
+                if (ok) ok = cuda_stream_selected_mark_inflight();
+                if (split_single_phase) {
+                    /* Every selected expert is resident: the resident-mask
+                     * launch above covered all slots.  Clear the pending state
+                     * and skip the drain and the missing-mask launch. */
+                    if (!ok) {
+                        (void)cuda_stream_selected_finish_pending_missing(0);
+                    } else {
+                        ok = cuda_stream_selected_finish_pending_missing(0);
+                    }
+                    split_gateup_done = ok;
+                } else {
+                if (ok && routed_moe_selected_split_drain()) {
+                    ok = cuda_ok(cudaStreamSynchronize(0),
+                                 "routed_moe split resident drain");
+                }
                 if (!ok) {
                     (void)cuda_stream_selected_finish_pending_missing(0);
                 } else {
@@ -1382,9 +1595,17 @@ static int routed_moe_launch(
                 }
                 if (ok) ok = cuda_ok(cudaGetLastError(), "routed_moe split missing gate/up launch");
                 split_gateup_done = ok;
+                }
             } else {
                 ok = cuda_stream_selected_finish_pending_missing(
                         stream_resident_mask | stream_missing_mask);
+                /* The compaction above copies expert slots into the compact
+                 * table on the upload stream; the generic kernels launched
+                 * below read that table on the compute stream, so order them
+                 * after the copies (the wait_upload_ready() near the top of
+                 * this function ran before the compaction existed). */
+                if (ok && routed_moe_split_compact_wait_enabled() &&
+                    !cuda_stream_selected_wait_upload_ready()) ok = 0;
             }
         }
         if (ok && !split_gateup_done && !mmq_gateup_done) {
@@ -2536,6 +2757,15 @@ static int routed_moe_launch(
                             "Q2 decode MoE profile resident gate/up end")) {
                         return 0;
                     }
+                }
+            }
+            /* As in the IQ2 split: the upload writes slots from its own
+             * stream while the resident kernels still read theirs. */
+            if (ok_gateup && stream_resident_mask != 0u) {
+                ok_gateup = cuda_stream_selected_mark_inflight();
+                if (ok_gateup && routed_moe_selected_split_drain()) {
+                    ok_gateup = cuda_ok(cudaStreamSynchronize(0),
+                                        "routed_moe q2 split resident drain");
                 }
             }
             if (!ok_gateup) {

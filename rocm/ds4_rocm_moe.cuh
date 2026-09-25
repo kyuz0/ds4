@@ -3040,6 +3040,86 @@ template<int Waves> __global__ void moe_v41_down_wave_ptrs_kernel(
     if (!lane) out[row] = total;
 }
 
+/* Halo DSpark verify: the rows' (token, slot) pairs grouped by compact expert,
+ * built on the device in pair order so the grouping is deterministic. */
+__global__ static void moe_v41_pairs_by_expert_kernel(int32_t *off, int32_t *idx, const int32_t *ids,
+                                                      uint32_t pairs, uint32_t unique) {
+    if (threadIdx.x || blockIdx.x || unique > 64u || pairs > 64u) return;
+    int32_t cursor[65];
+    for (uint32_t c = 0; c <= unique; c++) cursor[c] = 0;
+    for (uint32_t p = 0; p < pairs; p++) {
+        const int32_t c = ids[p];
+        if (c >= 0 && (uint32_t)c < unique) cursor[c + 1]++;
+    }
+    for (uint32_t c = 0; c < unique; c++) cursor[c + 1] += cursor[c];
+    for (uint32_t c = 0; c <= unique; c++) off[c] = cursor[c];
+    for (uint32_t p = 0; p < pairs; p++) {
+        const int32_t c = ids[p];
+        if (c >= 0 && (uint32_t)c < unique) idx[cursor[c]++] = (int32_t)p;
+    }
+}
+
+/* Gate/up for every pair of one unique expert: the wave loads the expert's row
+ * once from DRAM and reuses it from cache for the other rows that picked it.
+ * Per pair the arithmetic is moe_v41_gate_up_wave_ptrs_kernel's exactly. */
+template<int Waves> __global__ void moe_v41_gate_up_wave_dedup_kernel(
+        float *mid_out, const char *const *gt, const char *const *ut, const cuda_block_q8_K *xq,
+        const int32_t *pair_off, const int32_t *pair_idx, const float *weights,
+        uint64_t rb, uint32_t B, uint32_t M, uint32_t N, float clamp) {
+    const unsigned lane = threadIdx.x & 31, row = blockIdx.x * Waves + (threadIdx.x >> 5), c = blockIdx.y;
+    if (row >= M) return;
+    const char *gb = gt[c];
+    const char *ub = ut[c];
+    if (!gb || !ub) return;
+    auto *g = (const cuda_block_iq2_xxs *) (gb + row * rb);
+    auto *u = (const cuda_block_iq2_xxs *) (ub + row * rb);
+    const int32_t q1 = pair_off[c + 1];
+    for (int32_t q = pair_off[c]; q < q1; q++) {
+        const int32_t p = pair_idx[q];
+        const cuda_block_q8_K *x = xq + (uint64_t)((uint32_t)p / N) * B;
+        float gv = 0, uv = 0;
+        for (unsigned b = lane >> 3; b < B; b += 4) {
+            gv += v41_iq2_pair32(g + b, x + b, lane & 7);
+            uv += v41_iq2_pair32(u + b, x + b, lane & 7);
+        }
+        for (int off = 16; off; off >>= 1) {
+            gv += __shfl_down(gv, off, 32);
+            uv += __shfl_down(uv, off, 32);
+        }
+        if (!lane) {
+            if (clamp > 1e-6f) {
+                gv = fminf(gv, clamp);
+                uv = fmaxf(-clamp, fminf(uv, clamp));
+            }
+            mid_out[(uint64_t)p * M + row] = (gv / (1 + expf(-gv))) * uv * weights[p];
+        }
+    }
+}
+
+/* Down for all rows in one launch: a wave keeps one output row and walks the
+ * tokens, so a down row shared by several tokens is read from DRAM once.
+ * Per token the sum order is moe_v41_down_wave_ptrs_kernel's exactly. */
+template<int Waves> __global__ void moe_v41_down_wave_tokens_kernel(
+        float *out, const char *const *table, const cuda_block_q8_K *xq, const int32_t *ids,
+        uint64_t rb, unsigned B, unsigned M, unsigned N, unsigned T) {
+    const unsigned lane = threadIdx.x & 31, row = blockIdx.x * Waves + (threadIdx.x >> 5);
+    if (row >= M) return;
+    for (unsigned t = 0; t < T; t++) {
+        float total = 0;
+        for (unsigned slot = 0; slot < N; slot++) {
+            int id = ids[t * N + slot];
+            if (id < 0) id = 0;
+            const char *base = table[id];
+            if (!base) continue;
+            auto *w = (const cuda_block_q2_K *) (base + row * rb);
+            auto *x = xq + (uint64_t) (t * N + slot) * B;
+            for (unsigned b = lane >> 3; b < B; b += 4) total += v41_q2_part32(w + b, x + b, lane & 7);
+        }
+        total = warp_sum_f32(total);
+        if (!lane) out[(uint64_t)t * M + row] = total;
+    }
+}
+
 __global__ static void moe_down_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,

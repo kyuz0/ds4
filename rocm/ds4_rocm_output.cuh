@@ -20,7 +20,18 @@ __global__ static void output_hc_weights_kernel(
 }
 
 
-__global__ static void swiglu_kernel(float *out, const float *gate, const float *up, uint32_t n, float clamp, float weight) {
+
+/* Halo: bf16 rounding in kernel epilogues (same rounding as v41_bf16). */
+#ifndef HALO_BF16_ROUND_DEFINED
+#define HALO_BF16_ROUND_DEFINED
+__device__ static float halo_bf16_round(float x) {
+    uint32_t bits = __float_as_uint(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return __uint_as_float(bits & 0xffff0000u);
+}
+#endif
+template <bool ROUND_BF16>
+__global__ static void swiglu_kernel_t(float *out, const float *gate, const float *up, uint32_t n, float clamp, float weight) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float g = gate[i];
@@ -30,8 +41,9 @@ __global__ static void swiglu_kernel(float *out, const float *gate, const float 
         u = fminf(fmaxf(u, -clamp), clamp);
     }
     float s = g / (1.0f + expf(-g));
-    out[i] = s * u * weight;
+    out[i] = ROUND_BF16 ? halo_bf16_round(s * u * weight) : s * u * weight;
 }
+#define swiglu_kernel swiglu_kernel_t<false>
 
 __global__ static void add_kernel(float *out, const float *a, const float *b, uint32_t n) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;

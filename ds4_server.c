@@ -12407,9 +12407,27 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* DS4_SERVER_PREFILL_QUANTUM: tokens per batched prefill slice while no
+ * generation is active (default 2048).  The V4.1 streaming sweep stages each
+ * layer's experts once per slice, so a wider slice reads the SSD proportionally
+ * fewer times; it must stay within the graph's carry capacity. */
+static int server_prefill_quantum_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 2048;
+        const char *env = getenv("DS4_SERVER_PREFILL_QUANTUM");
+        if (env && env[0]) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v >= 128 && v <= 32768) cached = (int)v;
+        }
+    }
+    return cached;
+}
+
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    int quantum = generation_active ? s->mixed_prefill_quantum : server_prefill_quantum_env();
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
@@ -13976,10 +13994,15 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        /* Halo: one resident session has nothing to batch with, so the
+         * speculative (DSpark/MTP) path also runs in batched mode, directly on
+         * the session under the inference lock the decode worker takes. */
+        const bool direct_speculation = !s->batched_mode || s->slot_count == 1;
+        if (direct_speculation &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
+            if (s->batched_mode) pthread_mutex_lock(&s->inference_mu);
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
                     slot->session, token, max_tokens - completion,
@@ -13993,6 +14016,7 @@ decode_again:
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
             }
+            if (s->batched_mode) pthread_mutex_unlock(&s->inference_mu);
             if (ntok < 0) {
                 finish = "error";
                 break;
@@ -15992,7 +16016,8 @@ int main(int argc, char **argv) {
                    server_prefill_quantum_for(&s, true),
                    server_decode_coalesce_us());
         if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
-            server_log(DS4_LOG_DEFAULT,
+            server_log(DS4_LOG_DEFAULT, s.slot_count == 1 ?
+                       "ds4-server: speculative decoding runs directly on the single resident session" :
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
         }
     }

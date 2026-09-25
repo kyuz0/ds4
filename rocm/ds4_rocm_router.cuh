@@ -180,6 +180,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
         n_expert_groups > 1u || n_group_used > 0u ||
         (active_n_expert != DS4_ROCM_N_EXPERT &&
          active_n_expert != DS4_ROCM_GLM53_N_EXPERT &&
+         active_n_expert != 128u &&
          active_n_expert != DS4_ROCM_MAX_N_EXPERT) ||
         active_n_expert_used > DS4_ROCM_N_EXPERT_USED ||
         !(active_scale > 0.0f) ||
@@ -207,6 +208,23 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
     dim3 block(32, 4, 1);
     if (active_n_expert == DS4_ROCM_MAX_N_EXPERT) {
         router_select_warp_topk_kernel<DS4_ROCM_MAX_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
+                (int32_t *)selected->ptr,
+                (float *)weights->ptr,
+                (float *)probs->ptr,
+                bias,
+                hash,
+                (const float *)logits->ptr,
+                tokens ? (const int32_t *)tokens->ptr : NULL,
+                0,
+                hash_rows,
+                n_tokens,
+                active_n_expert_used,
+                active_scale,
+                has_bias && !hash_mode,
+                hash_mode);
+    } else if (active_n_expert == 128u) {
+        /* DSpark V4.1 draft stages: 128 experts, top-3. */
+        router_select_warp_topk_kernel<128u><<<(n_tokens + 3u) / 4u, block>>>(
                 (int32_t *)selected->ptr,
                 (float *)weights->ptr,
                 (float *)probs->ptr,

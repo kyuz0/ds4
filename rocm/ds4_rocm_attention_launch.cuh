@@ -143,6 +143,7 @@ extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
     }
     return 1;
 }
+static int g_v41_heads_round_bf16 = 0, g_v41_heads_round_fused = 0;
 extern "C" int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -191,7 +192,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                 parts, lse, (const float *)q->ptr, (const float *)raw_kv->ptr,
                 (const float *)comp_kv->ptr, sinks, n_head, n_raw, n_comp, raw_start);
         if (!cuda_ok(cudaGetLastError(), "V4.1 split decode attention launch")) return 0;
-        ds41_attention_split_combine_kernel<<<n_head, 256>>>(
+        if (g_v41_heads_round_bf16) { g_v41_heads_round_fused = 1; ds41_attention_split_combine_kernel_t<true><<<n_head, 256>>>(
+        (float *)heads->ptr, parts, lse, n_head, splits); } else ds41_attention_split_combine_kernel<<<n_head, 256>>>(
                 (float *)heads->ptr, parts, lse, n_head, splits);
         return cuda_ok(cudaGetLastError(), "V4.1 split decode attention combine");
     }
@@ -1760,4 +1762,20 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
             use_dp4a);
     return cuda_ok(cudaGetLastError(),
                    "attention_output_low_q8 launch");
+}
+
+/* Halo: decode attention whose combine rounds the heads to bf16 in the epilogue
+ * (split path); other paths fall back to a separate rounding launch. */
+extern "C" int ds4_gpu_attention_decode_heads_bf16_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *window, uint32_t n_raw, uint32_t window_rows, uint32_t window_start,
+        const ds4_gpu_tensor *selected_kv, uint32_t selected_offset, uint32_t n_selected,
+        const ds4_gpu_tensor *extra, uint32_t extra_count, uint32_t n_head, uint32_t head_dim) {
+    g_v41_heads_round_bf16 = 1; g_v41_heads_round_fused = 0;
+    const int ok = ds4_gpu_attention_decode_heads_tensor(heads, model_map, model_size, sinks_offset, q, window, n_raw,
+        window_rows, window_start, selected_kv, selected_offset, n_selected, extra, extra_count, n_head, head_dim);
+    g_v41_heads_round_bf16 = 0;
+    if (!ok) return 0;
+    if (g_v41_heads_round_fused) return 1;
+    return ds4_gpu_dsv41_quantize(heads, n_head * head_dim, 1, DS4_V41_BF16);
 }

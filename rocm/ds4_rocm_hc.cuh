@@ -57,7 +57,18 @@ __global__ static void hc_split_sinkhorn_kernel(float *out, const float *mix, co
     hc4_split_one(out + (uint64_t)row * 24, mix + (uint64_t)row * 24, scale, base, sinkhorn_iters, epsv);
 }
 
-__global__ static void hc_weighted_sum_kernel(float *out, const float *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
+
+/* Halo: bf16 rounding in kernel epilogues (same rounding as v41_bf16). */
+#ifndef HALO_BF16_ROUND_DEFINED
+#define HALO_BF16_ROUND_DEFINED
+__device__ static float halo_bf16_round(float x) {
+    uint32_t bits = __float_as_uint(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return __uint_as_float(bits & 0xffff0000u);
+}
+#endif
+template <bool ROUND_BF16>
+__global__ static void hc_weighted_sum_kernel_t(float *out, const float *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_embd * n_tokens;
     if (gid >= n) return;
@@ -68,8 +79,9 @@ __global__ static void hc_weighted_sum_kernel(float *out, const float *x, const 
         acc += x[(uint64_t)t * n_hc * n_embd + (uint64_t)h * n_embd + d] *
                w[(uint64_t)t * weight_stride_f32 + h];
     }
-    out[(uint64_t)t * n_embd + d] = acc;
+    out[(uint64_t)t * n_embd + d] = ROUND_BF16 ? halo_bf16_round(acc) : acc;
 }
+#define hc_weighted_sum_kernel hc_weighted_sum_kernel_t<false>
 
 __global__ static void hc_expand_kernel(
         float *out_hc,
@@ -163,7 +175,8 @@ __global__ static void hc_expand_add_half_kernel(
     out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
 }
 
-__global__ static void hc_expand4_kernel(
+template <bool ROUND_BF16>
+__global__ static void hc_expand4_kernel_t(
         float *out_hc,
         const float *block_out,
         const float *residual_hc,
@@ -192,9 +205,10 @@ __global__ static void hc_expand4_kernel(
         acc += comb[1u * 4u + dst] * r1;
         acc += comb[2u * 4u + dst] * r2;
         acc += comb[3u * 4u + dst] * r3;
-        out_hc[hc_base + (uint64_t)dst * n_embd] = acc;
+        out_hc[hc_base + (uint64_t)dst * n_embd] = ROUND_BF16 ? halo_bf16_round(acc) : acc;
     }
 }
+#define hc_expand4_kernel hc_expand4_kernel_t<false>
 
 __global__ static void hc_expand4_add_kernel(
         float *out_hc,
