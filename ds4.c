@@ -75097,6 +75097,15 @@ static int qwen4_spec_depth(ds4_session *s) {
         }
     } else if (bits < 6u || s->qwen4_reject2_streak >= 2u) {
         s->qwen4_depth3_engaged = false;
+#ifdef DS4_ROCM_BUILD
+        if (ds4_gpu_dspark_gfx1151_fast_path()) {
+            /* Retry only after a fresh perfect eight-cycle shallow window.
+             * A second-draft rejection cannot be cleared by shallow cycles,
+             * so retaining it here would permanently prevent reentry. */
+            s->qwen4_depth_window = 0u;
+            s->qwen4_reject2_streak = 0u;
+        }
+#endif
     }
     return s->qwen4_depth3_engaged ? 3 : 2;
 }
