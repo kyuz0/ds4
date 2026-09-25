@@ -2561,6 +2561,8 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
     return ok;
 }
 
+#include "ds4_rocm_qwen4_attention_wmma.cuh"
+
 extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *gate, const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc,
         const ds4_gpu_tensor *sel, const ds4_gpu_tensor *count, ds4_gpu_tensor *partial,
@@ -2573,6 +2575,27 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
     const unsigned keys = sparse ? stride : pos0 + T;
     const unsigned splits = partial ? std::min(64u, (keys + 31) / 32) : 1;
     if (partial && !tensor(partial, (uint64_t)T * H * splits * (D + 2) * 4)) return 0;
+    // Preserve the quality-mode and narrow-token paths. The mask scratch is
+    // consumed on the same stream before the existing temporary arena is reused.
+    if (!g_quality_mode && ds4_rocm_is_gfx1151() && T >= 512 &&
+        H == 24 && Hkv == 2 && D == 256 && scale == 0.0625f &&
+        (uint64_t)pos0 + T <= 65536 && (!sparse || stride == 2052)) {
+        using namespace qwen4_wmma_attention;
+        const float *qp=(const float *)q->ptr, *gp=(const float *)gate->ptr;
+        const __half *kp=(const __half *)kc->ptr, *vp=(const __half *)vc->ptr;
+        float *dst=(float *)out->ptr;
+        if (sparse) {
+            const unsigned words=(pos0+T+127)/128;
+            unsigned *mask=(unsigned *)cuda_tmp_alloc((uint64_t)T*words*sizeof(unsigned), "Qwen attention mask");
+            if (!mask) return 0;
+            selected_to_mask<<<T,256,0,0>>>(mask,(const int *)sel->ptr,(const unsigned *)count->ptr,stride,words,pos0);
+            if (!launched()) return 0;
+            WmmaCausalAttentionKernel<4,16,true,false><<<dim3((T+3)/4,2),256,0,0>>>(qp,gp,kp,vp,mask,words,dst,pos0,T);
+        } else {
+            WmmaCausalAttentionKernel<16,16,false,true><<<dim3((T+15)/16,12),256,0,0>>>(qp,gp,kp,vp,NULL,0,dst,pos0,T);
+        }
+        return launched();
+    }
     const dim3 grid((H + 3) / 4, T, splits);
 #define QWEN_ATTN(DIM) attention<DIM><<<grid, 128, 0, 0>>>((float *)out->ptr, \
         partial ? (float *)partial->ptr : NULL, (const float *)q->ptr, (const float *)gate->ptr, \
