@@ -1253,7 +1253,6 @@ qwen4-rocm-qa-build:
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)" \
 		NVCC="$(HIPCC)" NVCCFLAGS="$(ROCM_CFLAGS)" CUDA_LDLIBS="$(ROCM_LDLIBS)"
-
 # Compare production 2K/4K gate/up outputs with the current MMQ epilogue.
 tests/test_halo_moe_rocm.o: tests/test_halo_moe_rocm.cu cuda/mmq/ds4_mmq.h rocm/ds4_rocm_halo_moe.h
 	$(HIPCC) $(ROCM_CFLAGS) -DGGML_USE_HIP -I. -c -o $@ $<
