@@ -11723,6 +11723,25 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         return pr;
     }
 
+    /* DS41 frontier snapshots: any shared prefix shorter than the live
+     * checkpoint restarts from the newest captured frontier instead of
+     * rebuilding the whole transcript.  Ordered after the specialized
+     * tiers, which keep more live state when they match (thinking-visible
+     * retains sampled hidden reasoning that a rewind would drop). */
+    if (common > 0 && common < live_pos && token_image_prefix) {
+        const int snap = ds4_session_frontier_hint(slot->session, common);
+        const char *fdbg = getenv("DS4_ROCM_V41_FRONTIER_DEBUG");
+        if (fdbg && fdbg[0] != '\0' && strcmp(fdbg, "0") != 0)
+            fprintf(stderr,
+                    "ds4-server: reuse probe frontier common=%d live=%d prompt=%d hint=%d\n",
+                    common, live_pos, req->prompt.len, snap);
+        if (snap >= 0) {
+            pr.kind = REUSE_MEMORY_REWIND;
+            pr.reuse_tokens = snap;
+            return pr;
+        }
+    }
+
     return pr;
 }
 
@@ -12407,9 +12426,27 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* DS4_SERVER_PREFILL_QUANTUM: tokens per batched prefill slice while no
+ * generation is active (default 2048).  The V4.1 streaming sweep stages each
+ * layer's experts once per slice, so a wider slice reads the SSD proportionally
+ * fewer times; it must stay within the graph's carry capacity. */
+static int server_prefill_quantum_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 2048;
+        const char *env = getenv("DS4_SERVER_PREFILL_QUANTUM");
+        if (env && env[0]) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v >= 128 && v <= 32768) cached = (int)v;
+        }
+    }
+    return cached;
+}
+
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    int quantum = generation_active ? s->mixed_prefill_quantum : server_prefill_quantum_env();
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
@@ -12586,14 +12623,23 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
 static int server_generation_rewind(server *s, server_slot *slot,
                                      const request *r, int pos,
                                      char *err, size_t errlen) {
-    pthread_mutex_lock(&s->inference_mu);
-    ds4_session_rewind(slot->session, pos);
     ds4_tokens prefix = {0};
+    int rc = 0;
+    pthread_mutex_lock(&s->inference_mu);
+    /* Copy the token history before rewinding: a snapshot restart lands on
+     * an older frontier and the kept tokens must be replayed from there. */
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
-    bool rebuild = ds4_session_common_prefix(slot->session, &prefix) != prefix.len;
+    ds4_session_rewind(slot->session, pos);
+    const int live = ds4_session_pos(slot->session);
+    const bool rebuild = !ds4_session_checkpoint_valid(slot->session) || live != pos;
     pthread_mutex_unlock(&s->inference_mu);
-    int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
-        r->images, r->image_count, err, errlen) : 0;
+    if (rebuild) {
+        ds4_tokens target = {0};
+        tokens_copy_prefix(&target, &prefix, pos);
+        rc = server_session_sync_multimodal(s, slot, &target,
+            r->images, r->image_count, err, errlen);
+        ds4_tokens_free(&target);
+    }
     ds4_tokens_free(&prefix);
     return rc;
 }
@@ -13503,14 +13549,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     case REUSE_MEMORY_REWIND: {
         pthread_mutex_lock(&s->inference_mu);
         ds4_session_rewind(slot->session, reuse.reuse_tokens);
-        /* Rewinding mutates the session, so re-validate before trusting the
-         * frontier: the common prefix must land exactly on the rewind target
-         * and the vision state must still describe the request (upstream's
-         * multimodal hardening).  A failed validation falls through to the
-         * disk cache / cold prefill instead of reusing a bad frontier. */
+        /* Rewinding mutates the session and may restart from an older
+         * snapshot boundary than the probe hinted, so re-validate the actual
+         * frontier: the common prefix must land exactly on the restored
+         * position and the vision state must still describe the request
+         * (upstream's multimodal hardening).  A failed validation falls
+         * through to the disk cache / cold prefill instead of reusing a bad
+         * frontier. */
+        const int rewound = ds4_session_pos(slot->session);
         const bool rewind_valid =
-            ds4_session_common_prefix(slot->session, &j->req.prompt) ==
-                reuse.reuse_tokens &&
+            ds4_session_common_prefix(slot->session, &j->req.prompt) == rewound &&
             (!multimodal ||
              ds4_session_vision_state_matches(slot->session,
                                               j->req.images,
@@ -13518,16 +13566,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         pthread_mutex_unlock(&s->inference_mu);
         if (rewind_valid) {
             live_materialized = true;
+            cached = rewound;
             cache_source = "memory-rewind";
-            cache_diag.rewind_to = reuse.reuse_tokens;
+            cache_diag.rewind_to = rewound;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                       old_pos, reuse.reuse_tokens);
+                       "ds4-server: rewound live prefix from %d to %d; the suffix will be reevaluated",
+                       old_pos, rewound);
         } else {
             cached = 0;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
-                       old_pos, reuse.reuse_tokens);
+                       "ds4-server: live prefix rewind from %d to %d requires rebuild",
+                       old_pos, rewound);
         }
         break;
     }
@@ -13976,10 +14025,15 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        /* Halo: one resident session has nothing to batch with, so the
+         * speculative (DSpark/MTP) path also runs in batched mode, directly on
+         * the session under the inference lock the decode worker takes. */
+        const bool direct_speculation = !s->batched_mode || s->slot_count == 1;
+        if (direct_speculation &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
+            if (s->batched_mode) pthread_mutex_lock(&s->inference_mu);
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
                     slot->session, token, max_tokens - completion,
@@ -13993,10 +14047,15 @@ decode_again:
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
             }
+            if (s->batched_mode) pthread_mutex_unlock(&s->inference_mu);
             if (ntok < 0) {
                 finish = "error";
                 break;
             }
+            /* The speculative block committed accepted tokens; record the
+             * frontier so rewinds inside the generated region restart from a
+             * snapshot instead of the prompt end. */
+            ds4_session_decode_frontier_note(slot->session);
         } else if (s->batched_mode && s->qwen4_batch_mtp &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
@@ -14216,7 +14275,11 @@ decode_again:
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
                 pthread_mutex_lock(&s->inference_mu);
-                ds4_session_invalidate(slot->session);
+                /* Keep the prefill frontier instead of invalidating: the KV
+                 * rows past the visible stop boundary cannot match what the
+                 * client will replay, but rewinding to the generation start
+                 * lets the next request reuse the whole prompt prefix. */
+                ds4_session_rewind(slot->session, prompt_for_sync->len);
                 pthread_mutex_unlock(&s->inference_mu);
                 text_stop = true;
                 stop_decode = true;
@@ -15719,6 +15782,8 @@ static server_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--expert-profile")) {
+            c.engine.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {
@@ -15992,7 +16057,8 @@ int main(int argc, char **argv) {
                    server_prefill_quantum_for(&s, true),
                    server_decode_coalesce_us());
         if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
-            server_log(DS4_LOG_DEFAULT,
+            server_log(DS4_LOG_DEFAULT, s.slot_count == 1 ?
+                       "ds4-server: speculative decoding runs directly on the single resident session" :
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
         }
     }

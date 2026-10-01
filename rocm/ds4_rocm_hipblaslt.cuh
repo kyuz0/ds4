@@ -180,27 +180,54 @@ static int hipblaslt_prefill_solution_index(
     return -1;
 }
 
+/*
+ * Opt-in recovery for library revisions without the fixed-index table: use
+ * the installed hipBLASLt's own zero-workspace heuristic instead of dropping
+ * to the WMMA fallback kernels. The heuristic ordering is revision specific,
+ * so this stays off unless requested and can be A/B tested on the target.
+ */
+static int hipblaslt_prefill_heuristic_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_HIPBLASLT_PREFILL_HEURISTIC");
+        cached = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
 /* The caller restricts this path to gfx1151 DS4 with quality mode off;
  * validate the dimensions here as well before choosing any fixed-index plan. */
 static int hipblaslt_gemm_tn_f16_out_f32_prefill(
         float *out, const __half *w, const __half *x,
         uint32_t out_dim, uint32_t n_tok, uint32_t in_dim) {
     const int solution_index = hipblaslt_prefill_solution_index(out_dim, n_tok, in_dim);
-    if (solution_index < 0 || !g_hipblaslt_ready || !out || !w || !x ||
-        __atomic_load_n(&g_hipblaslt_prefill_state, __ATOMIC_RELAXED) < 0) return 0;
-    if (__atomic_load_n(&g_hipblaslt_prefill_state, __ATOMIC_RELAXED) == 0) {
+    if (solution_index < 0 || !g_hipblaslt_ready || !out || !w || !x) return 0;
+    const int state = __atomic_load_n(&g_hipblaslt_prefill_state, __ATOMIC_RELAXED);
+    if (state < 0) return 0;
+    int plan_index = solution_index;
+    if (state == 0) {
         int version = 0;
         char revision[128] = {0};
-        if (!hipblaslt_ok(hipblasLtGetVersion(g_hipblaslt, &version), "prefill version") ||
-            !hipblaslt_ok(hipblasLtGetGitRevision(g_hipblaslt, revision), "prefill revision") ||
-            version != 100401 || strcmp(revision, "8d1ae90e") != 0) {
+        const bool qualified =
+            hipblaslt_ok(hipblasLtGetVersion(g_hipblaslt, &version), "prefill version") &&
+            hipblaslt_ok(hipblasLtGetGitRevision(g_hipblaslt, revision), "prefill revision") &&
+            version == 100401 && strcmp(revision, "8d1ae90e") == 0;
+        if (qualified) {
+            __atomic_store_n(&g_hipblaslt_prefill_state, 1, __ATOMIC_RELAXED);
+        } else if (hipblaslt_prefill_heuristic_enabled()) {
+            /* Unqualified revision: ask the installed library for its own
+             * zero-workspace plan instead of dropping to the WMMA fallback. */
+            plan_index = -1;
+            __atomic_store_n(&g_hipblaslt_prefill_state, 2, __ATOMIC_RELAXED);
+        } else {
             __atomic_store_n(&g_hipblaslt_prefill_state, -1, __ATOMIC_RELAXED);
             return 0;
         }
-        __atomic_store_n(&g_hipblaslt_prefill_state, 1, __ATOMIC_RELAXED);
+    } else if (state == 2) {
+        plan_index = -1;
     }
     cuda_hipblaslt_gemm_plan *p = hipblaslt_gemm_plan_get(
-            out_dim, n_tok, in_dim, "prefill F16/F32", HIP_R_32F, solution_index);
+            out_dim, n_tok, in_dim, "prefill F16/F32", HIP_R_32F, plan_index);
     if (p) {
         const float alpha = 1.0f, beta = 0.0f;
         if (hipblaslt_ok(hipblasLtMatmul(g_hipblaslt, p->desc, &alpha,

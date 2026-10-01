@@ -59,8 +59,11 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_HOST_CFLAGS ?= -fPIC
-ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
-ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt -lrocblas
+# ROCm ships headers and shared libraries under /opt/rocm without putting
+# them on the compiler or linker search paths, so name them explicitly.
+# Both flags are inert on setups that already expose ROCm system-wide.
+ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH) -I/opt/rocm/include
+ROCM_LDLIBS ?= -lm -pthread -L/opt/rocm/lib -Wl,-rpath,/opt/rocm/lib -lhipblas -lhipblaslt -lrocblas
 ROCM_MMQ_Y ?= 64
 ROCM_MMQ_FLAGS := $(ROCM_CFLAGS) -std=c++17 -DGGML_USE_HIP -DDS4_HIP_MMQ_Y=$(ROCM_MMQ_Y) $(MMQ_INCLUDES)
 ROCM_MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.rocm.o cuda/mmq/ds4_mmq.rocm.o cuda/mmq/quantize.rocm.o cuda/mmq/mmid.rocm.o cuda/mmq/mmvq.rocm.o cuda/mmq/d2r_stubs.rocm.o

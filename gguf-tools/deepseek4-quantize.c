@@ -846,12 +846,17 @@ static float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64
     if (w->n_dims != 2 || scale->n_dims != 2) die("FP8 tensor must be 2D");
     const int64_t out_dim = w->shape[0];
     const int64_t in_dim = w->shape[1];
-    const int64_t block_out = 128;
-    const int64_t block_in = 128;
-    if (out_dim % block_out || in_dim % block_in) die("FP8 dims are not divisible by 128");
-    const int64_t scale_rows = out_dim / block_out;
-    const int64_t scale_cols = in_dim / block_in;
-    if (scale->shape[0] != scale_rows || scale->shape[1] != scale_cols) die("FP8 scale shape mismatch");
+    /* Block size follows the scale grid: DeepSeek V4 ships 128x128 FP8 blocks,
+     * V4.1 ships 32x32 (weight_block_size in config.json). Derive it from the
+     * scale shape instead of assuming 128 so both checkpoints convert. */
+    const int64_t scale_rows = scale->shape[0];
+    const int64_t scale_cols = scale->shape[1];
+    if (scale_rows <= 0 || scale_cols <= 0) die("FP8 scale shape invalid");
+    if (out_dim % scale_rows || in_dim % scale_cols) die("FP8 scale shape mismatch");
+    const int64_t block_out = out_dim / scale_rows;
+    const int64_t block_in = in_dim / scale_cols;
+    if ((block_out != 128 && block_out != 32) || (block_in != 128 && block_in != 32))
+        die("FP8 block size is neither 128 nor 32");
     /* shape and data_offsets are independent header fields; cross-check that the
      * on-disk buffers (sized from data_offsets by db_read) are actually large
      * enough for the shape-driven indexing below. Without this, a weight that
@@ -2255,6 +2260,10 @@ static const dspark_name_rule dspark_stage_rules[] = {
     {"norm.weight", "norm.weight", "emit"},
     {"markov_head.markov_w1.weight", "markov_head.markov_w1.weight", "emit"},
     {"markov_head.markov_w2.weight", "markov_head.markov_w2.weight", "emit"},
+    /* DeepSeek V4.1 Flash names the Markov head embed/head: embed is the
+     * per-token row (w1), head is the vocabulary projection (w2). */
+    {"markov_head.embed.weight", "markov_head.markov_w1.weight", "emit"},
+    {"markov_head.head.weight", "markov_head.markov_w2.weight", "emit"},
     {"confidence_head.proj.weight", "confidence_head.proj.weight", "emit"},
 };
 

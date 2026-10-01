@@ -2015,7 +2015,16 @@ __global__ static void ds41_attention_split_f32_heads_kernel(
 }
 
 /* Combine independently normalized key tiles, including the sink only in tile zero. */
-__global__ static void ds41_attention_split_combine_kernel(
+#ifndef HALO_BF16_ROUND_DEFINED
+#define HALO_BF16_ROUND_DEFINED
+__device__ static float halo_bf16_round(float x) {
+    uint32_t bits = __float_as_uint(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return __uint_as_float(bits & 0xffff0000u);
+}
+#endif
+template <bool ROUND_BF16>
+__global__ static void ds41_attention_split_combine_kernel_t(
         float *out, const float *parts, const float *lse,
         uint32_t n_head, uint32_t splits) {
     const uint32_t head = blockIdx.x;
@@ -2030,6 +2039,7 @@ __global__ static void ds41_attention_split_combine_kernel(
         for (uint32_t k = 0; k < splits; k++)
             value += parts[((uint64_t)k * n_head + head) * 512u + dim] *
                      expf(lse[k * n_head + head] - max_lse);
-        out[(uint64_t)head * 512u + dim] = value / denominator;
+        out[(uint64_t)head * 512u + dim] = ROUND_BF16 ? halo_bf16_round(value / denominator) : value / denominator;
     }
 }
+#define ds41_attention_split_combine_kernel ds41_attention_split_combine_kernel_t<false>

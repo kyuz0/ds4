@@ -591,6 +591,14 @@ void ds4_session_invalidate(ds4_session *s);
  * the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
+/* Newest captured DS41 frontier snapshot at or below desired_pos, or -1.
+ * Lock-free hint for the server reuse probe; the authoritative resolution
+ * and validation happen under the inference lock at rewind time. */
+int ds4_session_frontier_hint(const ds4_session *s, int desired_pos);
+/* Record a decode frontier for the snapshot ring; call when the checkpoint
+ * vector and the graph position agree exactly. Cheap no-op for backends
+ * without snapshot support. */
+void ds4_session_decode_frontier_note(ds4_session *s);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
