@@ -1160,10 +1160,10 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
-	rm -f $(ROCM_HALO_OBJS) rocm/halo/output_b/code.inc tests/test_halo_shapes ds4-kernel-halo-moe tests/test_halo_moe_rocm.o
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
 	rm -f tests/test_web_recovery
+	rm -f $(ROCM_HALO_OBJS) rocm/halo/output_b/code.inc tests/test_halo_shapes ds4-kernel-halo-moe tests/test_halo_moe_rocm.o
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal
