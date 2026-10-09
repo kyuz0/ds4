@@ -3581,6 +3581,20 @@ int ds4_gpu_qwen4_mtp_stage_tensor(
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
 
+#ifdef DS4_ROCM_BUILD
+void ds4_rocm_halo_set_model(bool enabled);
+void ds4_rocm_halo_attention_plan(bool enabled,const void *model,uint64_t size,
+        uint64_t a,uint64_t b,uint32_t pos,uint32_t n_ctx,float base,float scale,
+        float ext,float attn,float fast,float slow);
+void ds4_rocm_halo_set_dense_scratch(const ds4_gpu_tensor *heads);
+void ds4_rocm_halo_set_scope(uint32_t pos, uint32_t rows, uint32_t capacity,
+        uint32_t layer, bool enabled);
+/* ROCm-only HC normalization/conversion fusion with the native fallback. */
+int ds4_rocm_halo_hc_project(ds4_gpu_tensor *out, ds4_gpu_tensor *norm,
+        const void *map, uint64_t model_size, uint64_t offset, uint64_t k, uint64_t n,
+        const ds4_gpu_tensor *x, uint32_t rows, float eps);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

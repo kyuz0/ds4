@@ -608,5 +608,14 @@ static int cuda_rope_tail_stride_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint3
 }
 
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    auto &p=g_halo_attention;
+    if (p.state) {
+        const bool match=p.state==1 && x && x->ptr==p.heads && n_tok==g_halo_rows &&
+            n_head==64 && head_dim==512 && n_rot==64 && pos0==p.pos && n_ctx_orig==p.n_ctx &&
+            inverse && freq_base==p.base && freq_scale==p.scale && ext_factor==p.ext &&
+            attn_factor==p.attn && beta_fast==p.fast && beta_slow==p.slow;
+        if (!match) {p.state=3;return 0;}
+        p.state=2;return 1;
+    }
     return cuda_rope_tail_stride_tensor(x, n_tok, n_head, head_dim, n_rot, pos0, 1u, n_ctx_orig, inverse, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 }

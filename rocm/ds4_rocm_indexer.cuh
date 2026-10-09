@@ -869,6 +869,8 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
     mask[gid] = v;
 }
 
+#include "ds4_rocm_halo_indexer.cuh"
+
 static int indexer_scores_launch(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -899,6 +901,20 @@ static int indexer_scores_launch(
                                                          n_comp, pos0, ratio,
                                                          scale, causal ? 1 : 0);
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
+    }
+    if (g_halo_prefill_model && halo_prefill_scope(n_tokens) && !g_quality_mode && !g_ssd_streaming_mode && !g_glm_model &&
+        ds4_rocm_is_gfx1151() &&
+        ds4_rocm_halo_indexer_shape(n_comp, n_tokens, pos0, n_head,
+                                   head_dim, ratio, causal) &&
+        ((uintptr_t)index_comp->ptr & 15u) == 0u) {
+        /* Extents were validated above. The kernel adds no tensors or scratch;
+         * original Hadamard, top-k and attention consumers remain in place. */
+        dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
+        halo_indexer_scores_resident_keys_kernel<<<grid, 256>>>(
+            (float *)scores->ptr, (const float *)q->ptr,
+            (const float *)weights->ptr, (const float *)index_comp->ptr,
+            n_comp, n_tokens, pos0, n_head, head_dim, ratio, scale, 1);
+        return cuda_ok(cudaGetLastError(), "Halo resident-key indexer launch");
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);

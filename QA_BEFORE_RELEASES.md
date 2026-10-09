@@ -939,6 +939,9 @@ a substitute for CUDA or Metal release testing.
   alone, and stop below 3 GiB usable. Never run primitive benchmarks or builds
   beside a resident model, even if the model process is paused. Keep logs
   outside `/tmp` so a reboot does not erase the failure evidence.
+- After Flash bulk-prefill kernel changes, run `make test-halo-shapes
+  test-halo-moe-rocm`. Require full FP32/F16 equality against current MMQ
+  and intact canaries at both 2K and 4K with all three routing patterns.
 - After resident cache changes, exercise plain Flash and checkpoint-matched
   DSpark at the default context and prefill capacity. Required weights and
   session buffers must fit before optional Q8-to-FP16 expansion. Record the

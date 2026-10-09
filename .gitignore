@@ -98,3 +98,9 @@ ds4-kernel-v41-tp-gates
 /ds4-kernel-v41-tp-bind-failure
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
+
+# Rebuilt Halo code objects and host shape test.
+/rocm/halo/output_b/code.inc
+/tests/test_halo_shapes
+
+/ds4-kernel-halo-moe

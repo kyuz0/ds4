@@ -1,3 +1,20 @@
+// All dimensions and tensor extents are checked by the existing callers.
+// Only the cached, interleaved half-output projection has this donor contract.
+static int halo_output_a_launch(half *out, const half *w, const half *heads,
+        uint32_t rows, uint64_t k, uint64_t rank, uint32_t groups) {
+    if (!g_halo_prefill_model || !halo_prefill_scope(rows) || g_quality_mode || g_glm_model || g_ssd_streaming_mode ||
+        !ds4_rocm_is_gfx1151() ||
+        g_rocblas_f16_solution_set != DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E ||
+        !ds4_rocm_halo_output_a_shape(rows, k, rank, groups) ||
+        (((uintptr_t)out | (uintptr_t)w | (uintptr_t)heads) & 15u)) return 0;
+    const dim3 grid(rows / 32u, groups, 1u);
+    if (rows == 2048u) halo_output_a_kernel<2048u><<<grid,256>>>(out,w,heads);
+    else halo_output_a_kernel<4096u><<<grid,256>>>(out,w,heads);
+    // A launch error is surfaced before callers can overwrite partial output.
+    if (!cuda_ok(cudaGetLastError(), "Halo grouped output-A launch")) return -1;
+    return 1;
+}
+
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
@@ -264,6 +281,13 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         !g_quality_mode &&
         ((window != 0u ? window : n_tokens) <= 768u)) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+        if (g_halo_prefill_model && halo_prefill_scope(n_tokens) && !g_glm_model && !g_ssd_streaming_mode && ds4_rocm_is_gfx1151() &&
+            ds4_rocm_halo_static_query_shape(n_tokens, 0, window, 1, n_head, head_dim)) {
+            halo_static_query::static_q_reg_kernel<<<grid, 256>>>((float *)heads->ptr,
+                sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                (const float *)raw_kv->ptr, n_tokens, 0, window, 1, n_head, head_dim);
+            return cuda_ok(cudaGetLastError(), "Halo static query launch");
+        }
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
                                                                    (const float *)q->ptr,
@@ -419,6 +443,16 @@ static int attention_decode_batch_launch(
     if (use_wmma_ring && !use_comp_mask && n_tokens > 1u &&
         head_dim == 512u && fast_window_attention) {
         dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
+        if (g_halo_prefill_model && halo_prefill_scope(n_tokens) && !g_glm_model && !g_ssd_streaming_mode && ds4_rocm_is_gfx1151() &&
+            ds4_rocm_halo_direct_qk_shape(n_tokens, pos0, n_raw, raw_cap, raw_start,
+                n_comp, 0, window, ratio, n_head, head_dim, 0)) {
+            halo_direct_qk::bdqk_native<2, 32><<<grid, 512>>>((float *)heads->ptr,
+                sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                NULL, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, 0,
+                window, ratio, n_head, head_dim);
+            return cuda_ok(cudaGetLastError(), "Halo direct QK ring launch");
+        }
         attention_mixed_heads16_wmma_kernel<2, 32><<<grid, 512>>>((float *)heads->ptr,
                                                                   sinks,
                                                                   (const float *)q->ptr,
@@ -604,6 +638,66 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 (uint32_t)((head_dim & 3u) == 0u));
         return cuda_ok(cudaGetLastError(), "attention indexed decode oldhip fast launch");
     }
+    auto &plan=g_halo_attention;
+    /* Keep the newer Gufo arithmetic and dispatch when enabled. */
+    if (!ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_GUFO") &&
+        plan.enabled && !plan.state && g_halo_prefill_model && halo_prefill_scope(n_tokens) &&
+        !g_quality_mode && !g_glm_model && !g_ssd_streaming_mode && ds4_rocm_is_gfx1151() &&
+        cuda_runtime_config()->attention_output_cublas_all && !cuda_runtime_config()->graph_dump &&
+        g_cublas_ready && g_rocblas_f16_solution_set==DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
+        plan.pos==pos0 && raw_cap<=g_halo_capacity &&
+        ds4_rocm_halo_direct_qk_shape(n_tokens,pos0,n_raw,raw_cap,raw_start,n_comp,
+            top_k,window,ratio,n_head,head_dim,1) &&
+        (((uintptr_t)heads->ptr|(uintptr_t)q->ptr|(uintptr_t)raw_kv->ptr|
+          (uintptr_t)comp_kv->ptr)&15u)==0 && ((uintptr_t)heads->ptr&255u)==0 &&
+        (((uintptr_t)topk_ptr|(uintptr_t)sinks)&3u)==0) {
+        const uint64_t hb=(uint64_t)n_tokens*64*512*4;
+        const uint64_t list=(uint64_t)n_tokens*512*4;
+        const uint64_t view=(uint64_t)(n_raw+n_comp)*512*2;
+        const uint64_t packed=hb/2, tmp_bytes=packed+(uint64_t)n_tokens*8192*2;
+        bool safe=heads->bytes>=list+view && heads->bytes>=hb && q->bytes>=hb &&
+            raw_kv->bytes>=(uint64_t)raw_cap*512*4 && comp_kv->bytes>=(uint64_t)n_comp*512*4;
+        safe=safe && plan.a_offset<=plan.model_size && plan.b_offset<=plan.model_size &&
+            8ull*1024*128*34<=plan.model_size-plan.a_offset &&
+            4096ull*256*34<=plan.model_size-plan.b_offset &&
+            !halo_overlap(g_cuda_tmp,g_cuda_tmp_bytes,q->ptr,hb) &&
+            !halo_overlap(g_cuda_tmp,g_cuda_tmp_bytes,topk_ptr,list) &&
+            !halo_overlap(g_cuda_tmp,g_cuda_tmp_bytes,raw_kv->ptr,(uint64_t)raw_cap*512*4) &&
+            !halo_overlap(g_cuda_tmp,g_cuda_tmp_bytes,comp_kv->ptr,(uint64_t)n_comp*512*4) &&
+            !halo_overlap(g_cuda_tmp,g_cuda_tmp_bytes,sinks,256);
+        safe=safe && !halo_overlap(heads->ptr,hb,q->ptr,hb) &&
+            !halo_overlap(heads->ptr,hb,raw_kv->ptr,(uint64_t)raw_cap*512*4) &&
+            !halo_overlap(heads->ptr,hb,comp_kv->ptr,(uint64_t)n_comp*512*4) &&
+            !halo_overlap(heads->ptr,hb,topk_ptr,list) && !halo_overlap(heads->ptr,hb,sinks,256);
+        // Bind both original cache allocations before suppressing native FP32 heads.
+        const __half *aw=safe?cuda_q8_f16_ptr(plan.model,plan.a_offset,8ull*1024*128*34,
+            4096,8192,"attn_output_a"):nullptr;
+        const __half *bw=aw?cuda_q8_f16_transpose_ptr(plan.model,plan.b_offset,4096ull*256*34,
+            8192,4096,"attn_output_b",halo_output_b_admitted(n_tokens,8192,4096)):nullptr;
+        void *tmp=bw?cuda_tmp_alloc(tmp_bytes,"Halo fused attention packed heads"):nullptr;
+        safe=tmp && !halo_overlap(tmp,tmp_bytes,heads->ptr,hb) &&
+            !halo_overlap(tmp,tmp_bytes,q->ptr,hb) && !halo_overlap(tmp,tmp_bytes,topk_ptr,list) &&
+            !halo_overlap(tmp,tmp_bytes,raw_kv->ptr,(uint64_t)raw_cap*512*4) &&
+            !halo_overlap(tmp,tmp_bytes,comp_kv->ptr,(uint64_t)n_comp*512*4) &&
+            !halo_overlap(tmp,tmp_bytes,sinks,256);
+        if (safe) {
+            plan.state=3;plan.heads=heads->ptr;plan.packed=tmp;
+            auto *indices=(int32_t*)heads->ptr;
+            auto *kv=(half*)((char*)heads->ptr+list);
+            indexed_topk_sort_512_asc_kernel<<<n_tokens,512>>>(indices,topk_ptr,n_tokens);
+            if (!cuda_ok(cudaGetLastError(),"Halo fused attention index lease")) return 0;
+            halo_attention::convert<<<n_raw+n_comp,256>>>(kv,(const float*)raw_kv->ptr,
+                (const float*)comp_kv->ptr,n_raw,raw_cap,raw_start,n_comp);
+            if (!cuda_ok(cudaGetLastError(),"Halo fused attention KV half view")) return 0;
+            halo_attention::P2Rope rp={pos0,1,plan.n_ctx,1,plan.base,plan.scale,plan.ext,
+                plan.attn,plan.fast,plan.slow,64};
+            halo_attention::bdqk_half_fused<1,32,true><<<dim3(n_tokens,2),512>>>((half*)tmp,
+                sinks,(const float*)q->ptr,kv,kv+(uint64_t)n_raw*512,indices,n_tokens,pos0,
+                n_raw,n_raw,0,n_comp,top_k,window,ratio,n_head,head_dim,rp,nullptr);
+            if (!cuda_ok(cudaGetLastError(),"Halo fused attention inverse RoPE pack")) return 0;
+            plan.state=1;return 1;
+        }
+    }
     if (n_tokens > 1u && top_k == 512u) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
@@ -652,6 +746,16 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 const bool use_vec2 =
                         ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_F32_VEC2");
                 if (use_vec2) {
+                    if (g_halo_prefill_model && halo_prefill_scope(n_tokens) && !g_glm_model && !g_ssd_streaming_mode && ds4_rocm_is_gfx1151() &&
+                        ds4_rocm_halo_direct_qk_shape(n_tokens, pos0, n_raw, raw_cap, raw_start,
+                            n_comp, top_k, window, ratio, n_head, head_dim, 1)) {
+                        halo_direct_qk::bdqk_native<1, 32, true><<<grid, 512>>>((float *)heads->ptr,
+                            sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                            (const float *)comp_kv->ptr, topk_ptr, n_tokens, pos0,
+                            n_raw, raw_cap, raw_start, n_comp, top_k, window, ratio,
+                            n_head, head_dim);
+                        return cuda_ok(cudaGetLastError(), "Halo direct QK indexed launch");
+                    }
                     attention_mixed_heads16_wmma_kernel<1, 32, true><<<grid, 512>>>((float *)heads->ptr,
                                                                             sinks,
                                                                             (const float *)q->ptr,
@@ -958,6 +1062,15 @@ static int attention_prefill_mixed_launch(
                                                                       head_dim);
         } else {
             dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+            if (g_halo_prefill_model && halo_prefill_scope(n_tokens) && !g_glm_model && !g_ssd_streaming_mode &&
+                ds4_rocm_is_gfx1151() &&
+                ds4_rocm_halo_static_query_shape(n_tokens, n_comp, window, ratio, n_head, head_dim)) {
+                halo_static_query::static_q_reg_kernel<<<grid, 256>>>((float *)heads->ptr,
+                    sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                    n_tokens, n_comp, window, ratio, n_head, head_dim);
+                return cuda_ok(cudaGetLastError(), "Halo mixed static query launch");
+            }
             attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                        sinks,
                                                                        (const float *)q->ptr,
@@ -1211,7 +1324,12 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
     if (!cuda_ok(cudaGetLastError(), "attention_output_f16 heads pack launch")) return 0;
     const float alpha = 1.0f;
     const float beta0 = 0.0f;
-    cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
+    cublasStatus_t st = (cublasStatus_t)-1;
+    const int halo_a = halo_output_a_launch(low_h, out_a_f16, heads_h, n_tokens,
+                                             group_dim, rank, n_groups);
+    if (halo_a < 0) return 0;
+    if (halo_a > 0) st = CUBLAS_STATUS_SUCCESS;
+    if (st != CUBLAS_STATUS_SUCCESS) st = cublasGemmStridedBatchedEx(g_cublas,
                                                    CUBLAS_OP_T,
                                                    CUBLAS_OP_N,
                                                    (int)rank,
@@ -1274,6 +1392,13 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens) {
+    if (g_halo_attention.state && (g_halo_attention.state!=2 || !heads ||
+        heads->ptr!=g_halo_attention.heads || !halo_prefill_scope(n_tokens))) return 0;
+
+    if (g_halo_attention.state && (model_map!=g_halo_attention.model ||
+        model_size!=g_halo_attention.model_size || out_a_offset!=g_halo_attention.a_offset ||
+        out_b_offset!=g_halo_attention.b_offset || group_dim!=4096 || rank!=1024 ||
+        n_groups!=8 || out_dim!=4096)) return 0;
     (void)group_tmp;
     (void)low_tmp;
     if (!out || !low || !heads || !model_map ||
@@ -1302,6 +1427,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     const int attn_output_cublas =
         cuda_runtime_config()->attention_output_cublas_all &&
         (n_tokens == 1u || !g_ssd_streaming_mode);
+    if (g_halo_attention.state && !attn_output_cublas) return 0;
     if (!attn_output_cublas) {
         if ((group_dim & 31u) == 0u && rank <= UINT32_MAX && n_tokens <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
@@ -1348,16 +1474,20 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         n_tokens >= 2u) {
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
     }
+    if (g_halo_attention.state && !out_a_f16) return 0;
     if (out_a_f16) {
         if (cuda_runtime_config()->attention_output_cublas_all &&
             !g_quality_mode && !cuda_runtime_config()->graph_dump) {
             const int interleaved_b = 1;
+            bool halo_b_view = false;
+            const bool halo_b = halo_prefill_scope(n_tokens) && halo_output_b_admitted(n_tokens, low_dim, out_dim);
             const __half *out_b_f16_t = cuda_q8_f16_transpose_ptr(model_map, out_b_offset, out_b_bytes,
-                                                                  low_dim, out_dim, "attn_output_b");
+                low_dim,out_dim,"attn_output_b",halo_b,&halo_b_view);
             const __half *out_b_f16 = out_b_f16_t
                 ? NULL
                 : cuda_q8_f16_ptr(model_map, out_b_offset, out_b_bytes,
                                   low_dim, out_dim, "attn_output_b");
+            if (g_halo_attention.state && !out_b_f16 && !out_b_f16_t) return 0;
             if (out_b_f16 || out_b_f16_t) {
                 const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
                 const uint64_t low_h_count = (uint64_t)n_groups * n_tokens * rank;
@@ -1368,6 +1498,10 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 if (!tmp) return 0;
                 __half *heads_h = (__half *)tmp;
                 __half *low_h = (__half *)((char *)tmp + low_h_offset);
+                if (g_halo_attention.state) {
+                    if (g_halo_attention.state!=2 || tmp!=g_halo_attention.packed) return 0;
+                    g_halo_attention.state=3;
+                } else {
                 attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
                         heads_h,
                         (const float *)heads->ptr,
@@ -1375,6 +1509,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                         n_groups,
                         group_dim);
                 if (!cuda_ok(cudaGetLastError(), "attention_output_q8 packed heads pack launch")) return 0;
+                }
                 const float alpha = 1.0f;
                 const float beta0 = 0.0f;
                 const float beta1 = 1.0f;
@@ -1389,6 +1524,12 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                     st = CUBLAS_STATUS_SUCCESS;
                 }
 #endif
+                if (st != CUBLAS_STATUS_SUCCESS) {
+                    const int halo_a = halo_output_a_launch(low_h, out_a_f16, heads_h, n_tokens,
+                                                           group_dim, rank, n_groups);
+                    if (halo_a < 0) return 0;
+                    if (halo_a > 0) st = CUBLAS_STATUS_SUCCESS;
+                }
                 if (st != CUBLAS_STATUS_SUCCESS) st = cublasGemmStridedBatchedEx(g_cublas,
                                                                CUBLAS_OP_T,
                                                                CUBLAS_OP_N,
@@ -1413,6 +1554,14 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                                CUBLAS_COMPUTE_32F,
                                                                CUBLAS_GEMM_DEFAULT);
                 if (st == CUBLAS_STATUS_SUCCESS && interleaved_b) {
+                    if (halo_b_view) {
+                        // The getter has already bound the single cache allocation to DonorW.
+                        // Do not pass this representation to any native Wt consumer.
+                        if (!halo_b || !halo_output_b_launch((float *)out->ptr, out_b_f16_t,
+                                                             low_h, n_tokens)) return 0;
+                        return 1;
+                    }
+
                     const __half *b_ptr = out_b_f16_t ? out_b_f16_t : out_b_f16;
                     const auto b_op = out_b_f16_t ? CUBLAS_OP_N : CUBLAS_OP_T;
                     const int b_lda = out_b_f16_t ? (int)out_dim : (int)low_dim;
@@ -1532,6 +1681,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 }
             }
         }
+        if (g_halo_attention.state) return 0;
         const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
         const uint64_t low_tmp_count = (uint64_t)n_groups * n_tokens * rank;
         const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
@@ -1582,6 +1732,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 rank);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a unpack launch")) return 0;
     } else {
+        if (g_halo_attention.state) return 0;
         if (!g_quality_mode &&
             g_dspark_verify_mode && n_tokens <= 6u &&
             group_dim == 4096u && rank == 1024u && n_groups == 8u &&
@@ -1657,6 +1808,21 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                 blocks_a);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
         dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
+        const bool halo_uncached=g_halo_prefill_model && halo_prefill_scope(n_tokens) &&
+            !g_quality_mode && !g_glm_model && !g_ssd_streaming_mode && ds4_rocm_is_gfx1151() &&
+            ds4_rocm_halo_uncached_a_shape(n_tokens,g_halo_pos,g_halo_capacity,
+                group_dim,rank,n_groups,blocks_a) &&
+            (((uintptr_t)low->ptr|(uintptr_t)xq|(uintptr_t)xscale)&3u)==0 &&
+            ((uintptr_t)out_a&1u)==0 &&
+            !halo_overlap(low->ptr,(uint64_t)n_tokens*8192*4,out_a,34ull<<20) &&
+            !halo_overlap(low->ptr,(uint64_t)n_tokens*8192*4,xq,xq_bytes) &&
+            !halo_overlap(low->ptr,(uint64_t)n_tokens*8192*4,xscale,x_rows*blocks_a*4) &&
+            !halo_overlap(out_a,34ull<<20,xq,xq_bytes) &&
+            !halo_overlap(out_a,34ull<<20,xscale,x_rows*blocks_a*4);
+        if (halo_uncached) {
+            halo_output_a_uncached::halo_output_a_q8_slots<<<dim3(64,n_tokens/16,8),256>>>(
+                (float*)low->ptr,out_a,xq,xscale);
+        } else {
         grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
                                                           out_a,
                                                           xq,
@@ -1667,6 +1833,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                           n_tokens,
                                                           blocks_a,
                                                           use_dp4a);
+        }
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) return 0;
         }
     }

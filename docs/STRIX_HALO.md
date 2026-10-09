@@ -54,6 +54,11 @@ larger mixed and Q4 models have substantially higher memory requirements.
 Flash's ROCm resident and pipeline paths should not be confused with the GLM
 SSD-streaming path.
 
+DeepSeek V4 Flash 0731 IQ2_XXS/Q2_K with Q8 projections uses optimized
+2K/4K resident-prefill kernels automatically on `gfx1151`. Dispatch checks
+tensor layouts, context bounds and execution mode before selecting them;
+other shapes use the existing kernels. See [Halo source credits](HALO_THIRD_PARTY.md).
+
 ## DeepSeek V4.1 Flash
 
 - ROCm 10.0 supports published V4.1 Flash Q2 text/vision, resident experts, resident DSpark speculative decoding, SSD streaming and [two-machine TCP/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed.

@@ -222,7 +222,7 @@ static int routed_moe_q2_float_down_launch(
         uint32_t expert_mid_dim,
         uint32_t out_dim,
         uint64_t down_expert_bytes,
-        uint64_t down_row_bytes) {
+        uint64_t down_row_bytes, uint32_t hot_capacity = DS4_ROCM_MAX_N_EXPERT) {
     if (!out || !down || !mid || !down_w || !counts || !offsets || !sorted_pairs ||
         n_tokens == 0u || n_total_expert == 0u || n_total_expert > DS4_ROCM_MAX_N_EXPERT ||
         n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
@@ -268,7 +268,31 @@ static int routed_moe_q2_float_down_launch(
         }
     }
 
-    const uint32_t scalar_max = hot_count != 0u ? hot_threshold : 0u;
+    const uint32_t original_hot_count = hot_count;
+    bool halo_compact = use_wmma_hot && g_halo_prefill_model && halo_prefill_scope(n_tokens) &&
+        !g_glm_model && !g_quality_mode && !g_ssd_streaming_mode && ds4_rocm_is_gfx1151() &&
+        n_total_expert==256u && n_expert==6u && expert_mid_dim==2048u && out_dim==4096u &&
+        down_expert_bytes==2752512u && down_row_bytes==672u && hot_mid_f16 && mid_h_hot &&
+        use_f16_down && (((uintptr_t)mid_h_hot&15u)==0) && (((uintptr_t)down_w&3u)==0);
+    uint32_t h_tiles[640], tile_count=0, prepared_count=0;
+    if(halo_compact) {
+        for(uint32_t e=0;e<256u;e++)if(h_counts[e]>=hot_threshold) {
+            if(h_counts[e]>=512u)++prepared_count;
+            else for(uint32_t j=0;j<h_counts[e];j+=64u) {
+                if(tile_count==640u){halo_compact=false;break;}
+                h_tiles[tile_count++]=e|((j/64u)<<8u);
+            }
+            if(!halo_compact)break;
+        }
+        if(tile_count>hot_capacity || (prepared_count && !ds4_rocm_halo_q2_prepare()))halo_compact=false;
+        if(halo_compact) {
+            hot_count=0;hot_max=0;
+            for(uint32_t e=0;e<256u;e++)if(h_counts[e]>=hot_threshold && h_counts[e]<512u) {
+                h_hot[hot_count++]=e;if(h_counts[e]>hot_max)hot_max=h_counts[e];
+            }
+        }
+    }
+    const uint32_t scalar_max = original_hot_count != 0u ? hot_threshold : 0u;
     const bool compact_active = n_tokens <= 8u && hot_experts_dev != NULL;
     uint32_t *active_count = compact_active ? hot_experts_dev : NULL;
     uint32_t *active_experts = compact_active ? hot_experts_dev + 1u : NULL;
@@ -335,14 +359,32 @@ static int routed_moe_q2_float_down_launch(
                 active_count, active_experts);
     }
     if (!cuda_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down scalar launch")) return 0;
+    if (halo_compact && prepared_count && !ds4_rocm_halo_q2_prepared(down_h,down_w,
+            mid_h_hot,offsets,sorted_pairs,h_counts,n_tokens)) return 0;
     if (hot_count != 0u &&
-        !cuda_ok(cudaMemcpy(hot_experts_dev, h_hot, hot_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
+        !cuda_ok(cudaMemcpy(hot_experts_dev, halo_compact ? h_tiles : h_hot,
+                           (halo_compact ? tile_count : hot_count) * sizeof(uint32_t), cudaMemcpyHostToDevice),
                  "routed_moe iq2/q2 float-down hot copy")) {
         return 0;
     }
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     if (use_wmma_hot && hot_count != 0u) {
+        if (halo_compact && tile_count) {
+            const dim3 grid(128u,1u,tile_count);
+            if(n_tokens==2048u) {
+                halo_q2::q2_wstage64_n2_kernel<4,16,16,16,true,true,false,true><<<grid,128,9856>>>(
+                    nullptr,down_h,down_w,nullptr,mid_h_hot,counts,offsets,sorted_pairs,
+                    hot_experts_dev,tile_count,2048u,4096u,2752512u,672u,6u,0u);
+            } else {
+                halo_q2::q2_direct_x_n2_kernel<4,16,16,16,true,true,false,true><<<grid,128,9856>>>(
+                    nullptr,down_h,down_w,nullptr,mid_h_hot,counts,offsets,sorted_pairs,
+                    hot_experts_dev,tile_count,2048u,4096u,2752512u,672u,6u,0u);
+            }
+            if(!cuda_ok(cudaGetLastError(), "Halo Q2 direct-X compact launch"))return 0;
+        } else
+        {
+
         constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
         const int no_n2 = 0;
         const uint32_t wmma_mtiles = 4u;
@@ -462,6 +504,7 @@ static int routed_moe_q2_float_down_launch(
                     (float *)down->ptr, down_w, (const float *)mid->ptr,
                     counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                     expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+        }
         }
         if (!cuda_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down wmma launch")) return 0;
     }
@@ -1262,7 +1305,34 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe iq2 gate x f16 launch");
         }
         int mmq_gateup_done = 0;
-        if (ok && use_rocm_mmq_gateup) {
+        if (ok && g_halo_prefill_model && halo_prefill_scope(n_tokens) && use_rocm_mmq_gateup && !g_glm_model &&
+            !g_quality_mode && !g_ssd_streaming_mode && ds4_rocm_is_gfx1151() &&
+            (n_tokens == 2048u || n_tokens == 4096u) && expert_in_dim == 4096u &&
+            expert_mid_dim == 2048u && out_dim == 4096u && n_total_expert == 256u &&
+            n_expert == 6u && gate_type == 16u && down_type == 10u &&
+            gate_expert_bytes == 2162688u && gate_row_bytes == 1056u &&
+            down_expert_bytes == 2752512u && down_row_bytes == 672u &&
+            use_expert_tiles && sorted_pairs && sorted_offsets && sorted_counts &&
+            use_iq2_hot_f16_mid && !write_gate_up) {
+            const ds4_halo_span live[] = {
+                {gate->ptr,gate->bytes},{mid->ptr,mid->bytes},{down->ptr,down->bytes},
+                {x->ptr,x->bytes},{out->ptr,out->bytes},{selected_exec->ptr,selected_exec->bytes},
+                {weights->ptr,weights->bytes},
+                {sorted_pairs,pair_count64*sizeof(uint32_t)},
+                {sorted_offsets,(n_total_expert+1u)*sizeof(uint32_t)},
+                {sorted_counts,n_total_expert*sizeof(uint32_t)},
+                {gate_w,(uint64_t)n_total_expert*gate_expert_bytes},
+                {up_w,(uint64_t)n_total_expert*gate_expert_bytes},
+                {down_w,(uint64_t)n_total_expert*down_expert_bytes}
+            };
+            const int selected = ds4_rocm_halo_s9_run(n_tokens,gate_w,up_w,
+                (const float*)x->ptr,sorted_pairs,sorted_offsets,(const float*)weights->ptr,
+                (float*)mid->ptr,(uint16_t*)iq2_hot_mid_h,clamp,up->ptr,up->bytes,
+                live,sizeof(live)/sizeof(live[0]));
+            if (selected < 0) return 0;
+            mmq_gateup_done = selected;
+        }
+        if (ok && use_rocm_mmq_gateup && !mmq_gateup_done) {
             int mmq_rc = ds4_mmq_init(0) == 0 ? 0 : -1;
             const int use_fused_swiglu = mmq_epilogue_mid_h != NULL;
             /* The gfx1151 MMQ pair is stable through 2048 token rows. Tile
@@ -1987,7 +2057,7 @@ static int routed_moe_launch(
                             out, down, mid, iq2_hot_mid_h, use_iq2_hot_f16_mid, down_w,
                             sorted_counts, sorted_offsets, sorted_pairs, tile_experts,
                             n_tokens, n_total_expert, n_expert, expert_mid_dim, out_dim,
-                            down_expert_bytes, down_row_bytes);
+                            down_expert_bytes, down_row_bytes, tile_capacity);
                 }
             } else {
             dim3 dgrid((out_dim + 31u) / 32u, pair_count, 1);

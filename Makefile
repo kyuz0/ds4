@@ -18,7 +18,7 @@ QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
-ROCM_SRCS := $(wildcard rocm/*.cuh)
+ROCM_SRCS := $(wildcard rocm/*.cuh) rocm/ds4_rocm_halo_shapes.h $(wildcard rocm/halo/output_a/*.hpp rocm/halo/output_a/candidate/*.hpp)
 DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
@@ -59,11 +59,12 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_HOST_CFLAGS ?= -fPIC
-ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+ROCM_CFLAGS ?= -std=c++20 -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt -lrocblas
 ROCM_MMQ_Y ?= 64
 ROCM_MMQ_FLAGS := $(ROCM_CFLAGS) -std=c++17 -DGGML_USE_HIP -DDS4_HIP_MMQ_Y=$(ROCM_MMQ_Y) $(MMQ_INCLUDES)
 ROCM_MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.rocm.o cuda/mmq/ds4_mmq.rocm.o cuda/mmq/quantize.rocm.o cuda/mmq/mmid.rocm.o cuda/mmq/mmvq.rocm.o cuda/mmq/d2r_stubs.rocm.o
+ROCM_HALO_OBJS := rocm/halo/shared_gu/kernel.o rocm/halo/q2/runtime.o rocm/halo/q2/prepared.o rocm/halo/moe/runtime.o rocm/halo/moe/public/wide.o rocm/halo/moe/public/twin.o rocm/halo/moe/public/descriptors.o rocm/halo/moe/fresh/wide.o rocm/halo/moe/fresh/twin.o rocm/halo/moe/fresh/descriptors.o
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
@@ -312,7 +313,7 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)" \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -328,7 +329,7 @@ test-rocm:
 		test-session-state test-tp-linux \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args tests/test_prompt_prefix \
 		ds4 ds4-server ds4-bench ds4-agent \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)" \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -662,7 +663,7 @@ test-qwen4-vision: tests/test_qwen4_vision
 tests/test_glm53_kda_rocm.o: tests/test_glm53_kda.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-$(GLM53_KDA_ROCM_TEST): tests/test_glm53_kda_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS)
+$(GLM53_KDA_ROCM_TEST): tests/test_glm53_kda_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-glm53-kda-rocm: $(GLM53_KDA_ROCM_TEST)
@@ -671,7 +672,7 @@ test-glm53-kda-rocm: $(GLM53_KDA_ROCM_TEST)
 tests/test_glm_attention_rocm.o: tests/test_glm_attention.c ds4.h ds4_gpu.h ds4_linux_memory.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_glm_attention_rocm: tests/test_glm_attention_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS)
+tests/test_glm_attention_rocm: tests/test_glm_attention_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 .PHONY: test-glm-attention-rocm
@@ -816,7 +817,7 @@ cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq
 cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -c -o $@ $<
 
-ds4_rocm.o: ds4_rocm.cu ds4_rocm.h ds4_rocm_memory.h ds4_linux_memory.h ds4_gpu.h ds4_gpu_tp.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS) ds4_deepseek41_gpu.h
+ds4_rocm.o: ds4_rocm.cu ds4_rocm.h ds4_rocm_memory.h ds4_linux_memory.h ds4_gpu.h ds4_gpu_tp.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS) ds4_deepseek41_gpu.h rocm/halo/output_b/code.inc $(wildcard rocm/ds4_rocm_halo*.h rocm/halo/attention/*.hpp rocm/halo/attention/*.cuh rocm/halo/output_a_uncached/*.hpp rocm/halo/q2/*.hpp)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
 cuda/mmq/ds4_ggml_stubs.rocm.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh cuda/mmq/vendors/hip.h ds4_rocm_memory.h ds4_linux_memory.h
@@ -853,56 +854,56 @@ tests/test_deepseek41_tp_rocm.o: tests/test_deepseek41_tp_rocm.c ds4_gpu.h ds4_d
 tests/test_deepseek41_tp_moe_rocm.o: tests/test_deepseek41_tp_moe_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-ds4-kernel-v41-tp-moe: tests/test_deepseek41_tp_moe_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp-moe: tests/test_deepseek41_tp_moe_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 tests/test_rocm_tp_bind_failure.o: tests/test_rocm_tp_bind_failure.c ds4.c ds4.h ds4_gpu.h ds4_tp.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -I. -c -o $@ $<
 
-ds4-kernel-v41-tp-bind-failure: tests/test_rocm_tp_bind_failure.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp-bind-failure: tests/test_rocm_tp_bind_failure.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -Wl,--wrap=ds4_gpu_tensor_alloc_coherent -o $@ $^ $(ROCM_LDLIBS)
 
 tests/test_rocm_tp_gates.o: tests/test_rocm_tp_gates.c ds4_gpu.h ds4_tp.c ds4_tp_io.h ds4_tp_roce.h ds4_tp.h ds4.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -I. -c -o $@ $<
 
-ds4-kernel-v41-tp-gates: tests/test_rocm_tp_gates.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp-gates: tests/test_rocm_tp_gates.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
 
 tests/test_deepseek41_tp_mmq_rocm.o: tests/test_deepseek41_tp_mmq_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-ds4-kernel-v41-tp-mmq: tests/test_deepseek41_tp_mmq_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp-mmq: tests/test_deepseek41_tp_mmq_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 tests/test_deepseek41_tp_down_rocm.o: tests/test_deepseek41_tp_down_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-ds4-kernel-v41-tp-down: tests/test_deepseek41_tp_down_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp-down: tests/test_deepseek41_tp_down_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
-ds4-kernel-v41-tp-attention: tests/test_deepseek41_tp_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp-attention: tests/test_deepseek41_tp_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 tests/test_deepseek41_attention_gufo_rocm.o: tests/test_deepseek41_attention_gufo_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-ds4-kernel-v41-attention-gufo: tests/test_deepseek41_attention_gufo_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-attention-gufo: tests/test_deepseek41_attention_gufo_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
-ds4-kernel-v41: tests/test_deepseek41_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41: tests/test_deepseek41_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 .PHONY: test-deepseek41-rocm
 test-deepseek41-rocm: ds4-kernel-v41
 	./ds4-kernel-v41
 
-tests/test_mxfp4_rocm: tests/test_mxfp4_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS)
+tests/test_mxfp4_rocm: tests/test_mxfp4_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 tests/bench_mxfp4_rocm.o: tests/bench_mxfp4_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/bench_mxfp4_rocm: tests/bench_mxfp4_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS)
+tests/bench_mxfp4_rocm: tests/bench_mxfp4_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-mxfp4-rocm: tests/test_mxfp4_rocm
@@ -1159,6 +1160,7 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f $(ROCM_HALO_OBJS) rocm/halo/output_b/code.inc tests/test_halo_shapes ds4-kernel-halo-moe tests/test_halo_moe_rocm.o
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
 	rm -f tests/test_web_recovery
@@ -1197,3 +1199,36 @@ clean:
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
+
+# Compare production 2K/4K gate/up outputs with the current MMQ epilogue.
+tests/test_halo_moe_rocm.o: tests/test_halo_moe_rocm.cu cuda/mmq/ds4_mmq.h rocm/ds4_rocm_halo_moe.h
+	$(HIPCC) $(ROCM_CFLAGS) -DGGML_USE_HIP -I. -c -o $@ $<
+
+ds4-kernel-halo-moe: tests/test_halo_moe_rocm.o $(ROCM_MMQ_OBJS) $(filter rocm/halo/moe/%,$(ROCM_HALO_OBJS))
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+.PHONY: test-halo-moe-rocm
+test-halo-moe-rocm: ds4-kernel-halo-moe
+	@for rows in 2048 4096; do for pattern in 0 1 2; do ./ds4-kernel-halo-moe $$rows $$pattern || exit 1; done; done
+
+.PHONY: test-halo-shapes
+tests/test_halo_shapes: tests/test_halo_shapes.c rocm/ds4_rocm_halo_shapes.h
+	$(CC) $(QUALITY_CFLAGS) -o $@ $<
+test-halo-shapes: tests/test_halo_shapes
+	./tests/test_halo_shapes
+
+# This is a normal source build, independent of experimental binaries or paths.
+rocm/halo/output_b/code.inc: rocm/halo/output_b/s4_d2.s scripts/build_halo_output_b.py FORCE_HALO_ARCH
+	python3 scripts/build_halo_output_b.py --hipcc "$(HIPCC)" --arch "$(ROCM_ARCH)" --output $@
+
+.PHONY: FORCE_HALO_ARCH
+FORCE_HALO_ARCH:
+
+rocm/halo/moe/%.o: rocm/halo/moe/%.hip rocm/ds4_rocm_halo_moe.h $(wildcard rocm/halo/moe/*.hpp rocm/halo/moe/*/*.hpp)
+	$(HIPCC) $(ROCM_CFLAGS) -DGGML_USE_HIP -c -o $@ $<
+
+rocm/halo/q2/%.o: rocm/halo/q2/%.hip rocm/ds4_rocm_halo_q2.h $(wildcard rocm/halo/q2/*.hpp rocm/halo/q2/prepared/*.hpp)
+	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ $<
+
+rocm/halo/shared_gu/kernel.o: rocm/halo/shared_gu/kernel.hip $(wildcard rocm/halo/shared_gu/*.hpp rocm/halo/shared_gu/kernel/*.hpp)
+	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ $<

@@ -17302,6 +17302,7 @@ typedef struct {
     uint32_t spec_prefix_n_comp[DS4_SPEC_PREFIX_SLOTS][DS4_MAX_LAYER];
     uint32_t spec_prefix_n_index_comp[DS4_SPEC_PREFIX_SLOTS][DS4_MAX_LAYER];
     bool spec_capture_prefixes;
+    uint32_t halo_context_capacity;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -19160,6 +19161,7 @@ static bool metal_graph_alloc_raw_cap(
     const int saved_dspark_exec_tier = g->dspark_exec_tier;
     memset(g, 0, sizeof(*g));
     g->dspark_exec_tier = saved_dspark_exec_tier;
+    g->halo_context_capacity = ctx_size;
     g->owns_prefill_workspace = shared_prefill_workspace == NULL;
     g->cpu_router_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0]));
     g->active_tier = placement ? -1 : 0;
@@ -30619,6 +30621,13 @@ static bool metal_graph_hc_rms_scale_project(
         return true;
     }
 #endif
+#if defined(DS4_ROCM_BUILD)
+    if (weight->type == DS4_TENSOR_F16) {
+        return ds4_rocm_halo_hc_project(out, norm_scratch, model->map, model->size,
+                weight->abs_offset, in_dim, 2u * DS4_N_HC + DS4_N_HC * DS4_N_HC,
+                x, n_tokens, DS4_RMS_EPS) != 0;
+    }
+#endif
     bool ok = ds4_gpu_rms_norm_plain_rows_tensor(
                   norm_scratch,
                   x,
@@ -30922,6 +30931,10 @@ static bool metal_graph_encode_layer_attention_batch(
     const int32_t *visual_tokens =
         metal_graph_visual_tokens_for_batch(g, pos0, n_tokens);
     const bool visual_attention = visual_tokens != NULL;
+#ifdef DS4_ROCM_BUILD
+    ds4_rocm_halo_set_scope(pos0,n_tokens,g->halo_context_capacity,il,g->tp_world<=1 && !visual_attention);
+#endif
+
     /* TP attention row split for large zero-prefix chunks: q_a and the KV
      * path stay full (both ranks need every row's KV, and the compressor/
      * indexer keep updating their state from full rows), q_b onward runs on
@@ -30981,6 +30994,16 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ext_factor != 0.0f && freq_scale > 0.0f) {
         attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
+#ifdef DS4_ROCM_BUILD
+    ds4_rocm_halo_attention_plan(!g->batch_q_half && g->tp_world<=1 && !visual_attention &&
+        layer->attn_output_a->type==DS4_TENSOR_Q8_0 && layer->attn_output_b->type==DS4_TENSOR_Q8_0 &&
+        !metal_graph_directional_steering_attn_enabled(g) &&
+        !metal_graph_debug_wants("kqv_out",il,pos0) && !metal_graph_debug_wants("kqv_back",il,pos0) &&
+        !metal_graph_debug_wants("attn_low",il,pos0) && !metal_graph_debug_wants("attn_out",il,pos0),
+        model->map,model->size,layer->attn_output_a->abs_offset,layer->attn_output_b->abs_offset,
+        pos0,compressed?(uint32_t)DS4_ROPE_ORIG_CTX:0,freq_base,freq_scale,ext_factor,attn_factor,
+        DS4_ROPE_YARN_BETA_FAST,DS4_ROPE_YARN_BETA_SLOW);
+#endif
     enum { stack_count_cap = 16 };
     uint32_t comp_counts_stack[stack_count_cap];
     uint32_t index_counts_stack[stack_count_cap];
@@ -32734,6 +32757,11 @@ static bool metal_graph_encode_layer_ffn_batch(
         return false;
     }
 
+#ifdef DS4_ROCM_BUILD
+    ds4_rocm_halo_set_scope(pos0,n_tokens,g->halo_context_capacity,il,g->tp_world<=1 && decode_count==0 &&
+        metal_graph_visual_tokens_for_batch(g,pos0,n_tokens)==NULL);
+    ds4_rocm_halo_set_dense_scratch(metal_graph_batch_heads(g));
+#endif
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
@@ -33375,6 +33403,10 @@ static bool metal_graph_encode_layer_ffn_batch(
     ds4_gpu_tensor_free(hc_split_view);
     ds4_gpu_tensor_free(hc_mix_view);
 #undef DS4_METAL_PROFILE_FFN_STAGE
+#ifdef DS4_ROCM_BUILD
+    ds4_rocm_halo_set_scope(0,0,0,0,false);
+    ds4_rocm_halo_set_dense_scratch(NULL);
+#endif
     return ok;
 }
 
@@ -73094,6 +73126,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
              */
             ds4_gpu_set_glm_model(
                     DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
+            ds4_rocm_halo_set_model(false);
 #endif
             (void)ds4_gpu_set_model_fd(e->model.fd);
 
@@ -73130,6 +73163,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
+#ifdef DS4_ROCM_BUILD
+        ds4_rocm_halo_set_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+                DS4_N_LAYER == 43 && DS4_N_EMBD == 4096 && DS4_N_HC == 4 &&
+                (!gpu_cfg || gpu_cfg->n_gpus<=1));
+#endif
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
 #ifdef DS4_ROCM_BUILD
         ds4_gpu_set_deepseek41_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
