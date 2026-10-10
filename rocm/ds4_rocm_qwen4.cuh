@@ -987,9 +987,11 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
                     (uint64_t)NE * (((uint64_t)hi+nt-1)/nt));
                 const uint64_t blocks = jobs*((M+nr-1)/nr);
                 if (blocks > INT_MAX) return 0;
+                // Busy Q4 experts use the prefetched tile from 2K onward,
+                // including the 128-token occupancy group below 7K.
 #define QWEN_HALF(TYPE, DOWN) \
                 if (DOWN && T >= 2048) matrix_half_tile<TYPE,DOWN,32,128><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
-                else if (nt == 128 && (TYPE == 16 || (TYPE == 12 && T >= 7168)) && !DOWN && !(K%64)) matrix_half_tile_prefetch<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+                else if (nt == 128 && (TYPE == 16 || (TYPE == 12 && T >= 2048)) && !DOWN && !(K%64)) matrix_half_tile_prefetch<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
                 else if (nt == 128) matrix_half_tile<TYPE,DOWN,128,64><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
                 else if (nt == 64) matrix_half_tile<TYPE,DOWN,64,((!DOWN || TYPE == 10 || TYPE == 16) ? 64 : 128)><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
                 else if (nt == 16) matrix_half_tile<TYPE,DOWN,16,64,4><<<blocks,128,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \

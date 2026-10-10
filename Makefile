@@ -1224,7 +1224,7 @@ ds4-kernel-qwen-production: tests/test_qwen4_rocm_production.o ds4_rocm.o tests/
 
 .PHONY: test-qwen4-rocm-production
 test-qwen4-rocm-production: ds4-kernel-qwen-production
-	@for quant in Q2 Q4; do for rows in 33 2049 8193; do ./ds4-kernel-qwen-production $$quant $$rows || exit 1; done; done
+	@for quant in Q2 Q4; do for rows in 33 2047 2048 2049 4096 7167 7168 8193; do ./ds4-kernel-qwen-production $$quant $$rows || exit 1; done; done
 
 # Build Qwen model-backed QA with the same HIP objects as the frontends.
 .PHONY: qwen4-rocm-qa-build

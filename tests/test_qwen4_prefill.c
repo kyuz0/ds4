@@ -1,5 +1,5 @@
 /* Real-model mixed prefill/decode replay, including the sparse boundary.
- * Usage: test_qwen4_prefill MODEL PROMPT [MAX_CONTEXT [DUMP_DIRECTORY]] */
+ * Usage: test_qwen4_prefill MODEL PROMPT [MAX_CONTEXT [DUMP_DIRECTORY [PREFILL_CHUNK]]] */
 #define _POSIX_C_SOURCE 200809L
 #include "../ds4.h"
 #include <assert.h>
@@ -34,13 +34,19 @@ static void sync_prefix(ds4_session *s, ds4_tokens *tokens, int n) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3 || argc > 5) {
-        fprintf(stderr, "Usage: %s MODEL PROMPT [MAX_CONTEXT [DUMP_DIRECTORY]]\n", argv[0]);
+    if (argc < 3 || argc > 6) {
+        fprintf(stderr, "Usage: %s MODEL PROMPT [MAX_CONTEXT [DUMP_DIRECTORY [PREFILL_CHUNK]]]\n", argv[0]);
         return 1;
     }
     char *end = NULL;
     long max = argc > 3 ? strtol(argv[3], &end, 10) : 8192;
     if ((end && *end) || max < 4096 || max > 131072) return 1;
+    long chunk = 1024;
+    if (argc == 6) {
+        char *chunk_end = NULL;
+        chunk = strtol(argv[5], &chunk_end, 10);
+        if (!argv[5][0] || *chunk_end || chunk < 1 || chunk > 65536) return 1;
+    }
     FILE *fp = fopen(argv[2], "rb");
     assert(fp && fseek(fp, 0, SEEK_END) == 0);
     long bytes = ftell(fp);
@@ -49,7 +55,7 @@ int main(int argc, char **argv) {
     assert(text && fread(text, 1, bytes, fp) == (size_t)bytes);
     fclose(fp);
     ds4_engine_options opt = {.model_path = argv[1], .context_size = (int)max+8,
-        .prefill_chunk = 1024, .glm_mtp = true, .dspark_exact_sampling = true,
+        .prefill_chunk = (uint32_t)chunk, .glm_mtp = true, .dspark_exact_sampling = true,
 #ifdef __APPLE__
         .backend = DS4_BACKEND_METAL
 #else
@@ -131,7 +137,7 @@ int main(int argc, char **argv) {
             n,n-previous,(n-previous)/elapsed,p.calls,replay_error,worst,tv,kl,
             ds4_session_argmax(live),ds4_session_argmax(control));
         fflush(stdout);
-        if (argc == 5) {
+        if (argc >= 5) {
             char path[4096];
             int written = snprintf(path,sizeof(path),"%s/frontier-%d.bin",argv[4],n);
             assert(written > 0 && (size_t)written < sizeof(path));
