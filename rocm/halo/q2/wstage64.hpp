@@ -1,7 +1,7 @@
 #pragma once
 #include "decode.hpp"
 #include "direct_feed.hpp"
-template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool MID_F16=false, bool OUT_F16=false, bool SLOT_MAJOR=false, bool COMPACT=false>
+template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool MID_F16=false, bool OUT_F16=false, bool SLOT_MAJOR=false, bool COMPACT=false, unsigned EXPERT_BITS=8>
 __global__ static void q2_wstage64_n2_kernel(
         float *down_out,
         half *down_out_h,
@@ -30,10 +30,11 @@ __global__ static void q2_wstage64_n2_kernel(
     float *shC = reinterpret_cast<float *>(raw_sh); // [0,4096), late lifetime
     const uint32_t hot_idx = (uint32_t)blockIdx.z;
     if (hot_idx >= hot_count) return;
+    static_assert(EXPERT_BITS > 0 && EXPERT_BITS < 32);
     const uint32_t descriptor = hot_experts[hot_idx];
-    const uint32_t expert = COMPACT ? (descriptor & 255u) : descriptor;
+    const uint32_t expert = COMPACT ? (descriptor & ((1u << EXPERT_BITS) - 1u)) : descriptor;
     const uint32_t count = counts[expert];
-    const uint32_t m_group0 = (COMPACT ? (descriptor >> 8u) : (uint32_t)blockIdx.y) * MTILES * BM;
+    const uint32_t m_group0 = (COMPACT ? (descriptor >> EXPERT_BITS) : (uint32_t)blockIdx.y) * MTILES * BM;
     if (m_group0 >= count) return;
     const uint32_t n0 = (uint32_t)blockIdx.x * (2u * BN);
     const uint32_t tid = threadIdx.x;

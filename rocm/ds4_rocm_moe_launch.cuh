@@ -274,7 +274,23 @@ static int routed_moe_q2_float_down_launch(
         n_total_expert==256u && n_expert==6u && expert_mid_dim==2048u && out_dim==4096u &&
         down_expert_bytes==2752512u && down_row_bytes==672u && hot_mid_f16 && mid_h_hot &&
         use_f16_down && (((uintptr_t)mid_h_hot&15u)==0) && (((uintptr_t)down_w&3u)==0);
-    uint32_t h_tiles[640], tile_count=0, prepared_count=0;
+    bool v41_compact = use_wmma_hot &&
+        g_deepseek41_model && !g_glm_model && !g_quality_mode && !g_ssd_streaming_mode &&
+        ds4_rocm_is_gfx1151() && n_tokens==2048u &&
+        n_total_expert==384u && n_expert==6u && expert_mid_dim==2304u && out_dim==5120u &&
+        down_expert_bytes==3870720u && down_row_bytes==756u && hot_mid_f16 && mid_h_hot &&
+        use_f16_down && (((uintptr_t)mid_h_hot&15u)==0) && (((uintptr_t)down_w&3u)==0);
+    uint32_t h_tiles[1024], tile_count=0, prepared_count=0;
+    if(v41_compact) {
+        for(uint32_t e=0;e<384u;e++)if(h_counts[e]>=hot_threshold) {
+            for(uint32_t j=0;j<h_counts[e];j+=64u) {
+                if(tile_count==1024u){v41_compact=false;break;}
+                h_tiles[tile_count++]=e|((j/64u)<<9u);
+            }
+            if(!v41_compact)break;
+        }
+        if(tile_count>hot_capacity)v41_compact=false;
+    }
     if(halo_compact) {
         for(uint32_t e=0;e<256u;e++)if(h_counts[e]>=hot_threshold) {
             if(h_counts[e]>=512u)++prepared_count;
@@ -362,15 +378,23 @@ static int routed_moe_q2_float_down_launch(
     if (halo_compact && prepared_count && !ds4_rocm_halo_q2_prepared(down_h,down_w,
             mid_h_hot,offsets,sorted_pairs,h_counts,n_tokens)) return 0;
     if (hot_count != 0u &&
-        !cuda_ok(cudaMemcpy(hot_experts_dev, halo_compact ? h_tiles : h_hot,
-                           (halo_compact ? tile_count : hot_count) * sizeof(uint32_t), cudaMemcpyHostToDevice),
+        !cuda_ok(cudaMemcpy(hot_experts_dev, (halo_compact || v41_compact) ? h_tiles : h_hot,
+                           ((halo_compact || v41_compact) ? tile_count : hot_count) * sizeof(uint32_t), cudaMemcpyHostToDevice),
                  "routed_moe iq2/q2 float-down hot copy")) {
         return 0;
     }
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     if (use_wmma_hot && hot_count != 0u) {
-        if (halo_compact && tile_count) {
+        if (v41_compact && tile_count) {
+            const dim3 grid(160u,1u,tile_count);
+#define V41_Q2_ARGS nullptr,down_h,down_w,nullptr,mid_h_hot,counts,offsets,sorted_pairs,hot_experts_dev,tile_count,2304u,5120u,3870720u,756u,6u,0u
+            halo_q2::q2_wstage64_n2_kernel<4,16,16,16,true,true,false,true,9><<<grid,128,9856>>>(V41_Q2_ARGS);
+#undef V41_Q2_ARGS
+            if(!cuda_ok(cudaGetLastError(), "V4.1 Q2 prefill launch"))return 0;
+            static bool logged=false;
+            if(!logged){logged=true;fprintf(stderr,"ds4: ROCm V4.1 Q2 reused panels rows=%u tiles=%u\n",n_tokens,tile_count);}
+        } else if (halo_compact && tile_count) {
             const dim3 grid(128u,1u,tile_count);
             if(n_tokens==2048u) {
                 halo_q2::q2_wstage64_n2_kernel<4,16,16,16,true,true,false,true><<<grid,128,9856>>>(
@@ -1331,6 +1355,38 @@ static int routed_moe_launch(
                 live,sizeof(live)/sizeof(live[0]));
             if (selected < 0) return 0;
             mmq_gateup_done = selected;
+        }
+        if (ok && g_deepseek41_model && use_rocm_mmq_gateup && !g_glm_model &&
+            !g_quality_mode && !g_ssd_streaming_mode && ds4_rocm_is_gfx1151() &&
+            n_tokens == 2048u && expert_in_dim == 5120u &&
+            expert_mid_dim == 2304u && out_dim == 5120u && n_total_expert == 384u &&
+            n_expert == 6u && gate_type == 16u && down_type == 10u &&
+            gate_expert_bytes == 3041280u && gate_row_bytes == 1320u &&
+            down_expert_bytes == 3870720u && down_row_bytes == 756u &&
+            use_expert_tiles && sorted_pairs && sorted_offsets && sorted_counts &&
+            use_iq2_hot_f16_mid && !write_gate_up) {
+            const ds4_halo_span live[] = {
+                {gate->ptr,gate->bytes},{mid->ptr,mid->bytes},{down->ptr,down->bytes},
+                {x->ptr,x->bytes},{out->ptr,out->bytes},{selected_exec->ptr,selected_exec->bytes},
+                {weights->ptr,weights->bytes},
+                {sorted_pairs,pair_count64*sizeof(uint32_t)},
+                {sorted_offsets,(n_total_expert+1u)*sizeof(uint32_t)},
+                {sorted_counts,n_total_expert*sizeof(uint32_t)},
+                {gate_w,(uint64_t)n_total_expert*gate_expert_bytes},
+                {up_w,(uint64_t)n_total_expert*gate_expert_bytes},
+                {down_w,(uint64_t)n_total_expert*down_expert_bytes}
+            };
+            const int selected = ds4_rocm_v41_gate_up(n_tokens,gate_w,up_w,
+                (const float*)x->ptr,sorted_pairs,sorted_offsets,(const float*)weights->ptr,
+                (float*)mid->ptr,(uint16_t*)iq2_hot_mid_h,clamp,up->ptr,up->bytes,
+                live,sizeof(live)/sizeof(live[0]));
+            if (selected < 0) return 0;
+            mmq_gateup_done = selected;
+            static int logged_v41_gate_up = 0;
+            if (selected && !logged_v41_gate_up) {
+                logged_v41_gate_up = 1;
+                fprintf(stderr, "ds4: ROCm V4.1 co-computed IQ2 gate/up rows=%u\n", n_tokens);
+            }
         }
         if (ok && use_rocm_mmq_gateup && !mmq_gateup_done) {
             int mmq_rc = ds4_mmq_init(0) == 0 ? 0 : -1;

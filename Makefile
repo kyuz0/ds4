@@ -64,7 +64,8 @@ ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt -lrocblas
 ROCM_MMQ_Y ?= 64
 ROCM_MMQ_FLAGS := $(ROCM_CFLAGS) -std=c++17 -DGGML_USE_HIP -DDS4_HIP_MMQ_Y=$(ROCM_MMQ_Y) $(MMQ_INCLUDES)
 ROCM_MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.rocm.o cuda/mmq/ds4_mmq.rocm.o cuda/mmq/quantize.rocm.o cuda/mmq/mmid.rocm.o cuda/mmq/mmvq.rocm.o cuda/mmq/d2r_stubs.rocm.o
-ROCM_HALO_OBJS := rocm/halo/shared_gu/kernel.o rocm/halo/q2/runtime.o rocm/halo/q2/prepared.o rocm/halo/moe/runtime.o rocm/halo/moe/public/wide.o rocm/halo/moe/public/twin.o rocm/halo/moe/public/descriptors.o rocm/halo/moe/fresh/wide.o rocm/halo/moe/fresh/twin.o rocm/halo/moe/fresh/descriptors.o
+ROCM_V41_GATE_UP_OBJS := rocm/v41_gate_up/tiles/descriptors.o rocm/v41_gate_up/tiles/twin.o rocm/v41_gate_up/tiles/wide.o rocm/v41_gate_up/runtime.o
+ROCM_HALO_OBJS := $(ROCM_V41_GATE_UP_OBJS) rocm/halo/shared_gu/kernel.o rocm/halo/q2/runtime.o rocm/halo/q2/prepared.o rocm/halo/moe/runtime.o rocm/halo/moe/public/wide.o rocm/halo/moe/public/twin.o rocm/halo/moe/public/descriptors.o rocm/halo/moe/fresh/wide.o rocm/halo/moe/fresh/twin.o rocm/halo/moe/fresh/descriptors.o
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
@@ -817,7 +818,7 @@ cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq
 cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -c -o $@ $<
 
-ds4_rocm.o: ds4_rocm.cu ds4_rocm.h ds4_rocm_memory.h ds4_linux_memory.h ds4_gpu.h ds4_gpu_tp.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS) ds4_deepseek41_gpu.h rocm/halo/output_b/code.inc $(wildcard rocm/ds4_rocm_halo*.h rocm/halo/attention/*.hpp rocm/halo/attention/*.cuh rocm/halo/output_a_uncached/*.hpp rocm/halo/q2/*.hpp)
+ds4_rocm.o: rocm/ds4_rocm_v41_gate_up.h ds4_rocm.cu ds4_rocm.h ds4_rocm_memory.h ds4_linux_memory.h ds4_gpu.h ds4_gpu_tp.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS) ds4_deepseek41_gpu.h rocm/halo/output_b/code.inc $(wildcard rocm/ds4_rocm_halo*.h rocm/halo/attention/*.hpp rocm/halo/attention/*.cuh rocm/halo/output_a_uncached/*.hpp rocm/halo/q2/*.hpp)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
 cuda/mmq/ds4_ggml_stubs.rocm.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh cuda/mmq/vendors/hip.h ds4_rocm_memory.h ds4_linux_memory.h
@@ -1167,7 +1168,7 @@ clean:
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal
-	rm -f ds4-kernel-v41
+	rm -f ds4-kernel-v41 ds4-kernel-v41-gate-up ds4-kernel-v41-gate-up-oracle
 	rm -f tests/test_deepseek41_cuda
 	rm -f tests/test_cuda_q8_rows
 	rm -f tests/test_cuda_reductions
@@ -1232,3 +1233,19 @@ rocm/halo/q2/%.o: rocm/halo/q2/%.hip rocm/ds4_rocm_halo_q2.h $(wildcard rocm/hal
 
 rocm/halo/shared_gu/kernel.o: rocm/halo/shared_gu/kernel.hip $(wildcard rocm/halo/shared_gu/*.hpp rocm/halo/shared_gu/kernel/*.hpp)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ $<
+
+rocm/v41_gate_up/%.o: rocm/v41_gate_up/%.hip rocm/ds4_rocm_v41_gate_up.h $(wildcard rocm/v41_gate_up/*.hpp rocm/v41_gate_up/*/*.hpp)
+	$(HIPCC) $(ROCM_CFLAGS) -DGGML_USE_HIP -c -o $@ $<
+
+ds4-kernel-v41-gate-up: tests/test_v41_gate_up.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_V41_GATE_UP_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ -lm
+
+tests/test_v41_gate_up.rocm.o: tests/test_v41_gate_up.hip rocm/ds4_rocm_v41_gate_up.h
+	$(HIPCC) $(ROCM_CFLAGS) -DGGML_USE_HIP -I. -c -o $@ $<
+
+# Independent scalar IQ2 reference with full native-output parity and canaries.
+ds4-kernel-v41-gate-up-oracle: tests/test_v41_gate_up_oracle.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_V41_GATE_UP_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+tests/test_v41_gate_up_oracle.rocm.o: tests/test_v41_gate_up_oracle.hip tests/v41_gate_up_oracle_grid.hpp rocm/ds4_rocm_v41_gate_up.h
+	$(HIPCC) $(ROCM_MMQ_FLAGS) -I. -c -o $@ $<

@@ -5336,6 +5336,7 @@ static void cuda_q8_f16_cache_release_all(void) {
     }
     halo_output_b_release();
     ds4_rocm_halo_s9_release();
+    ds4_rocm_v41_gate_up_release();
     ds4_rocm_halo_q2_release();
     g_q8_f16_transpose_ranges.clear();
     g_q8_f16_transpose_by_offset.clear();

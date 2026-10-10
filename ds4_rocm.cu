@@ -135,6 +135,7 @@ static int ds4_rocm_is_gfx1151(void);
 
 #include "rocm/ds4_rocm_halo_output_b_module.cuh"
 #include "rocm/ds4_rocm_halo_moe.h"
+#include "rocm/ds4_rocm_v41_gate_up.h"
 #include "rocm/ds4_rocm_halo_q2.h"
 #include "rocm/ds4_rocm_runtime.cuh"
 
