@@ -827,6 +827,9 @@ typedef struct {
     bool ignore_eos;
     int cache_read_tokens;
     int cache_write_tokens;
+    /* Wall time of prompt prefill and of generation, in ms (0 = not measured). */
+    double prompt_ms;
+    double predicted_ms;
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
@@ -7198,22 +7201,58 @@ static void append_openai_usage_json(buf *b, const request *r,
                cached_tokens, cache_write_tokens);
 }
 
+static bool openai_timings_available(const request *r) {
+    return r && (r->prompt_ms > 0 || r->predicted_ms > 0);
+}
+
+/* llama.cpp's "timings" object: prompt_n counts the tokens actually prefilled,
+ * cache_n the prompt tokens reused from the KV cache. */
+static void append_openai_timings_json(buf *b, const request *r,
+                                       int prompt_tokens, int completion_tokens) {
+    int cache_n = clamp_usage_tokens(r->cache_read_tokens, prompt_tokens);
+    int prompt_n = prompt_tokens - cache_n;
+    double prompt_ms = r->prompt_ms > 0 ? r->prompt_ms : 0;
+    double predicted_ms = r->predicted_ms > 0 ? r->predicted_ms : 0;
+    buf_printf(b,
+               "{\"cache_n\":%d,\"prompt_n\":%d,\"prompt_ms\":%.3f,"
+               "\"prompt_per_token_ms\":%.3f,\"prompt_per_second\":%.3f,"
+               "\"predicted_n\":%d,\"predicted_ms\":%.3f,"
+               "\"predicted_per_token_ms\":%.3f,\"predicted_per_second\":%.3f}",
+               cache_n, prompt_n, prompt_ms,
+               prompt_n > 0 ? prompt_ms / prompt_n : 0.0,
+               prompt_ms > 0 ? prompt_n * 1000.0 / prompt_ms : 0.0,
+               completion_tokens, predicted_ms,
+               completion_tokens > 0 ? predicted_ms / completion_tokens : 0.0,
+               predicted_ms > 0 ? completion_tokens * 1000.0 / predicted_ms : 0.0);
+}
+
+/* The closing chunk before [DONE]: usage when the client asked for it
+ * (stream_options.include_usage), timings whenever they were measured, as
+ * llama.cpp sends them. */
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
-    if (!r->stream_include_usage) return true;
+    const bool timings = openai_timings_available(r);
+    if (!r->stream_include_usage && !timings) return true;
 
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[],\"usage\":");
+        buf_puts(&b, ",\"choices\":[]");
     } else {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[],\"usage\":");
+        buf_puts(&b, ",\"choices\":[]");
     }
-    append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    if (r->stream_include_usage) {
+        buf_puts(&b, ",\"usage\":");
+        append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    }
+    if (timings) {
+        buf_puts(&b, ",\"timings\":");
+        append_openai_timings_json(&b, r, prompt_tokens, completion_tokens);
+    }
     buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len);
@@ -9154,6 +9193,10 @@ static bool final_response(int fd, bool enable_cors,
         buf_puts(&b, "}],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    if (openai_timings_available(r)) {
+        buf_puts(&b, ",\"timings\":");
+        append_openai_timings_json(&b, r, prompt_tokens, completion_tokens);
+    }
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -14117,6 +14160,7 @@ decode_again:
     int stop_token = -1;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    if (!dsml_recovery_attempted) j->req.prompt_ms = (decode_t0 - t0) * 1000.0;
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -14803,6 +14847,7 @@ decode_again:
         thinking_live_clear(s, slot);
     }
 
+    j->req.predicted_ms = (now_sec() - t0) * 1000.0 - j->req.prompt_ms;
     bool response_ok = !job_cancelled(j);
     if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
@@ -15487,6 +15532,13 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, s->enable_cors, 204, NULL, "");
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/health")) {
+        /* The socket opens after the model is loaded, so answering is ready. */
+        http_response(fd, s->enable_cors, 200, "application/json", "{\"status\":\"ok\"}\n");
         http_request_free(&hr);
         goto done;
     }
@@ -17777,6 +17829,54 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+static void test_openai_timings_reported(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.cache_read_tokens = 6;
+    r.prompt_ms = 200.0;
+    r.predicted_ms = 500.0;
+
+    /* blocking response: timings beside usage */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(final_response(sv[0], false, &r, "chatcmpl_t", "OK", NULL, NULL, "stop", 10, 5));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"timings\":{\"cache_n\":6,\"prompt_n\":4,\"prompt_ms\":200.000") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_per_second\":20.000") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_n\":5,\"predicted_ms\":500.000") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_per_second\":10.000") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* stream without include_usage: a closing chunk with timings and no usage */
+    r.stream = true;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_t", 10, 5));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"choices\":[],\"timings\":{\"cache_n\":6") != NULL);
+    TEST_ASSERT(strstr(out, "\"usage\"") == NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* nothing measured: the stream ends as before */
+    r.prompt_ms = r.predicted_ms = 0;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_t", 10, 5));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(!strcmp(out, "data: [DONE]\n\n"));
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
 }
 
 static void test_qwen_stream_split_reasoning_close(void) {
@@ -23342,6 +23442,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_qwen_tool_stream_sends_answer_before_finish();
     test_qwen_stream_split_reasoning_close();
     test_openai_stream_usage_reports_cache_details();
+    test_openai_timings_reported();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
