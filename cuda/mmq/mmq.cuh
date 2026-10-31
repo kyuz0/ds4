@@ -37,6 +37,18 @@ DS4_MMQ_COMPACT_HD inline uint32_t prefix(const int32_t *bounds, uint32_t *out) 
 }
 #undef DS4_MMQ_COMPACT_HD
 
+/* Opt-in candidate for the compact IQ2_XXS gate/up pair on gfx1151: the
+ * partial-tile j-limited AMD-WMMA dot path.  DS4_ROCM_V41_COMPACT_JLIMIT=1
+ * selects it; the default remains the full-tile path. */
+static bool ds4_mmq_compact_jlimit() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_V41_COMPACT_JLIMIT");
+        enabled = env != nullptr && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled != 0;
+}
+
 #endif
 
 using namespace ggml_cuda_mma;
@@ -1367,6 +1379,69 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 
+
+#if defined(AMD_WMMA_AVAILABLE)
+template <int mmq_x, int mmq_y, mmq_q8_1_ds_layout ds_layout>
+static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_lim(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    constexpr data_layout input_layout = get_input_data_layout();
+    typedef tile<16,  8, int, input_layout>        tile_A;
+    typedef tile<16,  8, int, input_layout>        tile_B;
+    typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
+
+    constexpr int granularity = mmq_get_granularity_device(mmq_x);
+    constexpr int rows_per_warp = granularity;
+    constexpr int ntx = rows_per_warp/tile_C::I;
+
+    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + 2*MMQ_TILE_NE_K;
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+    const half2 * y_ds = (const half2 *) y;
+
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+    const int j_stop = min(mmq_x, j_max + 1);
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+        const int k0 = k00 + k01;
+
+        tile_A A[ntx];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q8_0 + k0, MMQ_MMA_TILE_X_K_Q8_0);
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < j_stop; j0 += ntx*tile_C::J) {
+            tile_B B;
+            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+            float dB;
+            const int j = j0 + tile_C::get_j(0);
+            if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
+                dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+            } else {
+                dB = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+            }
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n], B);
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+                    const float dA = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI8_0];
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                }
+            }
+        }
+    }
+}
+#endif
 
 template <int mmq_x, int mmq_y>
 static __device__ __forceinline__ void vec_dot_q8_1_q8_1_dp4a(
@@ -3730,7 +3805,7 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IQ4_XS> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
-template <ggml_type type, int mmq_x, bool need_check, bool fixup>
+template <ggml_type type, int mmq_x, bool need_check, bool fixup, bool limit_j = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -3782,8 +3857,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     // Seed invalid columns once. Both K stages refresh only the valid prefix,
     // and the existing barriers keep the suffix zero before every matrix op.
+    // The compact j-limit dot only reads fragments below its j_stop, so the
+    // candidate seeds just the suffix lanes that its last loaded fragment can
+    // observe; the full-tile path keeps the entire suffix seeded.
+    constexpr int fast_y_frag_j = mmq_get_granularity_device(mmq_x);
+    const int seed_y_words = limit_j
+        ? min(mmq_x, (tile_y_max_j + fast_y_frag_j) / fast_y_frag_j * fast_y_frag_j) * MMQ_TILE_Y_K
+        : mmq_x * MMQ_TILE_Y_K;
     if (fast_y_loads && !full_y_tile) {
-        for (int l = valid_y_words + linear_tid; l < mmq_x * MMQ_TILE_Y_K; l += nthreads) {
+        for (int l = valid_y_words + linear_tid; l < seed_y_words; l += nthreads) {
             tile_y[l] = 0;
         }
     }
@@ -3850,7 +3932,17 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
+#if defined(AMD_WMMA_AVAILABLE)
+        if constexpr (limit_j) {
+            static_assert(type == GGML_TYPE_IQ2_XXS, "compact j-limit only for IQ2_XXS");
+            vec_dot_q8_0_q8_1_mma_lim<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>(tile_x, tile_y, sum, 0, tile_y_max_j);
+        } else {
+            vec_dot(tile_x, tile_y, sum, 0);
+        }
+#else
+        GGML_UNUSED(limit_j);
         vec_dot(tile_x, tile_y, sum, 0);
+#endif
 
         __syncthreads();
 
@@ -3889,7 +3981,17 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
+#if defined(AMD_WMMA_AVAILABLE)
+        if constexpr (limit_j) {
+            static_assert(type == GGML_TYPE_IQ2_XXS, "compact j-limit only for IQ2_XXS");
+            vec_dot_q8_0_q8_1_mma_lim<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>(tile_x, tile_y, sum, MMQ_TILE_NE_K, tile_y_max_j);
+        } else {
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        }
+#else
+        GGML_UNUSED(limit_j);
         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+#endif
 
         __syncthreads();
     }
@@ -4332,7 +4434,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
 }
 
 #if defined(GGML_USE_HIP)
-template <ggml_type type, int mmq_x, bool need_check>
+template <ggml_type type, int mmq_x, bool need_check, bool limit_j>
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
 #endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
@@ -4432,7 +4534,7 @@ static __global__ void ds4_mmq_compact_mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
         constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, limit_j>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks,
              epilogue_gate ? epilogue_gate + offset_dst : nullptr,
@@ -4519,15 +4621,28 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                         args.nrows_x==2304 && args.ncols_x==5120 && args.ncols_max==2048 &&
                         args.nchannels_x==384 && args.nchannels_y==384 && args.nsamples_y==1 &&
                         args.ids_dst && args.expert_bounds && !args.use_stream_k && !args.x_soa);
-            CUDA_SET_SHARED_MEMORY_LIMIT((ds4_mmq_compact_mul_mat_q<type,64,false>), nbytes_shared);
-            ds4_mmq_compact_mul_mat_q<type,64,false><<<dim3(nty,ds4_mmq_compact::capacity,1),block_dims,nbytes_shared,stream>>>
-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
-                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd, args.x_soa, args.soa_blocks, args.compact_list,
-                 args.epilogue_gate, args.epilogue_weights, args.epilogue_mid,
-                 args.epilogue_mid_h, args.epilogue_clamp);
+            const bool compact_jlimit = ds4_mmq_compact_jlimit();
+            if (compact_jlimit) {
+                CUDA_SET_SHARED_MEMORY_LIMIT((ds4_mmq_compact_mul_mat_q<type,64,false,true>), nbytes_shared);
+                ds4_mmq_compact_mul_mat_q<type,64,false,true><<<dim3(nty,ds4_mmq_compact::capacity,1),block_dims,nbytes_shared,stream>>>
+                    (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                     blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                     channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                     sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                     ntx_fd, args.x_soa, args.soa_blocks, args.compact_list,
+                     args.epilogue_gate, args.epilogue_weights, args.epilogue_mid,
+                     args.epilogue_mid_h, args.epilogue_clamp);
+            } else {
+                CUDA_SET_SHARED_MEMORY_LIMIT((ds4_mmq_compact_mul_mat_q<type,64,false,false>), nbytes_shared);
+                ds4_mmq_compact_mul_mat_q<type,64,false,false><<<dim3(nty,ds4_mmq_compact::capacity,1),block_dims,nbytes_shared,stream>>>
+                    (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                     blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                     channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                     sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                     ntx_fd, args.x_soa, args.soa_blocks, args.compact_list,
+                     args.epilogue_gate, args.epilogue_weights, args.epilogue_mid,
+                     args.epilogue_mid_h, args.epilogue_clamp);
+            }
         } else { GGML_ASSERT(false && "unexpected compact tile selection"); }
         return;
     }

@@ -435,12 +435,40 @@ typedef struct ds4_gpu_dsv41_stream_layer_plan {
     ds4_gpu_stream_expert_table table;
     uint64_t generation;
     uint64_t hits[6];
+    /* Optional selected-expert staging. When use_selected is set, only these
+     * experts are admitted to the read plan; hits still describes residents. */
+    uint64_t selected[6];
+    uint32_t selected_experts;
+    uint32_t use_selected;
+    /* Diagnostics filled by prepare/load; ignored by plan matching. */
+    uint32_t resident_experts;
+    uint32_t missing_experts;
+    uint64_t missing_bytes;
+    uint32_t read_jobs;
+    uint64_t read_bytes;
+    /* Diagnostic read-scheduling summary, filled only when the read profile
+     * env is enabled. Times are microseconds over the layer's read batch. */
+    uint64_t read_busy_us;
+    uint64_t read_span_us;
+    uint64_t read_union_us;
+    uint64_t read_idle_us;
+    uint32_t read_peak_active;
+    uint64_t read_lat_p50_us;
+    uint64_t read_lat_p95_us;
+    uint64_t read_lat_max_us;
+    uint64_t read_job_bytes_min;
+    uint64_t read_job_bytes_max;
 } ds4_gpu_dsv41_stream_layer_plan;
 int ds4_gpu_dsv41_stream_prepare_layer(
         const ds4_gpu_stream_expert_table *table,
         ds4_gpu_dsv41_stream_layer_plan *plan);
+int ds4_gpu_dsv41_stream_prepare_layer_selected(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *selected,
+        uint32_t n_selected,
+        ds4_gpu_dsv41_stream_layer_plan *plan);
 int ds4_gpu_dsv41_stream_load_layer(
-        const ds4_gpu_dsv41_stream_layer_plan *plan);
+        ds4_gpu_dsv41_stream_layer_plan *plan);
 int ds4_gpu_dsv41_stream_cancel_layer(
         const ds4_gpu_dsv41_stream_layer_plan *plan);
 int ds4_gpu_stream_expert_cache_seed_from_layer_selected(

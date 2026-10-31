@@ -50,6 +50,8 @@ typedef struct {
     int ctx_max;
     int ctx_alloc;
     int step_incr;
+    int *ctx_frontiers;
+    int ctx_frontiers_len;
     int gen_tokens;
     int power_percent;
     uint32_t prefill_chunk;
@@ -75,10 +77,36 @@ typedef struct {
     float dspark_confidence_threshold;
 } bench_config;
 
+static int parse_ctx_frontiers(const char *s, int **out, int *len);
+
 static double bench_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+typedef struct {
+    uint64_t read_ios;
+    uint64_t read_sectors;
+    uint64_t io_ticks;
+} bench_dev_io;
+
+static void bench_dev_io_read(bench_dev_io *out) {
+    memset(out, 0, sizeof(*out));
+    const char *path = getenv("DS4_BENCH_DEV_STAT");
+    if (!path || !path[0]) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    unsigned long long v[11] = {0};
+    const int n = fscanf(f,
+                         "%llu %llu %llu %llu %llu %llu %llu %llu "
+                         "%llu %llu %llu",
+                         &v[0], &v[1], &v[2], &v[3], &v[4], &v[5],
+                         &v[6], &v[7], &v[8], &v[9], &v[10]);
+    fclose(f);
+    if (n >= 3) out->read_ios = v[0];
+    if (n >= 3) out->read_sectors = v[2];
+    if (n >= 10) out->io_ticks = v[9];
 }
 
 static uint64_t bench_snapshot_max_bytes(void) {
@@ -295,6 +323,11 @@ static bench_config parse_options(int argc, char **argv) {
             c.ctx_alloc = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--step-incr")) {
             c.step_incr = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--ctx-frontiers")) {
+            const char *list = need_arg(&i, argc, argv, arg);
+            if (parse_ctx_frontiers(list, &c.ctx_frontiers, &c.ctx_frontiers_len) != 0) exit(2);
+            c.ctx_start = c.ctx_frontiers[0];
+            c.ctx_max = c.ctx_frontiers[c.ctx_frontiers_len - 1];
         } else if (!strcmp(arg, "--step-mul")) {
             c.step_mul = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--gen-tokens") || !strcmp(arg, "--tokens") || !strcmp(arg, "-n")) {
@@ -530,6 +563,49 @@ static int write_frontier_logits_json(
         return 1;
     }
     free(logits);
+    return 0;
+}
+
+static int parse_ctx_frontiers(const char *s, int **out, int *len) {
+    int *v = NULL;
+    int n = 0, cap = 0;
+    const char *p = s;
+    for (;;) {
+        char *end = NULL;
+        long value = strtol(p, &end, 10);
+        if (p == end || value <= 0 || value > INT_MAX) {
+            fprintf(stderr, "ds4-bench: invalid value in --ctx-frontiers: %s\n", s);
+            free(v);
+            return -1;
+        }
+        if (n == cap) {
+            cap = cap ? cap * 2 : 8;
+            int *grown = realloc(v, (size_t)cap * sizeof(v[0]));
+            if (!grown) {
+                fprintf(stderr, "ds4-bench: out of memory parsing --ctx-frontiers\n");
+                free(v);
+                return -1;
+            }
+            v = grown;
+        }
+        v[n++] = (int)value;
+        if (*end == '\0') break;
+        if (*end != ',') {
+            fprintf(stderr, "ds4-bench: invalid value in --ctx-frontiers: %s\n", s);
+            free(v);
+            return -1;
+        }
+        p = end + 1;
+    }
+    for (int i = 1; i < n; i++) {
+        if (v[i] <= v[i - 1]) {
+            fprintf(stderr, "ds4-bench: --ctx-frontiers must be strictly increasing\n");
+            free(v);
+            return -1;
+        }
+    }
+    *out = v;
+    *len = n;
     return 0;
 }
 
@@ -779,7 +855,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes,prefill_ms\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -805,15 +881,19 @@ int main(int argc, char **argv) {
     bool warned_large_snapshot = false;
     char err[256];
     int previous = 0;
+    int frontier = cfg.ctx_start;
+    int frontier_idx = 0;
     int rc = 0;
 
-    for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
+    for (;;) {
         ds4_tokens prefix = {
             .v = prompt.v,
             .len = frontier,
             .cap = frontier,
         };
 
+        bench_dev_io dev_before = {0};
+        if (getenv("DS4_BENCH_DEV_STAT")) bench_dev_io_read(&dev_before);
         const double prefill_t0 = bench_now_sec();
 #if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
         const bool cuda_profile_prefill =
@@ -833,10 +913,25 @@ int main(int argc, char **argv) {
         }
         const double prefill_t1 = bench_now_sec();
         const double prefill_sec = prefill_t1 - prefill_t0;
+        if (getenv("DS4_BENCH_DEV_STAT")) {
+            bench_dev_io dev_after = {0};
+            bench_dev_io_read(&dev_after);
+            fprintf(stderr,
+                    "ds4-bench: dev snapshot frontier=%d read_ios=%llu "
+                    "read_sectors=%llu io_ticks=%llu\n",
+                    frontier,
+                    (unsigned long long)(dev_after.read_ios - dev_before.read_ios),
+                    (unsigned long long)(dev_after.read_sectors - dev_before.read_sectors),
+                    (unsigned long long)(dev_after.io_ticks - dev_before.io_ticks));
+        }
         if (getenv("DS4_METAL_CB_TIMES"))
             fprintf(stderr, "ds4-bench: prefill window mono %.1f .. %.1f ms\n",
                     prefill_t0 * 1e3, prefill_t1 * 1e3);
         const int prefill_tokens = frontier - previous;
+        fprintf(stderr,
+                "ds4-bench: prefill frontier=%d tokens=%d ms=%.3f tps=%.2f\n",
+                frontier, prefill_tokens, prefill_sec * 1000.0,
+                prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0);
 
         if (write_frontier_logits_json(&cfg, engine, session, frontier, previous) != 0) {
             rc = 1;
@@ -1018,7 +1113,7 @@ int main(int argc, char **argv) {
         const int gen_steady_tokens = gen_done > gen_first_tokens ?
             gen_done - gen_first_tokens : 0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu,%.3f\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
@@ -1027,11 +1122,18 @@ int main(int argc, char **argv) {
                 gen_first_sec * 1000.0,
                 gen_steady_tokens,
                 gen_steady_sec > 0.0 ? (double)gen_steady_tokens / gen_steady_sec : 0.0,
-                (unsigned long long)(have_snapshot ? snap.len : 0));
+                (unsigned long long)(have_snapshot ? snap.len : 0),
+                prefill_sec * 1000.0);
         fflush(out);
 
         previous = frontier;
-        if (frontier >= cfg.ctx_max) break;
+        if (cfg.ctx_frontiers) {
+            if (++frontier_idx >= cfg.ctx_frontiers_len) break;
+            frontier = cfg.ctx_frontiers[frontier_idx];
+        } else {
+            if (frontier >= cfg.ctx_max) break;
+            frontier = next_frontier(&cfg, frontier);
+        }
     }
 
     if (out != stdout) fclose(out);

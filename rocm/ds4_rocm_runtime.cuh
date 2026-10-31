@@ -1875,6 +1875,10 @@ typedef struct cuda_stream_read_job {
     int count_reads;
     uint64_t read_bytes;
     uint64_t direct_bytes;
+    int done;
+    int selected_part; /* selected-load jobs: 0 gate, 1 up, 2 down */
+    double read_start; /* diagnostic: worker read begin/end wall times */
+    double read_end;
 } cuda_stream_read_job;
 
 struct cuda_stream_batch_selected_pending {
@@ -2054,6 +2058,111 @@ static int cuda_stream_read_profile_enabled(void) {
     return g_stream_read_profile_enabled;
 }
 
+/* Summarize read-worker intervals for one layer. The union of read spans is
+ * time when at least one worker was reading; span-union is exposed SSD idle
+ * inside the batch. Peak overlap approximates the request queue depth seen by
+ * the device. Latencies use nearest-rank percentiles. Diagnostic only. */
+static void cuda_stream_read_jobs_timing(
+        const cuda_stream_read_job *jobs,
+        uint32_t count,
+        uint64_t *busy_us_out,
+        uint64_t *span_us_out,
+        uint64_t *union_us_out,
+        uint64_t *idle_us_out,
+        uint32_t *peak_active_out,
+        uint64_t *p50_us_out,
+        uint64_t *p95_us_out,
+        uint64_t *max_us_out) {
+    if (busy_us_out) *busy_us_out = 0;
+    if (span_us_out) *span_us_out = 0;
+    if (union_us_out) *union_us_out = 0;
+    if (idle_us_out) *idle_us_out = 0;
+    if (peak_active_out) *peak_active_out = 0;
+    if (p50_us_out) *p50_us_out = 0;
+    if (p95_us_out) *p95_us_out = 0;
+    if (max_us_out) *max_us_out = 0;
+    if (g_stream_read_profile_enabled != 1 || !jobs || count == 0 ||
+        count > DS4_ROCM_STREAM_READ_MAX_JOBS) return;
+
+    double starts[DS4_ROCM_STREAM_READ_MAX_JOBS];
+    double ends[DS4_ROCM_STREAM_READ_MAX_JOBS];
+    double durations[DS4_ROCM_STREAM_READ_MAX_JOBS];
+    uint32_t n = 0;
+    double busy = 0.0;
+    double span_min = 0.0, span_max = 0.0;
+    int have_span = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const double a = jobs[i].read_start;
+        const double b = jobs[i].read_end;
+        if (a <= 0.0 || b < a) continue;
+        starts[n] = a;
+        ends[n] = b;
+        durations[n] = b - a;
+        n++;
+        busy += b - a;
+        if (!have_span || a < span_min) span_min = a;
+        if (!have_span || b > span_max) span_max = b;
+        have_span = 1;
+    }
+    if (n == 0 || !have_span) return;
+
+    /* Sort read spans by start for union and peak-overlap calculations. */
+    for (uint32_t i = 1; i < n; i++) {
+        const double a = starts[i], b = ends[i];
+        uint32_t j = i;
+        while (j != 0 && starts[j - 1u] > a) {
+            starts[j] = starts[j - 1u];
+            ends[j] = ends[j - 1u];
+            j--;
+        }
+        starts[j] = a;
+        ends[j] = b;
+    }
+    double union_s = 0.0;
+    double cur_start = starts[0], cur_end = ends[0];
+    for (uint32_t i = 1; i < n; i++) {
+        if (starts[i] <= cur_end) {
+            if (ends[i] > cur_end) cur_end = ends[i];
+            continue;
+        }
+        union_s += cur_end - cur_start;
+        cur_start = starts[i];
+        cur_end = ends[i];
+    }
+    union_s += cur_end - cur_start;
+
+    uint32_t peak = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t active = 0;
+        for (uint32_t j = 0; j < n; j++) {
+            if (starts[j] <= starts[i] && starts[i] < ends[j]) active++;
+        }
+        if (active > peak) peak = active;
+    }
+
+    for (uint32_t i = 1; i < n; i++) {
+        const double d = durations[i];
+        uint32_t j = i;
+        while (j != 0 && durations[j - 1u] > d) {
+            durations[j] = durations[j - 1u];
+            j--;
+        }
+        durations[j] = d;
+    }
+    const double span = span_max - span_min;
+    const double idle = span > union_s ? span - union_s : 0.0;
+    if (busy_us_out) *busy_us_out = cuda_stream_read_profile_us(busy);
+    if (span_us_out) *span_us_out = cuda_stream_read_profile_us(span);
+    if (union_us_out) *union_us_out = cuda_stream_read_profile_us(union_s);
+    if (idle_us_out) *idle_us_out = cuda_stream_read_profile_us(idle);
+    if (peak_active_out) *peak_active_out = peak;
+    if (p50_us_out) *p50_us_out =
+        cuda_stream_read_profile_us(durations[(uint32_t)((n - 1u) / 2u)]);
+    if (p95_us_out) *p95_us_out =
+        cuda_stream_read_profile_us(durations[(uint32_t)(((uint64_t)(n - 1u) * 95u) / 100u)]);
+    if (max_us_out) *max_us_out = cuda_stream_read_profile_us(durations[n - 1u]);
+}
+
 static int cuda_stream_read_direct_disabled(void) {
     if (g_stream_read_direct_disabled < 0) {
         const char *env = getenv("DS4_ROCM_STREAM_NO_DIRECT");
@@ -2096,6 +2205,7 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
     job->uploaded = 0;
     job->errnum = 0;
     job->direct = 0;
+    job->done = 0;
     job->read_bytes = 0;
     job->direct_bytes = 0;
     if (!stage || job->bytes == 0 || g_model_fd < 0) {
@@ -2192,7 +2302,9 @@ static void *cuda_stream_read_worker(void *arg) {
 
         const int profile = g_stream_read_profile_enabled == 1;
         const double read_t0 = profile ? cuda_wall_sec() : 0.0;
+        job->read_start = profile ? read_t0 : 0.0;
         cuda_stream_read_job_run(job, stage, stage_bytes);
+        if (profile) job->read_end = cuda_wall_sec();
         uint64_t read_us = 0;
         uint64_t upload_us = 0;
         if (profile) {
@@ -2218,10 +2330,9 @@ static void *cuda_stream_read_worker(void *arg) {
             g_stream_read_profile_upload_us += upload_us;
         }
         if (!job->ok) g_stream_read_active_ok = 0;
+        job->done = 1;
         g_stream_read_active_done++;
-        if (g_stream_read_active_done >= g_stream_read_active_count) {
-            pthread_cond_signal(&g_stream_read_done_cond);
-        }
+        pthread_cond_broadcast(&g_stream_read_done_cond);
         pthread_mutex_unlock(&g_stream_read_mutex);
     }
     return NULL;
@@ -2242,6 +2353,29 @@ static uint32_t cuda_stream_read_worker_count(void) {
         }
     }
     return DS4_ROCM_STREAM_READ_DEFAULT_WORKERS;
+}
+
+/* Experimental one-token selected-load splitter.  A single missing expert
+ * contributes only three read jobs, so at most three SSD workers are active
+ * while the decoder waits in cuda_stream_selected_finish_pending_missing().
+ * Splitting each gate/up/down transfer into several aligned chunks lets more
+ * workers stream one expert in parallel.  The selected pending array has room
+ * for 24 jobs, so cap the expansion to that fixed slot count. */
+static uint32_t cuda_stream_selected_read_chunks(uint32_t job_count) {
+    if (job_count == 0) return 1u;
+    unsigned long v = 8u;
+    const char *env = getenv("DS4_ROCM_V41_SELECTED_READ_CHUNKS");
+    if (env && env[0]) {
+        char *end = NULL;
+        errno = 0;
+        v = strtoul(env, &end, 10);
+        if (end == env || errno != 0 || v < 2u) return 1u;
+    }
+    const uint32_t max_chunks =
+        (uint32_t)((DS4_ROCM_N_EXPERT_USED * 3u) / job_count);
+    if (max_chunks < 2u) return 1u;
+    if (v > max_chunks) v = max_chunks;
+    return (uint32_t)v;
 }
 
 static void cuda_stream_read_upload_streams_destroy(void) {
@@ -2349,8 +2483,11 @@ static int cuda_stream_read_jobs_prepare(cuda_stream_read_job *jobs, uint32_t co
         jobs[i].uploaded = 0;
         jobs[i].errnum = 0;
         jobs[i].direct = 0;
+        jobs[i].done = 0;
         jobs[i].host_raw = NULL;
         jobs[i].host_buf = NULL;
+        jobs[i].read_start = 0.0;
+        jobs[i].read_end = 0.0;
         if (jobs[i].bytes > max_bytes) max_bytes = jobs[i].bytes;
     }
     /* Slack so direct reads can align their offset and length. */
@@ -3093,10 +3230,27 @@ static int cuda_stream_layer_expert_cache_load(
 
 /* V4.1 only: the graph owns dynamic-cache metadata until every source copy
  * completes. The following reader receives no cache pointer or vector index. */
-static int cuda_stream_v41_prepare_layer(const ds4_gpu_stream_expert_table *t,
-                                         ds4_gpu_dsv41_stream_layer_plan *out) {
+static int cuda_stream_v41_prepare_layer_impl(const ds4_gpu_stream_expert_table *t,
+                                              const int32_t *selected,
+                                              uint32_t n_selected,
+                                              ds4_gpu_dsv41_stream_layer_plan *out) {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
+    uint64_t selected_bits[6] = {0};
+    uint32_t selected_unique = 0;
+    const bool use_selected = selected && n_selected;
+    if (use_selected) {
+        for (uint32_t i = 0; i < n_selected; i++) {
+            const int32_t e = selected[i];
+            if (e < 0 || (uint32_t)e >= 384u) return 0;
+            const uint64_t bit = UINT64_C(1) << ((uint32_t)e % 64u);
+            if (!(selected_bits[(uint32_t)e / 64u] & bit)) {
+                selected_bits[(uint32_t)e / 64u] |= bit;
+                selected_unique++;
+            }
+        }
+        if (!selected_unique) return 0;
+    }
     uint64_t total = 0;
     if (!g_ssd_streaming_mode || !cuda_stream_layer_table_bytes(t, &total) ||
         t->n_total_expert != 384u || t->layer >= 40u || g_model_fd < 0 ||
@@ -3177,13 +3331,46 @@ static int cuda_stream_v41_prepare_layer(const ds4_gpu_stream_expert_table *t,
     if (stats) {
         g_stream_v41_reuse_stats.hits += hits;
         g_stream_v41_reuse_stats.d2d_bytes += copied;
-        g_stream_v41_reuse_stats.missing_bytes += total - (uint64_t)hits * (total / 384u);
+        if (!use_selected)
+            g_stream_v41_reuse_stats.missing_bytes += total - (uint64_t)hits * (total / 384u);
         if (!ok) g_stream_v41_reuse_stats.failures++;
     }
     if (!ok) return 0;
+    const uint64_t expert_bytes = total / 384u;
+    uint32_t missing = 384u - hits;
+    uint64_t missing_bytes = total - (uint64_t)hits * expert_bytes;
+    if (use_selected) {
+        uint32_t selected_resident = 0;
+        for (uint32_t e = 0; e < 384u; e++) {
+            const uint64_t bit = UINT64_C(1) << (e % 64u);
+            if ((selected_bits[e / 64u] & bit) &&
+                (plan.hits[e / 64u] & bit)) selected_resident++;
+        }
+        missing = selected_unique - selected_resident;
+        missing_bytes = (uint64_t)missing * expert_bytes;
+        memcpy(plan.selected, selected_bits, sizeof(plan.selected));
+        plan.selected_experts = selected_unique;
+        plan.use_selected = 1;
+        if (stats) g_stream_v41_reuse_stats.missing_bytes += missing_bytes;
+    }
+    plan.resident_experts = hits;
+    plan.missing_experts = missing;
+    plan.missing_bytes = missing_bytes;
     s.reuse_plan = plan;
     *out = plan;
     return 1;
+}
+
+static int cuda_stream_v41_prepare_layer(const ds4_gpu_stream_expert_table *t,
+                                         ds4_gpu_dsv41_stream_layer_plan *out) {
+    return cuda_stream_v41_prepare_layer_impl(t, NULL, 0, out);
+}
+
+static int cuda_stream_v41_prepare_layer_selected(const ds4_gpu_stream_expert_table *t,
+                                                   const int32_t *selected,
+                                                   uint32_t n_selected,
+                                                   ds4_gpu_dsv41_stream_layer_plan *out) {
+    return cuda_stream_v41_prepare_layer_impl(t, selected, n_selected, out);
 }
 
 static int cuda_stream_v41_plan_matches(const ds4_gpu_dsv41_stream_layer_plan *p) {
@@ -3199,7 +3386,9 @@ static int cuda_stream_v41_plan_matches(const ds4_gpu_dsv41_stream_layer_plan *p
         a.gate_offset == b.gate_offset && a.up_offset == b.up_offset &&
         a.down_offset == b.down_offset && a.gate_expert_bytes == b.gate_expert_bytes &&
         a.down_expert_bytes == b.down_expert_bytes &&
-        memcmp(s.reuse_plan.hits, p->hits, sizeof(p->hits)) == 0;
+        s.reuse_plan.use_selected == p->use_selected &&
+        memcmp(s.reuse_plan.hits, p->hits, sizeof(p->hits)) == 0 &&
+        memcmp(s.reuse_plan.selected, p->selected, sizeof(p->selected)) == 0;
 }
 
 /* Coalesce only adjacent misses in a single plane. An empty hit bitmap retains
@@ -3214,12 +3403,23 @@ static int cuda_stream_v41_missing_jobs(const ds4_gpu_dsv41_stream_layer_plan *p
     const uint64_t stride[] = {t.gate_expert_bytes, t.gate_expert_bytes, t.down_expert_bytes};
     const uint64_t chunk = UINT64_C(32) * 1048576u;
     *count = 0;
+    const bool selected = p->use_selected != 0;
     for (uint32_t plane = 0; plane < 3u; plane++) {
         uint32_t e = 0;
         while (e < 384u) {
-            if ((p->hits[e / 64u] >> (e % 64u)) & 1u) { e++; continue; }
+            const uint64_t bit = UINT64_C(1) << (e % 64u);
+            const bool hit = (p->hits[e / 64u] & bit) != 0;
+            const bool want = selected ? ((p->selected[e / 64u] & bit) != 0 && !hit) : !hit;
+            if (!want) { e++; continue; }
             const uint32_t first = e++;
-            while (e < 384u && !((p->hits[e / 64u] >> (e % 64u)) & 1u)) e++;
+            while (e < 384u) {
+                const uint64_t nbit = UINT64_C(1) << (e % 64u);
+                const bool nhit = (p->hits[e / 64u] & nbit) != 0;
+                const bool nwant = selected ?
+                    ((p->selected[e / 64u] & nbit) != 0 && !nhit) : !nhit;
+                if (!nwant) break;
+                e++;
+            }
             uint64_t begin = (uint64_t)first * stride[plane];
             const uint64_t end = (uint64_t)e * stride[plane];
             while (begin < end) {
@@ -3244,7 +3444,7 @@ static int cuda_stream_v41_cancel_layer(const ds4_gpu_dsv41_stream_layer_plan *p
     return 1; /* Preparation owns no outstanding copies or dynamic entries. */
 }
 
-static int cuda_stream_v41_load_layer(const ds4_gpu_dsv41_stream_layer_plan *p) {
+static int cuda_stream_v41_load_layer(ds4_gpu_dsv41_stream_layer_plan *p) {
     if (!cuda_stream_v41_plan_matches(p)) return 0;
     cuda_stream_read_job *jobs = (cuda_stream_read_job *)calloc(
         DS4_ROCM_STREAM_READ_MAX_JOBS, sizeof(cuda_stream_read_job));
@@ -3254,6 +3454,17 @@ static int cuda_stream_v41_load_layer(const ds4_gpu_dsv41_stream_layer_plan *p) 
         (void)cuda_stream_v41_cancel_layer(p);
         return 0;
     }
+    uint64_t read_bytes = 0;
+    for (uint32_t i = 0; i < count; i++) read_bytes += jobs[i].bytes;
+    p->read_jobs = count;
+    p->read_bytes = read_bytes;
+    uint64_t job_min = 0, job_max = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (i == 0 || jobs[i].bytes < job_min) job_min = jobs[i].bytes;
+        if (jobs[i].bytes > job_max) job_max = jobs[i].bytes;
+    }
+    p->read_job_bytes_min = job_min;
+    p->read_job_bytes_max = job_max;
     const ds4_gpu_stream_expert_table t = p->table;
     cuda_stream_layer_expert_cache &s = g_stream_layer_expert_cache[t.layer & 1u];
     s.reuse_plan.generation = 0; /* Consume once, before admitting any reads. */
@@ -3264,6 +3475,11 @@ static int cuda_stream_v41_load_layer(const ds4_gpu_dsv41_stream_layer_plan *p) 
         g_stream_v41_reuse_stats.read_jobs += count;
     }
     const int ok = cuda_stream_read_jobs_parallel(jobs, count);
+    cuda_stream_read_jobs_timing(jobs, count,
+                                 &p->read_busy_us, &p->read_span_us,
+                                 &p->read_union_us, &p->read_idle_us,
+                                 &p->read_peak_active, &p->read_lat_p50_us,
+                                 &p->read_lat_p95_us, &p->read_lat_max_us);
     if (stats) {
         for (uint32_t i = 0; i < count; i++) {
             g_stream_v41_reuse_stats.read_bytes += jobs[i].read_bytes;
@@ -3459,12 +3675,15 @@ static int cuda_stream_resident_seed_experts(
             read_jobs[read_job_count++] =
                 {entry.gate, gate_offset + gate_rel, gate_expert_bytes,
                  NULL, NULL, 0, 0};
+            read_jobs[read_job_count - 1u].selected_part = 0;
             read_jobs[read_job_count++] =
                 {entry.up, up_offset + gate_rel, gate_expert_bytes,
                  NULL, NULL, 0, 0};
+            read_jobs[read_job_count - 1u].selected_part = 1;
             read_jobs[read_job_count++] =
                 {entry.down, down_offset + down_rel, down_expert_bytes,
                  NULL, NULL, 0, 0};
+            read_jobs[read_job_count - 1u].selected_part = 2;
         } else {
             cudaError_t err = cudaMemcpyAsync(entry.gate,
                                               (device_copy ? layer_gate : (const char *)model_map + gate_offset) + gate_rel,
@@ -4883,6 +5102,50 @@ static int cuda_stream_selected_load(
     }
 
     if (use_fd && read_job_count != 0) {
+        const uint32_t chunks =
+            cuda_stream_selected_read_chunks(read_job_count);
+        if (chunks > 1u) {
+            cuda_stream_read_job src[DS4_ROCM_N_EXPERT_USED * 3u];
+            memcpy(src, read_jobs,
+                   (size_t)read_job_count * sizeof(read_jobs[0]));
+            uint32_t expanded = 0;
+            for (uint32_t i = 0; i < read_job_count; i++) {
+                const uint64_t bytes = src[i].bytes;
+                const uint64_t base_chunk = bytes / chunks;
+                const uint64_t extra = bytes % chunks;
+                uint64_t off = 0;
+                for (uint32_t c = 0; c < chunks; c++) {
+                    const uint64_t chunk =
+                        base_chunk + ((uint64_t)c < extra ? 1u : 0u);
+                    if (chunk == 0 || expanded >= DS4_ROCM_N_EXPERT_USED * 3u) {
+                        break;
+                    }
+                    cuda_stream_read_job job = src[i];
+                    job.offset += off;
+                    job.dst += off;
+                    job.bytes = chunk;
+                    job.host_raw = NULL;
+                    job.host_buf = NULL;
+                    job.ok = 0;
+                    job.uploaded = 0;
+                    job.errnum = 0;
+                    job.direct = 0;
+                    job.done = 0;
+                    job.read_bytes = 0;
+                    job.direct_bytes = 0;
+                    read_jobs[expanded++] = job;
+                    off += chunk;
+                }
+            }
+            if (expanded != 0) read_job_count = expanded;
+            static int logged_selected_read_chunks = 0;
+            if (!logged_selected_read_chunks) {
+                logged_selected_read_chunks = 1;
+                fprintf(stderr,
+                        "ds4: V4.1 selected read chunks=%u jobs=%u\n",
+                        chunks, read_job_count);
+            }
+        }
         g_stream_selected_pending.active = 1;
         g_stream_selected_pending.model_map = model_map;
         g_stream_selected_pending.layer = layer;
@@ -5018,6 +5281,7 @@ static int cuda_stream_selected_pending_matches(
 }
 
 static int cuda_stream_selected_finish_pending_missing(uint32_t compact_mask);
+static int cuda_stream_selected_finish_pending_gateup(void);
 
 static int cuda_stream_selected_apply_split(
         const void *model_map,
@@ -5071,6 +5335,51 @@ static int cuda_stream_selected_apply_split(
     *missing_mask = g_stream_selected_pending.missing_mask;
     g_routed_moe_selected_override_n = 0;
     return 1;
+}
+
+/* Experimental partial join: wait only the selected-load gate/up jobs, leaving
+ * the down read jobs active.  Workers upload each job on their own stream and
+ * set job->done after the upload completes, so the returned gate/up data is
+ * ready for the missing gate kernel while the down transfer continues.  The
+ * full cuda_stream_selected_finish_pending_missing(0) later joins the down
+ * jobs before the down kernel. */
+static int cuda_stream_selected_finish_pending_gateup(void) {
+    if (!g_stream_selected_pending.active) return 1;
+    cuda_stream_read_job *jobs = g_stream_selected_pending.read_jobs;
+    const uint32_t count = g_stream_selected_pending.read_job_count;
+    pthread_mutex_lock(&g_stream_read_mutex);
+    if (g_stream_read_active_jobs != jobs) {
+        pthread_mutex_unlock(&g_stream_read_mutex);
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "streaming selected gate/up wait received inactive job set\n");
+        return 0;
+    }
+    for (;;) {
+        int waiting = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            if (jobs[i].selected_part != 2 && !jobs[i].done) {
+                waiting = 1;
+                break;
+            }
+        }
+        if (!waiting) break;
+        pthread_cond_wait(&g_stream_read_done_cond, &g_stream_read_mutex);
+    }
+    int ok = g_stream_read_active_ok;
+    for (uint32_t i = 0; i < count; i++) {
+        if (jobs[i].selected_part != 2 &&
+            (!jobs[i].ok || !jobs[i].uploaded)) {
+            ok = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_stream_read_mutex);
+    if (!ok) {
+        (void)cuda_stream_read_jobs_wait(jobs, count);
+        cuda_stream_read_jobs_free(jobs, count);
+        memset(&g_stream_selected_pending, 0, sizeof(g_stream_selected_pending));
+        cuda_stream_resident_cache_release();
+    }
+    return ok;
 }
 
 static int cuda_stream_selected_finish_pending_missing(uint32_t compact_mask) {
@@ -5382,6 +5691,7 @@ struct ds4_rocm_runtime_config {
     uint32_t moe_decode_gate_rpb;
     uint32_t moe_decode_down_rpb;
     int oldhip_attention_decode;
+    int attn_q_b_native;
 };
 
 static ds4_rocm_runtime_config g_rocm_cfg;
@@ -5402,6 +5712,11 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
+        const char *attn_q_b_native_env = getenv("DS4_ROCM_Q_B_NATIVE");
+        g_rocm_cfg.attn_q_b_native =
+            attn_q_b_native_env != NULL && cuda_env_present(attn_q_b_native_env);
+        fprintf(stderr, "ds4: V4.1 attn q_b native Q8=%d\n",
+                g_rocm_cfg.attn_q_b_native);
         g_rocm_cfg.shared_down_cublas = !g_quality_mode;
         const char *glm_grouped_value_project_env =
             getenv("DS4_ROCM_GLM_GROUPED_VALUE_PROJECT");
@@ -5438,7 +5753,9 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
             cuda_env_present(getenv("DS4_ROCM_GRAPH_DUMP_NONINVASIVE"));
         g_rocm_cfg.graph_dump =
             graph_dump_requested && !graph_dump_noninvasive;
-        g_rocm_cfg.q8_decode_rpb = 1u;
+        g_rocm_cfg.q8_decode_rpb =
+            cuda_rows_per_block_env_or_default("DS4_ROCM_Q8_DECODE_RPB", 1u);
+        fprintf(stderr, "ds4: V4.1 q8 decode rpb=%u\n", g_rocm_cfg.q8_decode_rpb);
         g_rocm_cfg.q8_hc_decode_rpb = 16u;
         g_rocm_cfg.attn_out_low_decode_rpb = 32u;
         const char *moe_decode_rpb_env = getenv("DS4_ROCM_MOE_DECODE_RPB");
@@ -5657,6 +5974,7 @@ static const __half *cuda_q8_f16_ptr(
         uint64_t in_dim,
         uint64_t out_dim,
         const char *label) {
+    if (cuda_runtime_config()->attn_q_b_native && label && strstr(label, "attn_q_b")) return NULL;
     auto exact = g_q8_f16_by_offset.find(offset);
     if (exact != g_q8_f16_by_offset.end()) {
         const cuda_q8_f16_range &r = g_q8_f16_ranges[exact->second];

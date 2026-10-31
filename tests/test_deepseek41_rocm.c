@@ -520,9 +520,9 @@ static int check_causal_topk(void) {
 
 static int check_indexer_scores(void) {
     enum { HEADS = 32, DIM = 128 };
-    const struct { uint32_t keys, rows; } shapes[] = {{129,1}, {1025,7}, {1025,8}, {1025,9}, {1025,31}, {1025,32}, {1025,33}, {16385,3}};
-    const uint32_t keys = shapes[requested_shape % 8u].keys, rows = shapes[requested_shape % 8u].rows;
-    const uint32_t ratio = requested_shape / 8u + 1u;
+    const struct { uint32_t keys, rows; } shapes[] = {{129,1}, {1025,7}, {1025,8}, {1025,9}, {1025,31}, {1025,32}, {1025,33}, {16385,3}, {16385,31}, {16385,32}, {65537,31}};
+    const uint32_t keys = shapes[requested_shape % 11u].keys, rows = shapes[requested_shape % 11u].rows;
+    const uint32_t ratio = requested_shape / 11u + 1u;
     const size_t nq = (size_t)rows * HEADS * DIM, nk = (size_t)keys * DIM, nw = (size_t)rows * HEADS;
     float *q = malloc(nq * 4), *k = malloc(nk * 4), *w = malloc(nw * 4), *s = malloc((size_t)rows * keys * 4);
     CHECK(q && k && w && s);
@@ -1232,7 +1232,7 @@ static const test_case cases[] = {
     {"gather", 7, check_sparse_gather},
     {"carry", 16, check_compact_carry},
     {"topk", 14, check_causal_topk},
-    {"indexer", 16, check_indexer_scores},
+    {"indexer", 22, check_indexer_scores},
     {"dspark-hc", 3, check_dspark_hc_mean},
     {"dspark-router", 1, check_dspark_router},
     {"dspark-markov", 3, check_dspark_markov},

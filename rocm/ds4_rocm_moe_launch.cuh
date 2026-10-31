@@ -33,6 +33,10 @@ enum {
     DS4_ROCM_MOE_DECODE_PROFILE_MID_QUANT_END,
     DS4_ROCM_MOE_DECODE_PROFILE_DOWN_START,
     DS4_ROCM_MOE_DECODE_PROFILE_DOWN_END,
+    DS4_ROCM_MOE_DECODE_PROFILE_PREP_START,
+    DS4_ROCM_MOE_DECODE_PROFILE_PREP_WAIT_END,
+    DS4_ROCM_MOE_DECODE_PROFILE_XQUANT_START,
+    DS4_ROCM_MOE_DECODE_PROFILE_XQUANT_END,
     DS4_ROCM_MOE_DECODE_PROFILE_EVENT_COUNT
 };
 
@@ -42,14 +46,21 @@ typedef struct {
     uint64_t q8_gateup_calls;
     uint64_t q8_down_calls;
     double finish_missing_ms;
+    double split_finish_missing_ms;
+    double split_down_wait_ms;
+    double split_prep_wait_ms;
+    double split_xquant_ms;
     double gate_resident_ms;
     double gate_missing_ms;
     double gate_full_ms;
     double mid_quant_ms;
     double down_ms;
+    double profile_collect_ms;
 } ds4_rocm_moe_decode_profile_stats;
 
 typedef struct {
+    int split_prep_wait;
+    int split_xquant;
     int gate_resident;
     int gate_missing;
     int gate_full;
@@ -59,6 +70,63 @@ typedef struct {
 
 static ds4_rocm_moe_decode_profile_stats g_moe_decode_profile_stats;
 static cudaEvent_t g_moe_decode_profile_events[DS4_ROCM_MOE_DECODE_PROFILE_EVENT_COUNT];
+
+/* Lightweight selected-split phase counters.  The heavy decode profile drains
+ * the stream; these counters only touch host-side integers and are suitable
+ * for paired throughput runs. */
+typedef struct {
+    uint64_t calls;
+    uint64_t resident_only;
+    uint64_t mixed;
+    uint64_t resident_experts;
+    uint64_t missing_experts;
+    uint32_t max_missing;
+} ds4_rocm_v41_split_counts;
+static ds4_rocm_v41_split_counts g_v41_split_counts;
+static int g_v41_split_counts_enabled = -1;
+static int g_v41_split_counts_registered = 0;
+
+static void ds4_rocm_v41_split_counts_print(void) {
+    const ds4_rocm_v41_split_counts *c = &g_v41_split_counts;
+    if (c->calls == 0u) return;
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "V4.1 split counts calls=%llu resident_only=%llu "
+            "mixed=%llu resident_experts=%llu missing_experts=%llu max_missing=%u\n",
+            (unsigned long long)c->calls,
+            (unsigned long long)c->resident_only,
+            (unsigned long long)c->mixed,
+            (unsigned long long)c->resident_experts,
+            (unsigned long long)c->missing_experts,
+            c->max_missing);
+}
+
+static int ds4_rocm_v41_split_counts_on(void) {
+    if (g_v41_split_counts_enabled < 0) {
+        const char *env = getenv("DS4_ROCM_V41_SPLIT_COUNTS");
+        g_v41_split_counts_enabled =
+            (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+        if (g_v41_split_counts_enabled && !g_v41_split_counts_registered) {
+            atexit(ds4_rocm_v41_split_counts_print);
+            g_v41_split_counts_registered = 1;
+        }
+    }
+    return g_v41_split_counts_enabled;
+}
+
+static void ds4_rocm_v41_split_counts_note(uint32_t resident_mask,
+                                            uint32_t missing_mask) {
+    if (!ds4_rocm_v41_split_counts_on()) return;
+    const uint32_t resident = (uint32_t)__builtin_popcount(resident_mask);
+    const uint32_t missing = (uint32_t)__builtin_popcount(missing_mask);
+    g_v41_split_counts.calls++;
+    g_v41_split_counts.resident_experts += resident;
+    g_v41_split_counts.missing_experts += missing;
+    if (missing == 0u) g_v41_split_counts.resident_only++;
+    else g_v41_split_counts.mixed++;
+    if (missing > g_v41_split_counts.max_missing) {
+        g_v41_split_counts.max_missing = missing;
+    }
+}
 static int g_moe_decode_profile_enabled = -1;
 static int g_moe_decode_profile_registered = 0;
 static int g_moe_decode_profile_events_ready = 0;
@@ -69,24 +137,33 @@ static void routed_moe_decode_profile_print(void) {
     if (p->calls == 0u) return;
     const double calls = (double)p->calls;
     fprintf(stderr,
-            DS4_GPU_LOG_PREFIX "Q2 decode MoE profile calls=%llu "
+            DS4_GPU_LOG_PREFIX "decode MoE profile calls=%llu "
             "split=%llu q8_gateup=%llu q8_down=%llu "
-            "finish_missing=%.3f ms gate_resident=%.3f ms "
+            "finish_missing=%.3f ms split_finish_missing=%.3f ms "
+            "split_down_wait=%.3f ms split_prep_wait=%.3f ms split_xquant=%.3f ms "
+            "gate_resident=%.3f ms "
             "gate_missing=%.3f ms gate_full=%.3f ms "
-            "mid_quant=%.3f ms down=%.3f ms avg_sum=%.3f ms\n",
+            "mid_quant=%.3f ms down=%.3f ms "
+            "profile_collect=%.3f ms avg_sum=%.3f ms\n",
             (unsigned long long)p->calls,
             (unsigned long long)p->split_calls,
             (unsigned long long)p->q8_gateup_calls,
             (unsigned long long)p->q8_down_calls,
             p->finish_missing_ms,
+            p->split_finish_missing_ms,
+            p->split_down_wait_ms,
+            p->split_prep_wait_ms,
+            p->split_xquant_ms,
             p->gate_resident_ms,
             p->gate_missing_ms,
             p->gate_full_ms,
             p->mid_quant_ms,
             p->down_ms,
-            (p->finish_missing_ms + p->gate_resident_ms +
-             p->gate_missing_ms + p->gate_full_ms + p->mid_quant_ms +
-             p->down_ms) / calls);
+            p->profile_collect_ms,
+            (p->finish_missing_ms + p->split_finish_missing_ms +
+             p->split_down_wait_ms + p->split_prep_wait_ms + p->split_xquant_ms +
+             p->gate_resident_ms + p->gate_missing_ms +
+             p->gate_full_ms + p->mid_quant_ms + p->down_ms) / calls);
 }
 
 static int routed_moe_decode_profile_enabled(void) {
@@ -108,7 +185,7 @@ static int routed_moe_decode_profile_ensure_events(void) {
         cudaError_t err = cudaEventCreate(&g_moe_decode_profile_events[i]);
         if (err != cudaSuccess) {
             fprintf(stderr,
-                    DS4_GPU_LOG_PREFIX "Q2 decode MoE profile event create failed: %s\n",
+                    DS4_GPU_LOG_PREFIX "decode MoE profile event create failed: %s\n",
                     cudaGetErrorString(err));
             for (uint32_t j = 0; j < i; j++) {
                 (void)cudaEventDestroy(g_moe_decode_profile_events[j]);
@@ -157,12 +234,28 @@ static int routed_moe_decode_profile_add_event_ms(uint32_t start_ev,
 static int routed_moe_decode_profile_collect(
         const ds4_rocm_moe_decode_profile_record *rec) {
     if (!rec) return 1;
+    if (rec->split_prep_wait &&
+        !routed_moe_decode_profile_add_event_ms(
+                DS4_ROCM_MOE_DECODE_PROFILE_PREP_START,
+                DS4_ROCM_MOE_DECODE_PROFILE_PREP_WAIT_END,
+                &g_moe_decode_profile_stats.split_prep_wait_ms,
+                "decode MoE profile split prep wait")) {
+        return 0;
+    }
+    if (rec->split_xquant &&
+        !routed_moe_decode_profile_add_event_ms(
+                DS4_ROCM_MOE_DECODE_PROFILE_XQUANT_START,
+                DS4_ROCM_MOE_DECODE_PROFILE_XQUANT_END,
+                &g_moe_decode_profile_stats.split_xquant_ms,
+                "decode MoE profile split x quant")) {
+        return 0;
+    }
     if (rec->gate_resident &&
         !routed_moe_decode_profile_add_event_ms(
                 DS4_ROCM_MOE_DECODE_PROFILE_GATE_RESIDENT_START,
                 DS4_ROCM_MOE_DECODE_PROFILE_GATE_RESIDENT_END,
                 &g_moe_decode_profile_stats.gate_resident_ms,
-                "Q2 decode MoE profile resident gate/up")) {
+                "decode MoE profile resident gate/up")) {
         return 0;
     }
     if (rec->gate_missing &&
@@ -170,7 +263,7 @@ static int routed_moe_decode_profile_collect(
                 DS4_ROCM_MOE_DECODE_PROFILE_GATE_MISSING_START,
                 DS4_ROCM_MOE_DECODE_PROFILE_GATE_MISSING_END,
                 &g_moe_decode_profile_stats.gate_missing_ms,
-                "Q2 decode MoE profile missing gate/up")) {
+                "decode MoE profile missing gate/up")) {
         return 0;
     }
     if (rec->gate_full &&
@@ -178,7 +271,7 @@ static int routed_moe_decode_profile_collect(
                 DS4_ROCM_MOE_DECODE_PROFILE_GATE_FULL_START,
                 DS4_ROCM_MOE_DECODE_PROFILE_GATE_FULL_END,
                 &g_moe_decode_profile_stats.gate_full_ms,
-                "Q2 decode MoE profile gate/up")) {
+                "decode MoE profile gate/up")) {
         return 0;
     }
     if (rec->mid_quant &&
@@ -186,7 +279,7 @@ static int routed_moe_decode_profile_collect(
                 DS4_ROCM_MOE_DECODE_PROFILE_MID_QUANT_START,
                 DS4_ROCM_MOE_DECODE_PROFILE_MID_QUANT_END,
                 &g_moe_decode_profile_stats.mid_quant_ms,
-                "Q2 decode MoE profile mid quant")) {
+                "decode MoE profile mid quant")) {
         return 0;
     }
     if (rec->down &&
@@ -194,7 +287,7 @@ static int routed_moe_decode_profile_collect(
                 DS4_ROCM_MOE_DECODE_PROFILE_DOWN_START,
                 DS4_ROCM_MOE_DECODE_PROFILE_DOWN_END,
                 &g_moe_decode_profile_stats.down_ms,
-                "Q2 decode MoE profile down")) {
+                "decode MoE profile down")) {
         return 0;
     }
     return 1;
@@ -770,10 +863,29 @@ static int routed_moe_launch(
                                            &up_slot_ptrs,
                                            &down_slot_ptrs,
                                            &stream_batch_unique);
-    /* The one-token resident/missing split can expose partially updated
-     * selected-expert state to the default stream. Keep the asynchronous
-     * read overlap, then use the deterministic compact table below. */
+    /* One-token resident/missing split. The split path waits for the
+     * pointer-table upload before launching the resident gate/up kernel, so
+     * resident compute can overlap the pending missing-expert reads. It was
+     * validated bit-exact against the compact path across 2048..32768. */
     int split_selected = 0;
+    if (!stream_full_layer && n_tokens == 1u) {
+        split_selected =
+            cuda_stream_selected_apply_split(model_map,
+                                             layer_index,
+                                             n_total_expert,
+                                             n_expert,
+                                             gate_expert_bytes,
+                                             down_expert_bytes,
+                                             &selected_exec,
+                                             &gate_w,
+                                             &up_w,
+                                             &down_w,
+                                             &gate_slot_ptrs,
+                                             &up_slot_ptrs,
+                                             &down_slot_ptrs,
+                                             &stream_resident_mask,
+                                             &stream_missing_mask);
+    }
     const int compact_selected =
         split_selected ||
         (!stream_full_layer &&
@@ -824,7 +936,19 @@ static int routed_moe_launch(
     } else if (!gate_w || !up_w || !down_w) {
         return 0;
     }
+    const int split_prep_profile =
+        split_selected && n_tokens == 1u && routed_moe_decode_profile_enabled();
+    if (split_prep_profile) {
+        if (!routed_moe_decode_profile_ensure_events() ||
+            !routed_moe_decode_profile_record_event(
+                DS4_ROCM_MOE_DECODE_PROFILE_PREP_START,
+                "IQ2 decode MoE profile split prep start")) return 0;
+    }
     if (compact_selected && !cuda_stream_selected_wait_upload_ready()) return 0;
+    if (split_prep_profile &&
+        !routed_moe_decode_profile_record_event(
+            DS4_ROCM_MOE_DECODE_PROFILE_PREP_WAIT_END,
+            "IQ2 decode MoE profile split prep wait end")) return 0;
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
@@ -953,10 +1077,21 @@ static int routed_moe_launch(
                     compact_selected, use_sorted_pairs, use_expert_tiles);
         }
         dim3 xq_grid(xq_blocks, n_tokens, 1);
+        int split_xquant_profile = 0;
+        if (ok && split_prep_profile) {
+            if (!routed_moe_decode_profile_record_event(
+                    DS4_ROCM_MOE_DECODE_PROFILE_XQUANT_START,
+                    "IQ2 decode MoE profile split x quant start")) return 0;
+            split_xquant_profile = 1;
+        }
         if (!use_rocm_mmq_gateup) {
             q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         }
+        if (split_xquant_profile && ok &&
+            !routed_moe_decode_profile_record_event(
+                DS4_ROCM_MOE_DECODE_PROFILE_XQUANT_END,
+                "IQ2 decode MoE profile split x quant end")) return 0;
         if (ok && (batch_stream_selected || batch_stream_split_selected)) {
             dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
             if (batch_stream_split_selected) {
@@ -1476,7 +1611,21 @@ static int routed_moe_launch(
             }
         }
         int split_gateup_done = 0;
+        const int iq2_decode_profile =
+            n_tokens == 1u && routed_moe_decode_profile_enabled();
+        ds4_rocm_moe_decode_profile_record iq2_profile_rec = {0};
+        iq2_profile_rec.split_prep_wait = split_prep_profile;
+        iq2_profile_rec.split_xquant = split_xquant_profile;
+        if (iq2_decode_profile) {
+            if (!routed_moe_decode_profile_ensure_events()) return 0;
+            g_moe_decode_profile_stats.calls++;
+            if (split_selected) g_moe_decode_profile_stats.split_calls++;
+        }
         if (ok && split_selected) {
+            ds4_rocm_v41_split_counts_note(stream_resident_mask,
+                                           stream_missing_mask);
+            const int allow_resident_only =
+                getenv("DS4_ROCM_V41_DISABLE_ALL_RESIDENT_SPLIT") == NULL;
             const int split_supported =
                 iq2_gate_path &&
                 n_tokens == 1u &&
@@ -1484,11 +1633,28 @@ static int routed_moe_launch(
                 !q4k_path &&
                 !sorted_pairs &&
                 stream_resident_mask != 0 &&
-                stream_missing_mask != 0;
+                (stream_missing_mask != 0 || allow_resident_only);
             if (split_supported) {
+                if (stream_missing_mask == 0u && allow_resident_only) {
+                    static int logged_all_resident = 0;
+                    if (!logged_all_resident) {
+                        logged_all_resident = 1;
+                        fprintf(stderr,
+                                "ds4: V4.1 all-resident split active "
+                                "(resident_mask=0x%x)\n",
+                                stream_resident_mask);
+                    }
+                }
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
+                if (iq2_decode_profile &&
+                    !routed_moe_decode_profile_record_event(
+                        DS4_ROCM_MOE_DECODE_PROFILE_GATE_RESIDENT_START,
+                        "IQ2 decode MoE profile resident gate/up start")) {
+                    return 0;
+                }
                 if (use_v41_wave_gate) {
-                    moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
+                    ds4_v41_launch_gate_up_wave_ptrs(
+                        ds4_rocm_v41_gate_waves(),
                         (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                         gate_slot_ptrs, up_slot_ptrs, xq,
                         (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
@@ -1529,19 +1695,48 @@ static int routed_moe_launch(
                         clamp);
                 }
                 ok = cuda_ok(cudaGetLastError(), "routed_moe split resident gate/up launch");
+                if (iq2_decode_profile && ok) {
+                    iq2_profile_rec.gate_resident = 1;
+                    if (!routed_moe_decode_profile_record_event(
+                            DS4_ROCM_MOE_DECODE_PROFILE_GATE_RESIDENT_END,
+                            "IQ2 decode MoE profile resident gate/up end")) {
+                        return 0;
+                    }
+                }
+                double split_finish_t0 = 0.0;
+                if (iq2_decode_profile) split_finish_t0 = cuda_wall_sec();
                 if (!ok) {
                     (void)cuda_stream_selected_finish_pending_missing(0);
-                } else {
+                } else if (getenv("DS4_ROCM_V41_ENABLE_PARTIAL_GATEUP") == NULL) {
                     ok = cuda_stream_selected_finish_pending_missing(0);
+                } else {
+                    ok = cuda_stream_selected_finish_pending_gateup();
+                    static int logged_partial_gateup = 0;
+                    if (ok && !logged_partial_gateup) {
+                        logged_partial_gateup = 1;
+                        fprintf(stderr,
+                                "ds4: V4.1 split partial gate/up wait active\n");
+                    }
                 }
-                if (ok && use_v41_wave_gate) {
-                    moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
+                if (iq2_decode_profile) {
+                    g_moe_decode_profile_stats.split_finish_missing_ms +=
+                        (cuda_wall_sec() - split_finish_t0) * 1000.0;
+                }
+                if (ok && stream_missing_mask != 0u && iq2_decode_profile &&
+                    !routed_moe_decode_profile_record_event(
+                        DS4_ROCM_MOE_DECODE_PROFILE_GATE_MISSING_START,
+                        "IQ2 decode MoE profile missing gate/up start")) {
+                    return 0;
+                }
+                if (ok && stream_missing_mask != 0u && use_v41_wave_gate) {
+                    ds4_v41_launch_gate_up_wave_ptrs(
+                        ds4_rocm_v41_gate_waves(),
                         (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                         gate_slot_ptrs, up_slot_ptrs, xq,
                         (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
                         0, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
                         write_gate_up, stream_missing_mask, clamp);
-                } else if (ok && use_decode_lut_gate) {
+                } else if (ok && stream_missing_mask != 0u && use_decode_lut_gate) {
                     moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -1558,7 +1753,7 @@ static int routed_moe_launch(
                         write_gate_up,
                         stream_missing_mask,
                         clamp);
-                } else if (ok) {
+                } else if (ok && stream_missing_mask != 0u) {
                     moe_gate_up_mid_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -1576,10 +1771,37 @@ static int routed_moe_launch(
                         clamp);
                 }
                 if (ok) ok = cuda_ok(cudaGetLastError(), "routed_moe split missing gate/up launch");
+                if (!ok) {
+                    (void)cuda_stream_selected_finish_pending_missing(0);
+                }
+                if (iq2_decode_profile && ok && stream_missing_mask != 0u) {
+                    iq2_profile_rec.gate_missing = 1;
+                    if (!routed_moe_decode_profile_record_event(
+                            DS4_ROCM_MOE_DECODE_PROFILE_GATE_MISSING_END,
+                            "IQ2 decode MoE profile missing gate/up end")) {
+                        return 0;
+                    }
+                }
                 split_gateup_done = ok;
+                if (split_gateup_done &&
+                    getenv("DS4_ROCM_V41_SPLIT_DEBUG") != NULL) {
+                    static int logged_v41_split = 0;
+                    if (!logged_v41_split) {
+                        logged_v41_split = 1;
+                        fprintf(stderr,
+                                "ds4: ROCm V4.1 split resident/missing decode active "
+                                "(resident_mask=0x%x missing_mask=0x%x)\n",
+                                stream_resident_mask, stream_missing_mask);
+                    }
+                }
             } else {
                 ok = cuda_stream_selected_finish_pending_missing(
                         stream_resident_mask | stream_missing_mask);
+                /* finish_pending_missing(all) compacts both masks into the
+                 * selected cache and records a fresh upload event.  The wait
+                 * above only covered the pointer table from load, so join the
+                 * compact copy before the fallback kernels consume it. */
+                if (ok) ok = cuda_stream_selected_wait_upload_ready();
             }
         }
         if (ok && !split_gateup_done && !mmq_gateup_done) {
@@ -1854,8 +2076,8 @@ static int routed_moe_launch(
                 } else if (use_v41_wave_gate) {
                     // V4.1 scalar: raw IQ2 and existing Q8_K activation.
                     // Four waves own four output rows; each lane handles32 values.
-                    const dim3 v41_grid((expert_mid_dim + 3u) / 4u, n_expert);
-                    moe_v41_gate_up_wave_pairs_kernel<4><<<v41_grid, 128>>>(
+                    ds4_v41_launch_gate_up_wave_pairs(
+                        ds4_rocm_v41_gate_waves(),
                         (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                         gate_w, up_w, xq, (const int32_t *)selected_exec->ptr,
                         (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
@@ -1988,25 +2210,64 @@ static int routed_moe_launch(
             n_expert <= DS4_ROCM_N_EXPERT_USED;
         if (ok && !use_iq2_q2_float_down &&
             !use_iq2_q2_decode_float_down) {
+            if (iq2_decode_profile &&
+                !routed_moe_decode_profile_record_event(
+                    DS4_ROCM_MOE_DECODE_PROFILE_MID_QUANT_START,
+                    "IQ2 decode MoE profile mid quant start")) {
+                return 0;
+            }
             dim3 midq_grid(midq_blocks, pair_count, 1);
             q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, pair_count);
             ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
+            if (iq2_decode_profile && ok) {
+                iq2_profile_rec.mid_quant = 1;
+                if (!routed_moe_decode_profile_record_event(
+                        DS4_ROCM_MOE_DECODE_PROFILE_MID_QUANT_END,
+                        "IQ2 decode MoE profile mid quant end")) {
+                    return 0;
+                }
+            }
+        }
+        if (ok && split_gateup_done) {
+            const double down_wait_t0 =
+                iq2_decode_profile ? cuda_wall_sec() : 0.0;
+            ok = cuda_stream_selected_finish_pending_missing(0);
+            if (iq2_decode_profile) {
+                g_moe_decode_profile_stats.split_down_wait_ms +=
+                    (cuda_wall_sec() - down_wait_t0) * 1000.0;
+            }
         }
         int direct_iq2_down_done = 0;
         if (ok && use_v41_q8_down) {
+            if (iq2_decode_profile &&
+                !routed_moe_decode_profile_record_event(
+                    DS4_ROCM_MOE_DECODE_PROFILE_DOWN_START,
+                    "IQ2 decode MoE profile down start")) {
+                return 0;
+            }
             if (split_gateup_done) {
-                moe_v41_down_wave_ptrs_kernel<4><<<(out_dim + 3u) / 4u, 128>>>(
+                ds4_v41_launch_down_wave_ptrs(
+                    ds4_rocm_v41_down_waves(),
                     (float *)out->ptr, down_slot_ptrs, midq,
                     (const int32_t *)selected_exec->ptr, 0,
                     down_row_bytes, midq_blocks, out_dim, n_expert);
             } else {
-                moe_v41_down_wave<4><<<(out_dim + 3u) / 4u, 128>>>(
+                ds4_v41_launch_down_wave(
+                    ds4_rocm_v41_down_waves(),
                     (float *)out->ptr, down_w, midq,
                     (const int32_t *)selected_exec->ptr, down_expert_bytes,
                     down_row_bytes, midq_blocks, out_dim, n_expert);
             }
             ok = cuda_ok(cudaGetLastError(), "V4.1 quantized wave down launch");
             direct_iq2_down_done = ok;
+            if (iq2_decode_profile && ok) {
+                iq2_profile_rec.down = 1;
+                if (!routed_moe_decode_profile_record_event(
+                        DS4_ROCM_MOE_DECODE_PROFILE_DOWN_END,
+                        "IQ2 decode MoE profile down end")) {
+                    return 0;
+                }
+            }
         } else if (ok && use_iq2_q2_decode_float_down) {
             const ds4_rocm_runtime_config *runtime_cfg = cuda_runtime_config();
             uint32_t rows_per_block = runtime_cfg->moe_decode_down_rpb;
@@ -2330,6 +2591,12 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
+        if (iq2_decode_profile) {
+            const double collect_t0 = cuda_wall_sec();
+            if (!routed_moe_decode_profile_collect(&iq2_profile_rec)) ok = 0;
+            g_moe_decode_profile_stats.profile_collect_ms +=
+                (cuda_wall_sec() - collect_t0) * 1000.0;
+        }
         return ok;
     }
 

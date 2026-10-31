@@ -384,6 +384,15 @@ __global__ static void v41_indexer_scalar_warp8_kernel(
     }
     if (!lane) out[(uint64_t) row * width + key] = total;
 }
+enum {
+    V41_IX_DISP_WIDE_GEMM = 0,
+    V41_IX_DISP_WARP8_BATCH,
+    V41_IX_DISP_SCALAR_ONE,
+    V41_IX_DISP_SCALAR_BATCH,
+    V41_IX_DISP_COUNT
+};
+static void v41_ix_dispatch_note(int path, uint32_t source_rows, uint32_t rows,
+        uint32_t start, uint32_t ratio);
 extern "C" int ds4_gpu_dsv41_indexer_scores_one(ds4_gpu_tensor *scores,
         const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *keys, uint32_t source_rows) {
@@ -395,6 +404,7 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_one(ds4_gpu_tensor *scores,
         !cuda_tensor_has_f32(q, 32u * 128u) ||
         !cuda_tensor_has_f32(weights, 32u) ||
         !cuda_tensor_has_elems2(keys, source_rows, 128u, 4u)) return 0;
+    v41_ix_dispatch_note(V41_IX_DISP_SCALAR_ONE, source_rows, 1u, source_rows - 1u, 1u);
     v41_indexer_scalar_warp8_kernel<<<(source_rows + 7u) / 8u, 256>>>(
         (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
         (const float *)keys->ptr, source_rows, source_rows - 1u, 1u);
@@ -488,6 +498,52 @@ static int v41_indexer_head_gemm(float *out, const float *q, const float *weight
     return 1;
 }
 
+static unsigned long long v41_ix_dispatch_counts[V41_IX_DISP_COUNT];
+static unsigned char v41_ix_dispatch_seen[V41_IX_DISP_COUNT];
+static unsigned int v41_ix_dispatch_last_source[V41_IX_DISP_COUNT];
+static int v41_ix_dispatch_log_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_ROCM_V41_INDEXER_DISPATCH_LOG") != NULL ? 1 : 0;
+    return cached;
+}
+static void v41_ix_dispatch_report(void) {
+    if (!v41_ix_dispatch_log_enabled()) return;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX
+        "indexer dispatch counts wide_gemm=%llu warp8_batch=%llu scalar_one=%llu scalar_batch=%llu\n",
+        v41_ix_dispatch_counts[V41_IX_DISP_WIDE_GEMM],
+        v41_ix_dispatch_counts[V41_IX_DISP_WARP8_BATCH],
+        v41_ix_dispatch_counts[V41_IX_DISP_SCALAR_ONE],
+        v41_ix_dispatch_counts[V41_IX_DISP_SCALAR_BATCH]);
+}
+static void v41_ix_dispatch_note(int path, uint32_t source_rows, uint32_t rows,
+        uint32_t start, uint32_t ratio) {
+    if (!v41_ix_dispatch_log_enabled()) return;
+    static int registered = 0;
+    if (!registered) { registered = 1; atexit(v41_ix_dispatch_report); }
+    const unsigned long long count = ++v41_ix_dispatch_counts[path];
+    if (v41_ix_dispatch_seen[path] && v41_ix_dispatch_last_source[path] == source_rows) return;
+    static const char *const names[] = {"wide_head_gemm", "warp8_batch", "scalar_one", "scalar_batch"};
+    v41_ix_dispatch_seen[path] = 1u;
+    v41_ix_dispatch_last_source[path] = source_rows;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX
+        "indexer dispatch=%s count=%llu source_rows=%u rows=%u start=%u ratio=%u\n",
+        names[path], count, source_rows, rows, start, ratio);
+}
+#ifndef DS4_ROCM_V41_INDEXER_HEAD_WIDE_DEFAULT
+#define DS4_ROCM_V41_INDEXER_HEAD_WIDE_DEFAULT 0
+#endif
+static bool v41_indexer_wide_head_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        /* Opt-in wide-head qualification: keep the 64K default cap, extend
+         * the bounded head tile through the 128K ratio-one index width. */
+        const char *wide = getenv("DS4_ROCM_V41_INDEXER_HEAD_WIDE");
+        cached = wide ? (!strcmp(wide, "1") ? 1 : !strcmp(wide, "0") ? 0 : DS4_ROCM_V41_INDEXER_HEAD_WIDE_DEFAULT) : DS4_ROCM_V41_INDEXER_HEAD_WIDE_DEFAULT;
+        if (cached) fprintf(stderr, DS4_GPU_LOG_PREFIX "V4.1 indexer wide head active\n");
+    }
+    return cached;
+}
+
 extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
                                                   const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
                                                   uint32_t source_rows, uint32_t rows, uint32_t start, uint32_t ratio) {
@@ -500,15 +556,20 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores, const 
     if (ds4_rocm_is_gfx1151()) {
         /* Small query tiles favor wave scoring. GEMM uses a bounded head tile
          * only for the wide, nearly fully visible batches qualified here. */
+        const uint32_t head_cap = v41_indexer_wide_head_enabled() ? 131072u : 65536u;
         if (!g_quality_mode && g_cublas_ready && rows >= 31u && rows <= 32u &&
-            source_rows >= 16384u && source_rows <= 65536u &&
-            (start + 1u) / ratio >= source_rows - source_rows / 8u)
+            source_rows >= 16384u && source_rows <= head_cap &&
+            (start + 1u) / ratio >= source_rows - source_rows / 8u) {
+            v41_ix_dispatch_note(V41_IX_DISP_WIDE_GEMM, source_rows, rows, start, ratio);
             return v41_indexer_head_gemm((float *)scores->ptr, (const float *)q->ptr,
                 (const float *)weights->ptr, (const float *)keys->ptr, source_rows, rows, start, ratio);
+        }
+        v41_ix_dispatch_note(V41_IX_DISP_WARP8_BATCH, source_rows, rows, start, ratio);
         v41_indexer_batch_warp8_kernel<<<dim3((source_rows + 7u) / 8u, rows), 256u>>>(
             (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
             (const float *)keys->ptr, source_rows, start, ratio);
     } else {
+        v41_ix_dispatch_note(V41_IX_DISP_SCALAR_BATCH, source_rows, rows, start, ratio);
         v41_indexer_kernel<<<dim3(source_rows, rows), 128>>>((float *)scores->ptr, (const float *)q->ptr,
             (const float *)weights->ptr, (const float *)keys->ptr, source_rows, start, ratio);
     }
@@ -1279,6 +1340,52 @@ __global__ static void v41_q8_f32_blocks4_kernel(float *out,
     if (lane == 0u) out[row] = acc;
 }
 
+/* V4.1 shared-expert gate/up pair. Each warp owns one mid row and retains
+ * the scalar blocks4 lane ownership, per-lane dot boundary and wave32
+ * reduction tree. Rounding gate and up before SwiGLU preserves the two
+ * standalone BF16 boundaries; the final rounding is the old mid BF16 pass. */
+__global__ static void v41_q8_f32_pair_swiglu_bf16_kernel(
+        float *gate_out, float *up_out, float *mid_out,
+        const unsigned char *gate_weights, const unsigned char *up_weights,
+        const float *input, uint32_t width, uint32_t outputs,
+        uint64_t row_bytes, float clamp) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (row >= outputs) return;
+    const uint32_t blocks = width / 32u;
+    float acc_g = 0.0f, acc_u = 0.0f;
+    for (uint32_t b = lane / 8u; b < blocks; b += 4u) {
+        const unsigned char *pg = gate_weights + row * row_bytes + (uint64_t)b * 34u;
+        const unsigned char *pu = up_weights + row * row_bytes + (uint64_t)b * 34u;
+        const float dg = q8_0_scale_scalar(pg);
+        const float du = q8_0_scale_scalar(pu);
+        const uint32_t j = (lane & 7u) * 4u;
+        float value_g = 0.0f, value_u = 0.0f;
+#pragma unroll
+        for (uint32_t k = 0; k < 4u; k++) {
+            const float x = input[b * 32u + j + k];
+            value_g += (float)((const int8_t *)(pg + 2u))[j + k] * x;
+            value_u += (float)((const int8_t *)(pu + 2u))[j + k] * x;
+        }
+        acc_g += dg * value_g;
+        acc_u += du * value_u;
+    }
+    float g = warp_sum_f32(acc_g);
+    float u = warp_sum_f32(acc_u);
+    if (lane == 0u) {
+        g = v41_bf16(g);
+        u = v41_bf16(u);
+        gate_out[row] = g;
+        up_out[row] = u;
+        if (clamp > 1.0e-6f) {
+            g = fminf(g, clamp);
+            u = fminf(fmaxf(u, -clamp), clamp);
+        }
+        const float s = g / (1.0f + expf(-g));
+        mid_out[row] = v41_bf16(s * u * 1.0f);
+    }
+}
+
 /* DSpark verifies two to six consecutive rows.  Reuse each packed Q8 block
  * across all rows while preserving the scalar blocks4 lane ownership,
  * per-lane dot boundary and wave32 reduction tree.  GROUPS supports the
@@ -1408,6 +1515,34 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
             (float *)out->ptr, weights, (const float *)in->ptr, width, outputs, rows, width / 32u);
     }
     return cuda_ok(cudaGetLastError(), "V4.1 F32-input Q8 projection");
+}
+
+extern "C" int ds4_gpu_dsv41_shared_gate_up_swiglu_bf16_rows(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset,
+        uint32_t width, uint32_t outputs, const ds4_gpu_tensor *in,
+        float clamp) {
+    uint64_t weight_bytes = 0;
+    if (!gate || !up || !mid || !model_map || !in || !width || width % 32u ||
+        !outputs || !ds4_rocm_is_gfx1151() ||
+        !cuda_u64_mul3_checked(width / 32u, outputs, 34u, &weight_bytes) ||
+        !cuda_model_range_fits(model_size, gate_offset, weight_bytes) ||
+        !cuda_model_range_fits(model_size, up_offset, weight_bytes) ||
+        !cuda_tensor_has_elems2(in, width, 1u, 4u) ||
+        !cuda_tensor_has_elems2(gate, outputs, 1u, 4u) ||
+        !cuda_tensor_has_elems2(up, outputs, 1u, 4u) ||
+        !cuda_tensor_has_elems2(mid, outputs, 1u, 4u)) return 0;
+    const unsigned char *gw = (const unsigned char *)cuda_model_range_ptr(
+        model_map, gate_offset, weight_bytes, "V4.1 shared gate Q8");
+    const unsigned char *uw = (const unsigned char *)cuda_model_range_ptr(
+        model_map, up_offset, weight_bytes, "V4.1 shared up Q8");
+    if (!gw || !uw) return 0;
+    v41_q8_f32_pair_swiglu_bf16_kernel<<<(outputs + 7u) / 8u, 256u>>>(
+        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+        gw, uw, (const float *)in->ptr, width, outputs,
+        (uint64_t)(width / 32u) * 34u, clamp);
+    return cuda_ok(cudaGetLastError(), "V4.1 shared gate/up pair");
 }
 
 /* V4.1 grouped output-A: retain physical token strides while using the
@@ -1541,6 +1676,24 @@ __global__ static void v41_grouped_q8_f32_blocks4_kernel(
     if (!lane) out[row] = acc;
 }
 
+static bool v41_attn_low_m256_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        /* Default-on after two paired 2K/8K/32K A/B cycles; opt out for old tile. */
+        cached = getenv("DS4_ROCM_V41_DISABLE_ATTN_LOW_M256") != NULL ? 0 : 1;
+    }
+    return cached;
+}
+
+static bool v41_attn_out_pad8_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        /* Default-on after the 2K/8K/32K paired A/B; opt out for the old tile. */
+        cached = getenv("DS4_ROCM_V41_DISABLE_ATTN_OUT_PAD8") != NULL ? 0 : 1;
+    }
+    return cached;
+}
+
 extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
         const ds4_gpu_tensor *heads, uint32_t n_tokens) {
@@ -1568,9 +1721,20 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
         /* Canonical eight groups of 4096 -> 1024, with physical F32 token
          * strides32768/8192. Keep the explicit BF16 low boundary below. */
-        v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u><<<dim3(8u, (n_tokens + 63u) / 64u, 8u), 256u>>>(
-            (float *)low->ptr, a, (const float *)heads->ptr,
-            n_tokens, 4096u, 1024u, UINT64_C(128) * 34u);
+        if (v41_attn_low_m256_enabled()) {
+            static bool low_m256_logged = false;
+            if (!low_m256_logged) {
+                low_m256_logged = true;
+                fprintf(stderr, "ds4: V4.1 attention low-A m256 tile active\n");
+            }
+            v41_grouped_q8_f32_wmma_rowtile_kernel<256u, 16u><<<dim3(4u, (n_tokens + 63u) / 64u, 8u), 512u>>>(
+                (float *)low->ptr, a, (const float *)heads->ptr,
+                n_tokens, 4096u, 1024u, UINT64_C(128) * 34u);
+        } else {
+            v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u><<<dim3(8u, (n_tokens + 63u) / 64u, 8u), 256u>>>(
+                (float *)low->ptr, a, (const float *)heads->ptr,
+                n_tokens, 4096u, 1024u, UINT64_C(128) * 34u);
+        }
     } else if (n_tokens >= 32u && ds4_rocm_is_gfx1151()) {
         cuda_launch_grouped_q8_a_sharedx((float *)low->ptr, a, (const float *)heads->ptr,
             n_tokens, 8u, 128u, 1024u, 128u * 34u, 8u, 8u, 8u);
@@ -1588,9 +1752,20 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
         /* Keep the BF16 boundary above and use the existing generic bulk
          * matrix path: F16-rounded operands with F32 accumulation. */
-        matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u><<<dim3(40u, (n_tokens + 63u) / 64u), 256u>>>(
-            (float *)out->ptr, b, (const float *)low->ptr,
-            n_tokens, 8192u, 5120u, UINT64_C(256) * 34u);
+        if (v41_attn_out_pad8_enabled()) {
+            static bool pad8_logged = false;
+            if (!pad8_logged) {
+                pad8_logged = true;
+                fprintf(stderr, "ds4: V4.1 attention output-B pad8 tile active\n");
+            }
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u, 8u><<<dim3(40u, (n_tokens + 63u) / 64u), 256u>>>(
+                (float *)out->ptr, b, (const float *)low->ptr,
+                n_tokens, 8192u, 5120u, UINT64_C(256) * 34u);
+        } else {
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u><<<dim3(40u, (n_tokens + 63u) / 64u), 256u>>>(
+                (float *)out->ptr, b, (const float *)low->ptr,
+                n_tokens, 8192u, 5120u, UINT64_C(256) * 34u);
+        }
     } else if (n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
         /* Keep the existing BF16-rounded low rows and reuse sixteen tokens. */
         cuda_launch_q8_batch_sharedx((float *)out->ptr, b, (const float *)low->ptr,
@@ -1729,7 +1904,8 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
     const char *const *slots = (const char *const *)table->ptr;
     if (ok) {
         if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
-            moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3(576u, used), 128>>>(
+            ds4_v41_launch_gate_up_wave_ptrs(
+                ds4_rocm_v41_gate_waves(),
                 (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                 slots, slots + experts, xq, (const int32_t *)selected->ptr,
                 (const float *)weights->ptr, 0, gate_row, 20u, 2304u, used,
@@ -1750,7 +1926,8 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
                 midq, (const float *)mid->ptr, 2304u, used);
             ok = cuda_ok(cudaGetLastError(), "V4.1 TP mid quantization");
             if (ok) {
-                moe_v41_down_wave_ptrs_kernel<4><<<1280u, 128>>>(
+                ds4_v41_launch_down_wave_ptrs(
+                    ds4_rocm_v41_down_waves(),
                     (float *)out->ptr, slots + 2u * experts, midq,
                     (const int32_t *)selected->ptr, 0, down_row, 9u, 5120u, used);
                 ok = cuda_ok(cudaGetLastError(), "V4.1 TP quantized wave down");

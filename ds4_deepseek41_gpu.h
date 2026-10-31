@@ -196,6 +196,13 @@ int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out,
                                     uint64_t weight_offset, uint32_t width,
                                     uint32_t outputs, uint32_t rows,
                                     const ds4_gpu_tensor *in);
+/* Single-row shared gate/up pair with the standalone BF16 boundaries. */
+int ds4_gpu_dsv41_shared_gate_up_swiglu_bf16_rows(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset,
+        uint32_t width, uint32_t outputs, const ds4_gpu_tensor *in,
+        float clamp);
 #endif
 
 #ifdef __cplusplus

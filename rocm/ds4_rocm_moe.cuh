@@ -3143,6 +3143,183 @@ template<int Waves> __global__ void moe_v41_down_wave_ptrs_kernel(
     if (!lane) out[row] = total;
 }
 
+/* Six-slot decode specialization: hoist every expert pointer load ahead of
+ * the block loop so the six dependent table lookups overlap.  The per-slot
+ * accumulation order and the final warp reduction are unchanged, keeping the
+ * result bit-identical to moe_v41_down_wave_ptrs_kernel. */
+template<int Waves> __global__ void moe_v41_down_wave_ptrs6_kernel(
+        float *out, const char *const * table, const cuda_block_q8_K *xq,
+        const int32_t *ids, uint64_t eb, uint64_t rb, unsigned B, unsigned M) {
+    unsigned lane = threadIdx.x & 31, row = blockIdx.x * Waves + (threadIdx.x >> 5);
+    if (row >= M) return;
+    const char *base[6];
+#pragma unroll
+    for (unsigned slot = 0; slot < 6u; slot++) {
+        int id = ids[slot];
+        if (id < 0) id = 0;
+        base[slot] = table[id];
+    }
+    float total = 0;
+#pragma unroll
+    for (unsigned slot = 0; slot < 6u; slot++) {
+        if (!base[slot]) continue;
+        auto *w = (const cuda_block_q2_K *) (base[slot] + row * rb);
+        auto *x = xq + (uint64_t) slot * B;
+        for (unsigned b = lane >> 3; b < B; b += 4) total += v41_q2_part32(w + b, x + b, lane & 7);
+    }
+    total = warp_sum_f32(total);
+    if (!lane) out[row] = total;
+}
+
+/* Decode occupancy selectors. The wave count changes only how many rows one
+ * block owns; per-row lane math and reduction order are unchanged. */
+static int ds4_rocm_v41_wave_env(const char *name) {
+    static int cached[2] = {-1, -1};
+    const int which = name && strstr(name, "DOWN") ? 1 : 0;
+    if (cached[which] >= 0) return cached[which];
+    int waves = 4;
+    const char *e = name ? getenv(name) : NULL;
+    if (e && e[0]) {
+        long v = strtol(e, NULL, 10);
+        if (v == 2 || v == 4 || v == 8) waves = (int)v;
+    }
+    cached[which] = waves;
+    return waves;
+}
+static int ds4_rocm_v41_gate_waves(void) {
+    static int logged = 0;
+    const int waves = ds4_rocm_v41_wave_env("DS4_ROCM_V41_GATE_WAVES");
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr, "ds4: V4.1 decode gate/up waves=%d\n", waves);
+    }
+    return waves;
+}
+static int ds4_rocm_v41_down_waves(void) {
+    static int logged = 0;
+    const int waves = ds4_rocm_v41_wave_env("DS4_ROCM_V41_DOWN_WAVES");
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr, "ds4: V4.1 decode down waves=%d\n", waves);
+    }
+    return waves;
+}
+static int ds4_rocm_v41_down_preload6(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_ROCM_V41_DOWN_PRELOAD6") != NULL ? 1 : 0;
+        fprintf(stderr, "ds4: V4.1 decode down preload6=%d\n", cached);
+    }
+    return cached;
+}
+
+static void ds4_v41_launch_gate_up_wave_pairs(
+        int waves, float *gate_out, float *up_out, float *mid_out,
+        const char *gb, const char *ub, const cuda_block_q8_K *xq,
+        const int32_t *ids, const float *weights, uint64_t eb, uint64_t rb,
+        uint32_t B, uint32_t M, uint32_t N, uint32_t aux, uint32_t mask,
+        float clamp) {
+    switch (waves) {
+    case 2:
+        moe_v41_gate_up_wave_pairs_kernel<2><<<dim3((M + 1u) / 2u, N), 64>>>(
+            gate_out, up_out, mid_out, gb, ub, xq, ids, weights, eb, rb,
+            B, M, N, aux, mask, clamp);
+        break;
+    case 8:
+        moe_v41_gate_up_wave_pairs_kernel<8><<<dim3((M + 7u) / 8u, N), 256>>>(
+            gate_out, up_out, mid_out, gb, ub, xq, ids, weights, eb, rb,
+            B, M, N, aux, mask, clamp);
+        break;
+    default:
+        moe_v41_gate_up_wave_pairs_kernel<4><<<dim3((M + 3u) / 4u, N), 128>>>(
+            gate_out, up_out, mid_out, gb, ub, xq, ids, weights, eb, rb,
+            B, M, N, aux, mask, clamp);
+        break;
+    }
+}
+
+static void ds4_v41_launch_gate_up_wave_ptrs(
+        int waves, float *gate_out, float *up_out, float *mid_out,
+        const char *const *gt, const char *const *ut, const cuda_block_q8_K *xq,
+        const int32_t *ids, const float *weights, uint64_t eb, uint64_t rb,
+        uint32_t B, uint32_t M, uint32_t N, uint32_t aux, uint32_t mask,
+        float clamp) {
+    switch (waves) {
+    case 2:
+        moe_v41_gate_up_wave_ptrs_kernel<2><<<dim3((M + 1u) / 2u, N), 64>>>(
+            gate_out, up_out, mid_out, gt, ut, xq, ids, weights, eb, rb,
+            B, M, N, aux, mask, clamp);
+        break;
+    case 8:
+        moe_v41_gate_up_wave_ptrs_kernel<8><<<dim3((M + 7u) / 8u, N), 256>>>(
+            gate_out, up_out, mid_out, gt, ut, xq, ids, weights, eb, rb,
+            B, M, N, aux, mask, clamp);
+        break;
+    default:
+        moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((M + 3u) / 4u, N), 128>>>(
+            gate_out, up_out, mid_out, gt, ut, xq, ids, weights, eb, rb,
+            B, M, N, aux, mask, clamp);
+        break;
+    }
+}
+
+static void ds4_v41_launch_down_wave(
+        int waves, float *out, const char *base, const cuda_block_q8_K *xq,
+        const int32_t *ids, uint64_t eb, uint64_t rb, unsigned B, unsigned M,
+        unsigned N) {
+    switch (waves) {
+    case 2:
+        moe_v41_down_wave<2><<<dim3((M + 1u) / 2u), 64>>>(
+            out, base, xq, ids, eb, rb, B, M, N);
+        break;
+    case 8:
+        moe_v41_down_wave<8><<<dim3((M + 7u) / 8u), 256>>>(
+            out, base, xq, ids, eb, rb, B, M, N);
+        break;
+    default:
+        moe_v41_down_wave<4><<<dim3((M + 3u) / 4u), 128>>>(
+            out, base, xq, ids, eb, rb, B, M, N);
+        break;
+    }
+}
+
+static void ds4_v41_launch_down_wave_ptrs(
+        int waves, float *out, const char *const *table, const cuda_block_q8_K *xq,
+        const int32_t *ids, uint64_t eb, uint64_t rb, unsigned B, unsigned M,
+        unsigned N) {
+    if (N == 6u && ds4_rocm_v41_down_preload6()) {
+        switch (waves) {
+        case 2:
+            moe_v41_down_wave_ptrs6_kernel<2><<<dim3((M + 1u) / 2u), 64>>>(
+                out, table, xq, ids, eb, rb, B, M);
+            break;
+        case 8:
+            moe_v41_down_wave_ptrs6_kernel<8><<<dim3((M + 7u) / 8u), 256>>>(
+                out, table, xq, ids, eb, rb, B, M);
+            break;
+        default:
+            moe_v41_down_wave_ptrs6_kernel<4><<<dim3((M + 3u) / 4u), 128>>>(
+                out, table, xq, ids, eb, rb, B, M);
+            break;
+        }
+        return;
+    }
+    switch (waves) {
+    case 2:
+        moe_v41_down_wave_ptrs_kernel<2><<<dim3((M + 1u) / 2u), 64>>>(
+            out, table, xq, ids, eb, rb, B, M, N);
+        break;
+    case 8:
+        moe_v41_down_wave_ptrs_kernel<8><<<dim3((M + 7u) / 8u), 256>>>(
+            out, table, xq, ids, eb, rb, B, M, N);
+        break;
+    default:
+        moe_v41_down_wave_ptrs_kernel<4><<<dim3((M + 3u) / 4u), 128>>>(
+            out, table, xq, ids, eb, rb, B, M, N);
+        break;
+    }
+}
+
 __global__ static void moe_down_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,

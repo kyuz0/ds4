@@ -104,3 +104,27 @@ ds4-kernel-v41-tp-gates
 /tests/test_halo_shapes
 
 /ds4-kernel-halo-moe
+
+# Generated artifacts
+findings/
+.rocprofv3/
+*.log
+*.status
+*.pid
+*.lock
+
+# Build artifacts
+*.o
+*.hipv4-amdgcn-*
+*.host-x86_64-*
+/ds4-kernel-v41
+
+# Local / historical notes
+/NOTE.md
+/RESULTS.md
+/STATE.md
+
+# Historical benchmark scripts
+/bench-*-ab.sh
+/profile-*.sh
+/smoke-compact-*.sh
