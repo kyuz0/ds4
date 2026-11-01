@@ -43580,6 +43580,18 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
         !getenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP") &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) return remaining;
 #endif
+#ifdef DS4_ROCM_BUILD
+    {
+        /* Like the CUDA medium sweep, but ROCm has no short-prefill fallback by
+         * default, so a tail below 256 tokens joins the sweep instead of being
+         * decoded one token at a time. 0 = off, 1 = CUDA rule, 2 = default. */
+        const char *medium = getenv("DS4_ROCM_V41_MEDIUM_SWEEP");
+        const long mode = medium && medium[0] ? strtol(medium, NULL, 10) : 2;
+        if (mode > 0 && g->streaming && g->tp_world == 1 && g->prefill_cap >= 2048u &&
+            g->carry_cap >= remaining && remaining > 2048u && remaining < 8192u &&
+            (mode >= 2 || remaining % 2048u >= 256u)) return remaining;
+    }
+#endif
     if (g->carry_cap && remaining >= 4096u &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) {
         const uint32_t count = remaining < g->carry_cap ? remaining : g->carry_cap;
@@ -44403,9 +44415,33 @@ static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int c
     return largest->prefill_cap >= (uint32_t)count ? largest : NULL;
 }
 
-#if !defined(DS4_ROCM_BUILD)
+#ifdef DS4_ROCM_BUILD
+/* ROCm short SSD appends: rows per batched step (DS4_ROCM_V41_SHORT_PREFILL,
+ * default 6, 0 = off). Below 256 tokens an SSD append cannot afford a full
+ * layer sweep, and decoding it one token at a time runs at generation speed.
+ * Six rows match the DSpark verifier's gfx1151 tiny-batch kernels; generic
+ * kernels at eight rows measured no faster than one token at a time. */
+static uint32_t ds41_rocm_short_prefill_rows(void) {
+    const char *env = getenv("DS4_ROCM_V41_SHORT_PREFILL");
+    if (!env || !env[0]) return 6u;
+    const long v = strtol(env, NULL, 10);
+    if (v < 2) return 0;
+    return v > (long)DS4_TP_BATCH_MAX_ROWS ? DS4_TP_BATCH_MAX_ROWS : (uint32_t)v;
+}
+#endif
+
 static bool ds41_cuda_row_batch_supported(const ds41_gpu_graph *g, const ds4_weights *w) {
-#ifndef __APPLE__
+#ifdef DS4_ROCM_BUILD
+    if (!ds41_rocm_short_prefill_rows() || !g->streaming || g->tp_world != 1 ||
+        g->quality || g->imatrix || g->image_count || g->draft) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (l->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
+            l->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
+            l->ffn_down_exps->type != DS4_TENSOR_Q2_K) return false;
+    }
+    return true;
+#elif !defined(__APPLE__)
     const bool placement = (g->streaming && g->tp_world == 1) ||
         (!g->streaming && g->tp_world == 2);
     if (!placement || g->quality || g->imatrix || g->image_count ||
@@ -44431,9 +44467,13 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
         return 0;
     if (g->tp_world == 2 && (!ds41_tp_batch_enabled(g) ||
         getenv("DS4_METAL_DISABLE_V41_TP_SMALL_PREFILL"))) return 0;
-    return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
-}
+#ifdef DS4_ROCM_BUILD
+    const uint32_t cap = ds41_rocm_short_prefill_rows();
+#else
+    const uint32_t cap = DS4_TP_BATCH_MAX_ROWS;
 #endif
+    return remaining < cap ? remaining : cap;
+}
 
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
@@ -44878,21 +44918,27 @@ static bool ds41_draft_rollback(ds41_gpu_graph *g, const int *tokens,
     return ok;
 }
 
-#if !defined(DS4_ROCM_BUILD)
 static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_weights *w, const int *tokens, uint32_t count) {
     if (!g->valid || count < 2u || count > DS4_TP_BATCH_MAX_ROWS ||
         g->pos > g->ctx || count > g->ctx - g->pos) return false;
     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
     for (uint32_t i = 0; i < count; i++) graphs[i] = g;
+#ifdef DS4_ROCM_BUILD
+    /* The DSpark verifier's gfx1151 tiny-batch kernels cover two to six rows. */
+    const bool tiny_kernels = count <= 6u;
+    if (tiny_kernels) ds4_gpu_set_dspark_verify_mode(true);
+#endif
     bool ok = ds4_gpu_begin_commands() && ds41_graph_step_batch(graphs, tokens,
         (int)count, count, m, w);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+#ifdef DS4_ROCM_BUILD
+    if (tiny_kernels) ds4_gpu_set_dspark_verify_mode(false);
+#endif
     if (!ok) g->valid = false;
     return ok;
 }
-#endif /* Metal native session batching */
 #undef DS41_ENGRAM_GPU_PREFETCH_ROWS
 #undef DS41_INDEX_PACKED_WORDS
 #include "ds4_deepseek41_dspark.h"
@@ -79334,12 +79380,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             const uint32_t remaining = (uint32_t)(prompt->len - i);
             if (g->encoder_resident && remaining < 768u)
                 ds41_encoder_release(g, &e->model, &encoder);
-#ifdef DS4_ROCM_BUILD
-            const uint32_t short_count = 0;
-#else
             const uint32_t short_count = decoder_pending ? 0u :
                 ds41_short_prefill_count(g, &e->weights, remaining);
-#endif
             const uint32_t count = short_count ? short_count : g->encoder_resident ?
                 (remaining - 512u < g->prefill_cap ? remaining - 512u : g->prefill_cap) :
                 ds41_prefill_count(g, remaining);
@@ -79351,10 +79393,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * remainder finishes the pending decoder here, then runs normally. */
             const bool layer_major = count > 1u;
             const bool ok =
-#ifndef DS4_ROCM_BUILD
                 short_count ?
                 ds41_graph_short_prefill(g, &e->model, &e->weights, prompt->v + i, count) :
-#endif
                 layer_major ?
                 (defer_decoder || decoder_pending ?
                  ds41_graph_prefill_sweep(g, &e->model, &e->weights, prompt->v + i, count,

@@ -81,6 +81,32 @@ Native `ds4-bench`, 76 GiB expert-cache request, 34,816 allocated context, 128 g
 - Cache admission depends on available RAM, context and sessions; images may need a smaller cache. The GPU-visible limit shares system RAM and is not a cache budget. Populated 256K is unqualified.
 - Resident/SSD image and cache checks pass; see [quality results](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151). Image inputs are excluded from text timing.
 
+### Short and medium SSD appends
+
+Agent turns append small tool results and user messages to a warm session. With SSD streaming, ROCm used to handle an append in two ways: below 256 tokens it decoded the append one token at a time, at generation speed; from 256 tokens it ran layer sweeps of up to 2,048 rows, and decoded any remainder below 256 tokens one token at a time.
+
+- **Short appends (2 to 255 tokens)** now run as batched steps of six rows on the DSpark verifier's gfx1151 tiny-batch kernels, as CUDA does for SSD streaming. `DS4_ROCM_V41_SHORT_PREFILL=0` restores token-major decode; another value from 2 to 8 sets the rows per step (eight rows use the generic kernels and measured no faster than token-major decode).
+- **Medium appends (2,049 to 8,191 tokens)** now run as one layer sweep, tail included, instead of a 2,048-row sweep plus a token-major tail. `DS4_ROCM_V41_MEDIUM_SWEEP=0` restores the old split; `1` applies the CUDA rule (tail of at least 256 tokens).
+
+Measured on a 128 GB Strix Halo with a Lexar NQ790 2 TB (PCIe 4.0 ×4, btrfs), `--ssd-streaming --ssd-streaming-cache-experts 84GB --ctx 262144`, Q2 `DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix`, warm chat session of about 40K tokens, server `prompt done` time in seconds, mean of the same two appends before and after:
+
+| Appended tokens | Before | After |
+|---:|---:|---:|
+| 29, 31 | 4.2 | 3.3 |
+| 46, 56 | 6.1 | 4.4 |
+| 79, 84 | 9.1 | 6.3 |
+| 133, 153 | 16.2 | 10.3 |
+| 220, 231 | 26.5 | 17.1 |
+| 565, 592 | 16.8 | 17.3 |
+| 1,197, 1,243 | 16.7 | 17.2 |
+| 1,813, 2,075 | 20.2 | 19.9 |
+| 3,105, 3,257 | 37.8 | 29.9 |
+
+Appends of 565 to 1,813 tokens take unchanged paths; their spread is run-to-run noise.
+
+- Medium sweep: frontier logits are bit-identical to the old split (`ds4-bench`, 3,105-token appends from 20,000 tokens, 4 frontiers).
+- Short prefill: argmax identical at every frontier, KL 3e-8 to 2e-7 against token-major decode (231-token appends, 4 frontiers). For scale, routing the same 231-token appends through a layer sweep instead of token-major decode differs by KL 1e-8 to 1e-6. Two control runs are bit-identical.
+
 ### Run text or vision
 
 ```bash
