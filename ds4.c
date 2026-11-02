@@ -80366,14 +80366,15 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 /* Reclaim the prefill expert reserve as dynamic decode cache once prefill has
  * finished. The streaming slab grows lazily and is free-memory guarded, so this
  * can only use memory that is genuinely available; nothing is pre-allocated.
- * Promoted: on by default, opt out with
- * DS4_ROCM_V41_GROW_CACHE_AFTER_PREFILL=0. */
+ * Opt-in: DS4_ROCM_V41_GROW_CACHE_AFTER_PREFILL=1. The earlier +5-10% was
+ * DVFS drift between arms; a clock-soaked A/B shows +0.6% with overlapping
+ * ranges and ~4% slower 4K appends, so this stays off until re-measured. */
 static void ds41_stream_grow_cache_after_prefill(ds4_session *s) {
     static bool grown;
     ds4_engine *e = s ? s->engine : NULL;
     if (grown || !e || !e->ssd_streaming) return;
     const char *env = getenv("DS4_ROCM_V41_GROW_CACHE_AFTER_PREFILL");
-    if (env != NULL && env[0] == '0' && env[1] == '\0') return;  /* opt-out */
+    if (env == NULL || (env[0] == '0' && env[1] == '\0')) return;  /* opt-in */
     grown = true;
     if (e->ssd_streaming_cache_bytes == 0 || e->ssd_streaming_prefill_headroom_bytes == 0) return;
     const uint64_t budget = ds4_add_sat_u64(e->ssd_streaming_cache_bytes,
