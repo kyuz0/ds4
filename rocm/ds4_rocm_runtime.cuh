@@ -5348,12 +5348,10 @@ static int cuda_stream_selected_finish_pending_gateup(void) {
     cuda_stream_read_job *jobs = g_stream_selected_pending.read_jobs;
     const uint32_t count = g_stream_selected_pending.read_job_count;
     pthread_mutex_lock(&g_stream_read_mutex);
-    if (g_stream_read_active_jobs != jobs) {
-        pthread_mutex_unlock(&g_stream_read_mutex);
-        fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "streaming selected gate/up wait received inactive job set\n");
-        return 0;
-    }
+    /* A different read batch can own the workers at this point (the full-layer
+     * loader, or an engram prefetch). Our jobs stay queued in that case, and
+     * the workers broadcast on every completion, so waiting on our own jobs is
+     * correct: the pointer check only distinguishes who is currently active. */
     for (;;) {
         int waiting = 0;
         for (uint32_t i = 0; i < count; i++) {
