@@ -538,10 +538,21 @@ static int routed_moe_q2_float_down_launch(
                 const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
                                         (mt * bm * bn) * sizeof(float) + 2u * bn * 84u;
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
-                            NULL, down_h, down_w, NULL, mid_h_hot,
-                            counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
-                            expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
+                    /* Opt-in: hold the next weight chunk in registers while the
+                     * current one dequantises (bit-identical values). */
+                    static const bool down_prefetch =
+                        getenv("DS4_ROCM_V41_DOWN_PREFETCH") != NULL;
+                    if (down_prefetch) {
+                        moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true,false,true><<<grid, block, shmem_n2>>>(
+                                NULL, down_h, down_w, NULL, mid_h_hot,
+                                counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
+                                expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
+                    } else {
+                        moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                                NULL, down_h, down_w, NULL, mid_h_hot,
+                                counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
+                                expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
+                    }
                 } else if (use_f16_down) {
                     moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,false,true><<<grid, block, shmem_n2>>>(
                             NULL, down_h, down_w, (const float *)mid->ptr, NULL,

@@ -5487,7 +5487,7 @@ __global__ static void moe_down_q2K_hotlist_wmma_kernel(
     }
 }
 
-template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool MID_F16=false, bool OUT_F16=false, bool SLOT_MAJOR=false>
+template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool MID_F16=false, bool OUT_F16=false, bool SLOT_MAJOR=false, bool PREFETCH=false>
 __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         float *down_out,
         half *down_out_h,
@@ -5544,20 +5544,68 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     }
 
     const unsigned char *dew = (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
-    for (uint32_t kb = 0; kb < expert_mid_dim; kb += 256u) {
-        for (uint32_t j = tid; j < RAW_ROWS * RAW_DWORDS; j += blockDim.x) {
-            const uint32_t row_local = j / RAW_DWORDS;
-            const uint32_t word = j - row_local * RAW_DWORDS;
-            const uint32_t row = n0 + row_local;
+    /* Opt-in register prefetch (GEMM-article step 7): keep the next 256-K
+     * chunk's raw words in registers while the current chunk dequantises and
+     * issues its mma, then flush them at the next barrier. Values and
+     * accumulation order are untouched, so the result is bit-identical. */
+    constexpr uint32_t PRE_VEC = 128u;
+    constexpr uint32_t PRE_N = (RAW_ROWS * RAW_DWORDS + PRE_VEC - 1u) / PRE_VEC;
+    uint32_t pre[PRE_N];
+    if constexpr (PREFETCH) {
+        for (uint32_t i = 0; i < PRE_N; ++i) {
+            const uint32_t j = tid + i * PRE_VEC;
             uint32_t v = 0u;
-            if (row < out_dim) {
-                const unsigned char *blk = dew + (uint64_t)row * down_row_bytes +
-                                           (uint64_t)(kb >> 8u) * 84u;
-                v = *reinterpret_cast<const uint32_t *>(blk + word * sizeof(uint32_t));
+            if (j < RAW_ROWS * RAW_DWORDS) {
+                const uint32_t row_local = j / RAW_DWORDS;
+                const uint32_t word = j - row_local * RAW_DWORDS;
+                const uint32_t row = n0 + row_local;
+                if (row < out_dim) {
+                    const unsigned char *blk = dew + (uint64_t)row * down_row_bytes;
+                    v = *reinterpret_cast<const uint32_t *>(blk + word * sizeof(uint32_t));
+                }
             }
-            shW[j] = v;
+            pre[i] = v;
         }
-        __syncthreads();
+    }
+    for (uint32_t kb = 0; kb < expert_mid_dim; kb += 256u) {
+        if constexpr (PREFETCH) {
+            for (uint32_t i = 0; i < PRE_N; ++i) {
+                const uint32_t j = tid + i * PRE_VEC;
+                if (j < RAW_ROWS * RAW_DWORDS) shW[j] = pre[i];
+            }
+            __syncthreads();
+            if (kb + 256u < expert_mid_dim) {
+                for (uint32_t i = 0; i < PRE_N; ++i) {
+                    const uint32_t j = tid + i * PRE_VEC;
+                    uint32_t v = 0u;
+                    if (j < RAW_ROWS * RAW_DWORDS) {
+                        const uint32_t row_local = j / RAW_DWORDS;
+                        const uint32_t word = j - row_local * RAW_DWORDS;
+                        const uint32_t row = n0 + row_local;
+                        if (row < out_dim) {
+                            const unsigned char *blk = dew + (uint64_t)row * down_row_bytes +
+                                                       (uint64_t)((kb + 256u) >> 8u) * 84u;
+                            v = *reinterpret_cast<const uint32_t *>(blk + word * sizeof(uint32_t));
+                        }
+                    }
+                    pre[i] = v;
+                }
+            }
+        } else {
+            for (uint32_t j = tid; j < RAW_ROWS * RAW_DWORDS; j += blockDim.x) {
+                const uint32_t row_local = j / RAW_DWORDS;
+                const uint32_t word = j - row_local * RAW_DWORDS;
+                const uint32_t row = n0 + row_local;
+                uint32_t v = 0u;
+                if (row < out_dim) {
+                    const unsigned char *blk = dew + (uint64_t)row * down_row_bytes +
+                                               (uint64_t)(kb >> 8u) * 84u;
+                    v = *reinterpret_cast<const uint32_t *>(blk + word * sizeof(uint32_t));
+                }
+                shW[j] = v;
+            }
+            __syncthreads();
+        }
 
         for (uint32_t krel = 0; krel < 256u && kb + krel < expert_mid_dim; krel += BK) {
             const uint32_t k0 = kb + krel;

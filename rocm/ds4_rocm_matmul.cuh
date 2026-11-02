@@ -611,7 +611,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             out_dim >= 1024u &&
             n_tok >= 256u &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
-            if (out_dim >= 8192u) {
+            /* Opt-in: use the 256-column / 16-row WMMA tile for every projection
+             * at or above 1024 outputs, not just the >=8192 ones. Tile order
+             * changes, so results move by ~1 ULP; verify with the shape gate. */
+            static const bool q8_wide_tile =
+                getenv("DS4_ROCM_Q8_WIDE_TILE") != NULL;
+            if (out_dim >= (q8_wide_tile ? 1024u : 8192u)) {
                 const dim3 grid((uint32_t)((out_dim + 255u) / 256u),
                                 (uint32_t)((n_tok + 63u) / 64u),
                                 1u);
