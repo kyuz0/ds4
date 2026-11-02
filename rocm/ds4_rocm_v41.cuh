@@ -1315,6 +1315,17 @@ extern "C" int ds4_gpu_hc_rms_scale_project_f16_tensor(ds4_gpu_tensor *out, ds4_
 /* Four input values per lane, four Q8 blocks per wave. Scalar V4.1
  * projections retain F32 activations; the block-wise reduction differs from
  * the original lane accumulation and is qualified independently. */
+__device__ static uint32_t g_v41_q8b4_pf;
+static int g_v41_q8b4_pf_set;
+static void v41_q8b4_prefetch_publish(void) {
+    if (g_v41_q8b4_pf_set) return;
+    g_v41_q8b4_pf_set = 1;
+    const uint32_t on = getenv("DS4_ROCM_V41_Q8_BLOCKS4_PREFETCH") != NULL ? 1u : 0u;
+    (void)hipMemcpyToSymbol(HIP_SYMBOL(g_v41_q8b4_pf), &on, sizeof(on), 0,
+                            hipMemcpyHostToDevice);
+    if (on) fprintf(stderr, "ds4: V4.1 Q8 blocks4 register prefetch active\n");
+}
+
 __global__ static void v41_q8_f32_blocks4_kernel(float *out,
         const unsigned char *weights, const float *input,
         uint32_t width, uint32_t outputs, uint64_t row_bytes) {
@@ -1325,16 +1336,34 @@ __global__ static void v41_q8_f32_blocks4_kernel(float *out,
     input += (uint64_t)token * width;
     out += (uint64_t)token * outputs;
     const uint32_t blocks = width / 32u;
+    const uint32_t j = (lane & 7u) * 4u;
     float acc = 0.0f;
-    for (uint32_t b = lane / 8u; b < blocks; b += 4u) {
-        const unsigned char *p = weights + row * row_bytes + (uint64_t)b * 34u;
-        const float d = q8_0_scale_scalar(p);
-        const uint32_t j = (lane & 7u) * 4u;
-        float value = 0.0f;
+    if (g_v41_q8b4_pf != 0u) {
+        /* Opt-in unrolled block loop: four iterations' loads are issued up
+         * front so the 40-step dependent chain is hidden behind four memory
+         * round trips instead of one. Same lane->block mapping and the same
+         * per-block accumulation order, so the result is bit-identical. */
+#pragma unroll 4
+        for (uint32_t b = lane / 8u; b < blocks; b += 4u) {
+            const unsigned char *p = weights + row * row_bytes + (uint64_t)b * 34u;
+            const float d = q8_0_scale_scalar(p);
+            float value = 0.0f;
+            value += (float)((const int8_t *)(p + 2u))[j + 0] * input[b * 32u + j + 0];
+            value += (float)((const int8_t *)(p + 2u))[j + 1] * input[b * 32u + j + 1];
+            value += (float)((const int8_t *)(p + 2u))[j + 2] * input[b * 32u + j + 2];
+            value += (float)((const int8_t *)(p + 2u))[j + 3] * input[b * 32u + j + 3];
+            acc += d * value;
+        }
+    } else {
+        for (uint32_t b = lane / 8u; b < blocks; b += 4u) {
+            const unsigned char *p = weights + row * row_bytes + (uint64_t)b * 34u;
+            const float d = q8_0_scale_scalar(p);
+            float value = 0.0f;
 #pragma unroll
-        for (uint32_t k = 0; k < 4u; k++)
-            value += (float)((const int8_t *)(p + 2u))[j + k] * input[b * 32u + j + k];
-        acc += d * value;
+            for (uint32_t k = 0; k < 4u; k++)
+                value += (float)((const int8_t *)(p + 2u))[j + k] * input[b * 32u + j + k];
+            acc += d * value;
+        }
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
@@ -1461,7 +1490,9 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
         model_map, weight_offset, weight_bytes, "V4.1 Q8 projection");
     if (!weights) return 0;
     if (rows == 1u && ds4_rocm_is_gfx1151()) {
-        v41_q8_f32_blocks4_kernel<<<(outputs + 7u) / 8u, 256u>>>(
+        v41_q8b4_prefetch_publish();
+        v41_q8b4_prefetch_publish();
+    v41_q8_f32_blocks4_kernel<<<(outputs + 7u) / 8u, 256u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             width, outputs, (uint64_t)(width / 32u) * 34u);
     } else if (rows <= 6u && ds4_rocm_is_gfx1151()) {
@@ -1746,7 +1777,9 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
         !ds4_gpu_dsv41_quantize(low, 8192u, n_tokens, DS4_V41_BF16)) return 0;
     if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
         /* The shared input is the same BF16-rounded output-A row above. */
-        v41_q8_f32_blocks4_kernel<<<640u, 256u>>>(
+        v41_q8b4_prefetch_publish();
+        v41_q8b4_prefetch_publish();
+    v41_q8_f32_blocks4_kernel<<<640u, 256u>>>(
             (float *)out->ptr, b, (const float *)low->ptr,
             8192u, 5120u, UINT64_C(256) * 34u);
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
@@ -1817,7 +1850,9 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_
     if (!cuda_ok(cudaGetLastError(), "V4.1 TP attention low projection") ||
         !ds4_gpu_dsv41_quantize(low, 4096u, n_tokens, DS4_V41_BF16)) return 0;
     if (n_tokens <= 6u && ds4_rocm_is_gfx1151()) {
-        v41_q8_f32_blocks4_kernel<<<dim3(640u, n_tokens), 256u>>>(
+        v41_q8b4_prefetch_publish();
+        v41_q8b4_prefetch_publish();
+    v41_q8_f32_blocks4_kernel<<<dim3(640u, n_tokens), 256u>>>(
             (float *)out->ptr, b, (const float *)low->ptr,
             4096u, 5120u, UINT64_C(256) * 34u);
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
