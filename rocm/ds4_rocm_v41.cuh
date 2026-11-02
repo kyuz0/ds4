@@ -530,13 +530,13 @@ static void v41_ix_dispatch_note(int path, uint32_t source_rows, uint32_t rows,
         names[path], count, source_rows, rows, start, ratio);
 }
 #ifndef DS4_ROCM_V41_INDEXER_HEAD_WIDE_DEFAULT
-#define DS4_ROCM_V41_INDEXER_HEAD_WIDE_DEFAULT 0
+#define DS4_ROCM_V41_INDEXER_HEAD_WIDE_DEFAULT 1
 #endif
 static bool v41_indexer_wide_head_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        /* Opt-in wide-head qualification: keep the 64K default cap, extend
-         * the bounded head tile through the 128K ratio-one index width. */
+        /* Default-on after paired 110K append A/B and isolated dispatch
+         * qualification; DS4_ROCM_V41_INDEXER_HEAD_WIDE=0 restores the 64K cap. */
         const char *wide = getenv("DS4_ROCM_V41_INDEXER_HEAD_WIDE");
         cached = wide ? (!strcmp(wide, "1") ? 1 : !strcmp(wide, "0") ? 0 : DS4_ROCM_V41_INDEXER_HEAD_WIDE_DEFAULT) : DS4_ROCM_V41_INDEXER_HEAD_WIDE_DEFAULT;
         if (cached) fprintf(stderr, DS4_GPU_LOG_PREFIX "V4.1 indexer wide head active\n");
@@ -1871,6 +1871,23 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
             (const float *)weights->ptr, count, 2304u, 10.f);
         if (!cuda_ok(cudaGetLastError(), "V4.1 TP MMQ weighted activation") ||
             !ds4_gpu_synchronize()) return 0;
+        /* Opt-in producer capture of the actual gate/up projections and the
+         * input row the MMQ consumed, at the same sampled row as the mid/down
+         * probe.  Settles whether the mid delta comes from the projection or
+         * from a different input row. */
+        const char *probe_row = getenv("DS4_ROCM_V41_DIAG_MOE_ROW");
+        if (probe_row) {
+            const uint32_t row = (uint32_t)strtoul(probe_row, nullptr, 10);
+            if (row >= n_tokens) return 0;
+            const uint64_t first_pair = (uint64_t)row * used;
+            if (!v41_diag_moe_save("gate", (const float *)gate->ptr + first_pair * 2304u,
+                                   (size_t)used * 2304u * sizeof(float)) ||
+                !v41_diag_moe_save("up", (const float *)up->ptr + first_pair * 2304u,
+                                   (size_t)used * 2304u * sizeof(float)) ||
+                !v41_diag_moe_save("x", (const float *)x->ptr + (uint64_t)row * 5120u,
+                                   5120u * sizeof(float))) return 0;
+            fprintf(stderr, "ds4: V4.1 MoE projection probe row=%u tokens=%u\n", row, n_tokens);
+        }
         return ds4_gpu_dsv41_moe_tp_down(out, scratch, mid, selected,
             model_map, model_size, down_offset, n_tokens, tp_rank);
     }

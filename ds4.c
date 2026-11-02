@@ -41460,13 +41460,27 @@ static bool ds41_hc_mix_batch(
     const ds4_gpu_tensor *input = ffn ? b->after_attn : b->residual;
 #ifdef DS4_ROCM_BUILD
     bool projected;
-    if (fn->type == DS4_TENSOR_F16 && fn->dim[0] == 20480u && fn->dim[1] == 24u && count == 2048u) {
+    /* Diagnostic: retain the full-tile HC reduction for a pruned tail.
+     * Only HC projection is padded; attention and experts keep active rows. */
+    const bool pad_hc = count >= 32u && count < 2048u && g->prefill_cap >= 2048u &&
+        metal_graph_tp_env_flag("DS4_ROCM_V41_SUFFIX_HC_PAD", false);
+    if (fn->type == DS4_TENSOR_F16 && fn->dim[0] == 20480u && fn->dim[1] == 24u &&
+        (count == 2048u || pad_hc)) {
         /* Preserve the existing RMS input and feed F32 mix directly to Sinkhorn. */
         if (!ds4_gpu_rms_norm_plain_rows_tensor(b->flat_norm, input,
                 DS4_N_HC * DS4_N_EMBD, count, DS4_RMS_EPS)) return false;
+        if (pad_hc) {
+            const uint64_t row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+            ds4_gpu_tensor *tail = ds4_gpu_tensor_view(g->batch.flat_norm,
+                count * row_bytes, (2048u - count) * row_bytes);
+            const bool cleared = tail && ds4_gpu_tensor_fill_f32(tail, 0.0f,
+                (uint64_t)(2048u - count) * DS4_N_HC * DS4_N_EMBD);
+            ds4_gpu_tensor_free(tail);
+            if (!cleared) return false;
+        }
         const int result = ds4_gpu_dsv41_hc_project(&g->hc_sgemm,
-            b->mix, m->map, m->size, fn->abs_offset, count,
-            b->flat_norm, g->batch.heads);
+            pad_hc ? g->batch.mix : b->mix, m->map, m->size, fn->abs_offset, 2048u,
+            pad_hc ? g->batch.flat_norm : b->flat_norm, g->batch.heads);
         if (result < 0) return false;
         projected = result > 0 || ds41_matmul_batch(b->mix, m, fn, b->flat_norm, count, false);
     } else
@@ -43421,6 +43435,137 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
  * travel down the stack with their token, while only source layers append KV.
  * A failed partial chunk cannot be snapshotted: its layers have different
  * frontiers, so the caller must rebuild from its retained token history. */
+static int ds41_diag_slug(char *dst, size_t cap, const char *src) {
+    size_t n = 0;
+    if (!dst || !cap || !src) return -1;
+    for (; *src && n + 1u < cap; src++) {
+        const unsigned char c = (unsigned char)*src;
+        dst[n++] = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_') ? (char)c : '_';
+    }
+    dst[n] = 0;
+    return n ? 0 : -1;
+}
+
+/* Selected-row diagnostic dumps. It is inert unless the harness sets
+ * DS4_METAL_V41_DIAG_DUMP_DIR and DS4_METAL_V41_DIAG_DUMP. */
+static bool ds41_diag_dump_rows(const char *stage, uint32_t il, const char *name,
+                                const ds4_gpu_tensor *t, uint32_t tstart,
+                                uint32_t start, uint32_t count,
+                                uint32_t width, uint32_t elem_bytes,
+                                uint32_t pos0, uint32_t posn) {
+    const char *dir = getenv("DS4_METAL_V41_DIAG_DUMP_DIR");
+    if (!dir || !*dir || !t || !width || !elem_bytes || !count) return false;
+    const uint64_t end = (uint64_t)start + count;
+    const uint32_t first = start > pos0 ? start : pos0;
+    const uint32_t last = (uint32_t)(end < posn ? end : posn);
+    if (first >= last) return true;
+    if (first < tstart) return false;
+    const uint64_t row_bytes = (uint64_t)width * elem_bytes;
+    const uint64_t bytes = (uint64_t)(last - first) * row_bytes;
+    if (!row_bytes || bytes > 64ull * 1024u * 1024u ||
+        (uint64_t)(first - tstart) * row_bytes + bytes > ds4_gpu_tensor_bytes(t))
+        return false;
+    unsigned char *buf = malloc((size_t)bytes);
+    if (!buf) return false;
+    /* GPU tensor operations return nonzero on success. Rows are contiguous. */
+    bool ok = ds4_gpu_tensor_read(t, (uint64_t)(first - tstart) * row_bytes,
+                                  buf, bytes) != 0;
+    char slug[48], file[512];
+    if (ok) ok = ds41_diag_slug(slug, sizeof(slug), stage) == 0;
+    if (ok) {
+        const int n = snprintf(file, sizeof(file), "%s/%s_%u_%s_%u_%u.raw",
+                               dir, slug, il, name, first, last);
+        ok = n > 0 && (size_t)n < sizeof(file);
+    }
+    FILE *fp = ok ? fopen(file, "wb") : NULL;
+    if (!fp) ok = false;
+    else {
+        if (fwrite(buf, 1, (size_t)bytes, fp) != bytes) ok = false;
+        if (fclose(fp)) ok = false;
+    }
+    if (ok) {
+        char meta[512];
+        const int n = snprintf(meta, sizeof(meta), "%s/manifest.txt", dir);
+        FILE *mf = n > 0 && (size_t)n < sizeof(meta) ? fopen(meta, "a") : NULL;
+        if (!mf) ok = false;
+        else {
+            if (fprintf(mf, "%s\t%u\t%s\t%u\t%u\t%u\t%u\t%s\n",
+                        stage, il, name, first, last, width, elem_bytes, file) < 0) ok = false;
+            if (fclose(mf)) ok = false;
+        }
+    }
+    free(buf);
+    return ok;
+}
+
+static bool ds41_diag_dump_stage(const char *stage, ds41_gpu_graph *g,
+                                 ds41_prefill_row *b, uint32_t il,
+                                 uint32_t start, uint32_t count) {
+    if (!getenv("DS4_METAL_V41_DIAG_DUMP") || !b || (il != 20u && il != 21u)) return true;
+    const uint32_t r0 = 8065u, r1 = 8066u, h0 = 8065u, h1 = 8192u;
+    const uint32_t blocks = (g->ctx + 7u) / 8u;
+    bool ok = true;
+#define DS41_DIAG_D(field, width, elem, p0, p1) do { \
+        if (ok) ok = ds41_diag_dump_rows(stage, il, #field, b->field, start, \
+            start, count, (width), (elem), (p0), (p1)); \
+    } while (0)
+    if (!strcmp(stage, "hc/engram")) {
+        DS41_DIAG_D(residual, DS4_N_HC * DS4_N_EMBD, 4u, r0, r1);
+        DS41_DIAG_D(ffn_split, 24u, 4u, r0, r1);
+        DS41_DIAG_D(attn_split, 24u, 4u, r0, r1);
+        DS41_DIAG_D(x, DS4_N_EMBD, 4u, r0, r1);
+        DS41_DIAG_D(norm, DS4_N_EMBD, 4u, r0, r1);
+    } else if (!strcmp(stage, "attention projections")) {
+        DS41_DIAG_D(qr, DS4_N_LORA_Q, 4u, r0, r1);
+        DS41_DIAG_D(q, DS4_N_HEAD * DS4_N_HEAD_DIM, 4u, r0, r1);
+        DS41_DIAG_D(kv, DS4_N_HEAD_DIM, 4u, r0, r1);
+    } else if (!strcmp(stage, "attention core/index")) {
+        const bool src = ds41_kv_source(il), idx = ds41_index_source(il);
+        DS41_DIAG_D(kv, DS4_N_HEAD_DIM, 4u, h0, h1);
+        DS41_DIAG_D(heads, DS4_N_HEAD * DS4_N_HEAD_DIM, 4u, r0, r1);
+        if (src) {
+            /* Publication can use scalar scratch; compare the live caches. */
+            if (ok && g->compressed[3])
+                ok = ds41_diag_dump_rows(stage, il, "compressed3", g->compressed[3], 0u,
+                    start, count, DS4_N_HEAD_DIM, 4u, h0, h1);
+            if (ok && g->index_cache[3])
+                ok = ds41_diag_dump_rows(stage, il, "index_cache3", g->index_cache[3], 0u,
+                    start, count, DS4_N_INDEXER_HEAD_DIM, 4u, h0, h1);
+        }
+        if (idx) {
+            DS41_DIAG_D(index_q, DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM, 4u, r0, r1);
+            DS41_DIAG_D(index_weights, DS4_N_INDEXER_HEAD, 4u, r0, r1);
+            DS41_DIAG_D(selected_comp, DS4_N_INDEXER_TOP_K, 4u, h0, h1);
+            DS41_DIAG_D(block_mask, blocks, 4u, h0, h1);
+        }
+    } else if (!strcmp(stage, "attention output")) {
+        DS41_DIAG_D(block, DS4_N_EMBD, 4u, r0, r1);
+        DS41_DIAG_D(heads, DS4_N_HEAD * DS4_N_HEAD_DIM, 4u, r0, r1);
+        DS41_DIAG_D(low, DS4_N_OUT_GROUP * DS4_N_LORA_O, 4u, r0, r1);
+    } else if (!strcmp(stage, "hc/ffn norm")) {
+        DS41_DIAG_D(after_attn, DS4_N_HC * DS4_N_EMBD, 4u, r0, r1);
+        DS41_DIAG_D(attn_split, 24u, 4u, r0, r1);
+        DS41_DIAG_D(ffn_split, 24u, 4u, r0, r1);
+        DS41_DIAG_D(x, DS4_N_EMBD, 4u, r0, r1);
+        DS41_DIAG_D(norm, DS4_N_EMBD, 4u, r0, r1);
+    } else if (!strcmp(stage, "shared/routed ffn")) {
+        /* Expert scratch may be grouped/reused; only compare row outputs. */
+        DS41_DIAG_D(shared, DS4_N_EMBD, 4u, r0, r1);
+        DS41_DIAG_D(routed, DS4_N_EMBD, 4u, r0, r1);
+        DS41_DIAG_D(selected, DS4_N_EXPERT_USED, 4u, r0, r1);
+        DS41_DIAG_D(route_weights, DS4_N_EXPERT_USED, 4u, r0, r1);
+        DS41_DIAG_D(route_logits, DS4_N_EXPERT, 4u, r0, r1);
+        DS41_DIAG_D(route_probs, DS4_N_EXPERT, 4u, r0, r1);
+    } else if (!strcmp(stage, "hc expand")) {
+        DS41_DIAG_D(block, DS4_N_EMBD, 4u, r0, r1);
+        DS41_DIAG_D(residual, DS4_N_HC * DS4_N_EMBD, 4u, r0, r1);
+        DS41_DIAG_D(ffn_split, 24u, 4u, r0, r1);
+    }
+#undef DS41_DIAG_D
+    return ok;
+}
+
 static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t total_count,
                               ds4_session_progress_fn progress, void *progress_ud,
@@ -43433,12 +43578,18 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         return false;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
     const bool stage_profile = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL;
+    const bool stage_dump = getenv("DS4_METAL_V41_DIAG_DUMP") != NULL;
     const bool batch_moe = !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE");
     const bool batch_attention = !getenv("DS4_METAL_DISABLE_V41_BATCH_ATTN");
     const bool batch_core = batch_attention && !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE");
     const bool batch_hc = batch_attention && batch_moe &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
+    /* The suffix skips early decoder bodies, whose current-layer norms/carry
+     * are the only source of their compressed/index rows. A publication-only
+     * correction cannot be exact. Keep the unqualified path opt-in and use the
+     * full decoder body by default. */
     const bool decoder_suffix = wide && total_count >= 8192u &&
+        metal_graph_tp_env_flag("DS4_METAL_V41_DECODER_SUFFIX", false) &&
         !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
 #ifdef DS4_ROCM_BUILD
@@ -43660,12 +43811,18 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             const double t_engram = profile ? now_sec() : 0;
             double stage_start = stage_profile ? now_sec() : 0;
 #define DS41_STAGE(label) do { \
-                if (ok && stage_profile) { \
+                if (ok && (stage_profile || (stage_dump && (il == 20u || il == 21u)))) { \
                     ok = ds4_gpu_end_commands() != 0; \
                     const double now = now_sec(); \
-                    fprintf(stderr, "ds4: V4.1 stage layer=%u pos=%u rows=%u %s=%.3f ms\n", \
-                        il, start, count, (label), (now - stage_start) * 1000); \
+                    if (stage_profile) \
+                        fprintf(stderr, "ds4: V4.1 stage layer=%u pos=%u rows=%u %s=%.3f ms\n", \
+                            il, start, count, (label), (now - stage_start) * 1000); \
                     stage_start = now; \
+                    if (ok && stage_dump) { \
+                        ok = ds41_diag_dump_stage((label), g, &g->batch, il, start, count); \
+                        if (!ok) fprintf(stderr, "ds4: V4.1 diagnostic dump failed layer=%u pos=%u rows=%u stage=%s\n", \
+                                         il, start, count, (label)); \
+                    } \
                     if (ok) ok = ds4_gpu_begin_commands() != 0; \
                 } \
             } while (0)
@@ -43744,6 +43901,17 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok && batch_moe) {
 #ifdef DS4_ROCM_BUILD
+                /* Diagnostic marker for the live backend producer, not scratch
+                 * inspected after another kernel has reused it. */
+                const bool moe_probe = stage_dump && il == 20u &&
+                    start <= 8065u && start + count > 8065u;
+                if (moe_probe) {
+                    char local_row[24];
+                    snprintf(local_row, sizeof(local_row), "%u", 8065u - start);
+                    if (setenv("DS4_ROCM_V41_DIAG_MOE_ROW", local_row, 1)) ok = false;
+                }
+#endif
+#ifdef DS4_ROCM_BUILD
                 if (il < 20u && g->tp_world == 2u && count >= 32u && count <= 2048u &&
                     ds4_gpu_tp_big_gate_overlap_supported())
                     ok = ds41_moe_batch_overlap(g, m, &w->layer[il], il, count);
@@ -43751,6 +43919,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #endif
                 ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false,
                                     selective_stage);
+#ifdef DS4_ROCM_BUILD
+                if (moe_probe) unsetenv("DS4_ROCM_V41_DIAG_MOE_ROW");
+#endif
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
@@ -78096,6 +78267,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 ds41_prefill_count(g, remaining);
             const bool defer_decoder = !g->encoder_resident && count >= 16384u &&
                 remaining - count >= 8192u &&
+                metal_graph_tp_env_flag("DS4_METAL_V41_DECODER_SUFFIX", false) &&
                 !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX") &&
                 !getenv("DS4_METAL_DISABLE_V41_DEFER_DECODER");
             /* Never add an encoder sweep just to defer the decoder. A short
@@ -80190,7 +80362,42 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
+#ifdef DS4_ROCM_BUILD
+/* Reclaim the prefill expert reserve as dynamic decode cache once prefill has
+ * finished. The streaming slab grows lazily and is free-memory guarded, so this
+ * can only use memory that is genuinely available; nothing is pre-allocated.
+ * Promoted: on by default, opt out with
+ * DS4_ROCM_V41_GROW_CACHE_AFTER_PREFILL=0. */
+static void ds41_stream_grow_cache_after_prefill(ds4_session *s) {
+    static bool grown;
+    ds4_engine *e = s ? s->engine : NULL;
+    if (grown || !e || !e->ssd_streaming) return;
+    const char *env = getenv("DS4_ROCM_V41_GROW_CACHE_AFTER_PREFILL");
+    if (env != NULL && env[0] == '0' && env[1] == '\0') return;  /* opt-out */
+    grown = true;
+    if (e->ssd_streaming_cache_bytes == 0 || e->ssd_streaming_prefill_headroom_bytes == 0) return;
+    const uint64_t budget = ds4_add_sat_u64(e->ssd_streaming_cache_bytes,
+                                            e->ssd_streaming_prefill_headroom_bytes);
+    uint64_t per_expert = 0;
+    const uint32_t target =
+        ds4_streaming_cache_experts_for_byte_budget(&e->weights, budget, &per_expert);
+    const uint32_t current = ds4_gpu_stream_expert_cache_configured_count();
+    if (target > current) {
+        ds4_gpu_set_streaming_expert_cache_budget(target);
+        fprintf(stderr,
+                "ds4: V4.1 decode cache grew after prefill: %u -> %u experts "
+                "(%.2f -> %.2f GiB)\n",
+                current, target,
+                per_expert ? (double)((uint64_t)current * per_expert) / 1073741824.0 : 0.0,
+                per_expert ? (double)((uint64_t)target * per_expert) / 1073741824.0 : 0.0);
+    }
+}
+#endif
+
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+#ifdef DS4_ROCM_BUILD
+    ds41_stream_grow_cache_after_prefill(s);
+#endif
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {

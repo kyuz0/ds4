@@ -298,6 +298,26 @@ static int routed_moe_decode_profile_collect(
  * re-quantizing mid to Q8_K and taking the older qwarp down path.  This keeps
  * the CyberNeurova all-Q2 path untouched while giving the standard IQ2 mix the
  * same fast Q2 down projection used by q2k_path. */
+/* Opt-in producer capture; graph supplies a local row only for layer20/token8065. */
+static bool v41_diag_moe_save(const char *name, const void *device, size_t bytes) {
+    const char *dir = getenv("DS4_METAL_V41_DIAG_DUMP_DIR");
+    if (!dir || !device || !bytes) return false;
+    char path[1024];
+    const int n = snprintf(path, sizeof(path), "%s/moe_%s.raw", dir, name);
+    if (n <= 0 || (size_t)n >= sizeof(path)) return false;
+    void *host = malloc(bytes);
+    if (!host) return false;
+    bool ok = cuda_ok(cudaMemcpy(host, device, bytes, cudaMemcpyDeviceToHost), "MoE diagnostic read");
+    FILE *fp = ok ? fopen(path, "wb") : nullptr;
+    if (!fp) ok = false;
+    else {
+        if (fwrite(host, 1, bytes, fp) != bytes) ok = false;
+        if (fclose(fp)) ok = false;
+    }
+    free(host);
+    return ok;
+}
+
 static int routed_moe_q2_float_down_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *down,
@@ -340,6 +360,9 @@ static int routed_moe_q2_float_down_launch(
     const int use_f16_down = (out_dim & 1u) == 0u;
     half *down_h = use_f16_down ? (half *)down->ptr : NULL;
 
+    const bool diag_force_compact = getenv("DS4_ROCM_V41_DIAG_DOWN_FORCE_COMPACT") != NULL;
+    const bool diag_force_hotlist = getenv("DS4_ROCM_V41_DIAG_DOWN_FORCE_HOTLIST") != NULL;
+
     uint32_t hot_count = 0u;
     uint32_t hot_max = 0u;
     const uint32_t hot_threshold = 8u;
@@ -369,10 +392,11 @@ static int routed_moe_q2_float_down_launch(
         use_f16_down && (((uintptr_t)mid_h_hot&15u)==0) && (((uintptr_t)down_w&3u)==0);
     bool v41_compact = use_wmma_hot &&
         g_deepseek41_model && !g_glm_model && !g_quality_mode && !g_ssd_streaming_mode &&
-        ds4_rocm_is_gfx1151() && n_tokens==2048u &&
+        ds4_rocm_is_gfx1151() && (n_tokens==2048u || diag_force_compact) &&
         n_total_expert==384u && n_expert==6u && expert_mid_dim==2304u && out_dim==5120u &&
         down_expert_bytes==3870720u && down_row_bytes==756u && hot_mid_f16 && mid_h_hot &&
         use_f16_down && (((uintptr_t)mid_h_hot&15u)==0) && (((uintptr_t)down_w&3u)==0);
+    if(diag_force_hotlist) v41_compact = false;
     uint32_t h_tiles[1024], tile_count=0, prepared_count=0;
     if(v41_compact) {
         for(uint32_t e=0;e<384u;e++)if(h_counts[e]>=hot_threshold) {
@@ -627,6 +651,23 @@ static int routed_moe_q2_float_down_launch(
     }
 #endif
 
+    const char *probe_row = getenv("DS4_ROCM_V41_DIAG_MOE_ROW");
+    if (probe_row && g_deepseek41_model) {
+        const uint32_t row = (uint32_t)strtoul(probe_row, nullptr, 10);
+        if (row >= n_tokens) return 0;
+        const uint64_t first_pair = (uint64_t)row * n_expert;
+        if (!v41_diag_moe_save("counts_u32", counts, n_total_expert * sizeof(uint32_t)) ||
+            !v41_diag_moe_save("down", (const char *)down->ptr +
+                first_pair * out_dim * (use_f16_down ? sizeof(half) : sizeof(float)),
+                (size_t)n_expert * out_dim * (use_f16_down ? sizeof(half) : sizeof(float)))) return 0;
+        if (hot_mid_f16 && mid_h_hot &&
+            !v41_diag_moe_save("mid_f16", mid_h_hot + first_pair * expert_mid_dim,
+                (size_t)n_expert * expert_mid_dim * sizeof(half))) return 0;
+        if (!v41_diag_moe_save("mid_f32", (const float *)mid->ptr + first_pair * expert_mid_dim,
+                (size_t)n_expert * expert_mid_dim * sizeof(float))) return 0;
+        fprintf(stderr, "ds4: MoE diagnostic row=%u tokens=%u hot=%u threshold=%u mid_f16=%d down_f16=%d\n",
+                row, n_tokens, hot_count, hot_threshold, hot_mid_f16, use_f16_down);
+    }
     const uint64_t n = (uint64_t)n_tokens * out_dim;
     if (use_f16_down && (out_dim & 1u) == 0u) {
         const uint64_t n2 = (uint64_t)n_tokens * (out_dim >> 1u);
@@ -1599,6 +1640,32 @@ static int routed_moe_launch(
                 if (!logged_mmq_fallback) {
                     logged_mmq_fallback = 1;
                     fprintf(stderr, "ds4: ROCm MMQ IQ2 gate/up returned %d; falling back\n", mmq_rc);
+                }
+            }
+            /* Opt-in producer probe in the path production actually uses
+             * (fused MMQ gate/up + SwiGLU write-back). Drains first so the
+             * snapshot cannot be confused with a partially published buffer. */
+            if (ok && mmq_gateup_done && gate && mid && x && weights) {
+                const char *probe_row = getenv("DS4_ROCM_V41_DIAG_MOE_ROW");
+                if (probe_row) {
+                    const uint32_t row = (uint32_t)strtoul(probe_row, nullptr, 10);
+                    if (row >= n_tokens) return 0;
+                    const uint64_t first_pair = (uint64_t)row * n_expert;
+                    const size_t mid_elems = (size_t)n_expert * expert_mid_dim;
+                    if (!cuda_ok(cudaDeviceSynchronize(), "MoE producer probe drain") ||
+                        !v41_diag_moe_save("x", (const float *)x->ptr +
+                                           (uint64_t)row * expert_in_dim,
+                                           (size_t)expert_in_dim * sizeof(float)) ||
+                        !v41_diag_moe_save("gate", (const float *)gate->ptr +
+                                           first_pair * expert_mid_dim,
+                                           mid_elems * sizeof(float)) ||
+                        !v41_diag_moe_save("mid_sync", (const float *)mid->ptr +
+                                           first_pair * expert_mid_dim,
+                                           mid_elems * sizeof(float)) ||
+                        !v41_diag_moe_save("weights", (const float *)weights->ptr + first_pair,
+                                           (size_t)n_expert * sizeof(float))) return 0;
+                    fprintf(stderr, "ds4: MoE fused producer probe row=%u tokens=%u\n",
+                            row, n_tokens);
                 }
             }
             if (v41_mmq_topology && !mmq_gateup_done) {
