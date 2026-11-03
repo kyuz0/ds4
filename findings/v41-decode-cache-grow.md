@@ -717,3 +717,487 @@ So the quantizer *can* emit the layout without breaking anything, but only via
 option 2, and that makes it a two-part project (packer + engine read path) whose
 ceiling is the 2-4% the SoA loader offers on an 18.3% kernel. Nothing in the tree
 was changed for this step.
+
+## Sidecar prototype (executed): packer + lossless round-trip
+
+tools/pack-iq2-soa.py implements the smallest safe slice of the sidecar path: for
+one tensor and one expert it emits the two SoA planes (global dq plane of 2 B per
+66-byte block, then qs plane of 64 B per block - the layout
+load_tiles_iq2_xxs_soa expects) and then re-interleaves them to prove the
+transform is lossless. No engine change, no container impact, no numerics risk.
+
+Verified on the real model:
+  tensor=blk.20.ffn_gate_exps.weight expert=0 blocks=46080
+  sidecar_bytes=3041280 roundtrip_identical=True
+3041280 B is exactly gate_expert_bytes (2304 x 1320), so one expert's SoA blob is
+the same size as one cache slot - the granularity the staging path already uses.
+
+End-to-end shape of the remaining work, now that the bytes are proven:
+1. extend the packer to a whole tensor (two global planes per tensor, ~47 GB for
+   gate+up), with a small header table mapping (layer, tensor) -> plane offsets;
+2. engine: map the sidecar when present and stage an expert from two ranges
+   (dq plane slice + qs plane slice) instead of one, into the same cache slot;
+3. pass xa_soa/xb_soa/soa_blocks from ds4_mmq_iq2_xxs_moe_pair_swiglu (the only
+   place that drops them) with soa_blocks = 46080 and the expert's base offsets;
+4. gates unchanged: bit-identical frontier logits first (the loader is documented
+   bit-identical), then >=3 interleaved 32K pairs plus a second session.
+
+## Sidecar prototype, whole tensor (executed)
+
+tools/pack-iq2-soa.py now packs a whole IQ2 tensor: a 64-byte header
+(magic/version/experts/blocks/dq offset/qs offset/end) followed by one global dq
+plane and one global qs plane, then re-interleaves two experts (first and last)
+straight from the file to prove the layout.
+
+  tensor=blk.20.ffn_gate_exps.weight experts=384 blocks=17694720
+  sidecar_bytes=1167851584 verified_experts=2 identical=True
+
+1 167 851 584 B = 64 + 384*46080*2 + 384*46080*64 = one tensor's worth, i.e. the
+sidecar is byte-for-byte the same size as the GGUF tensor it mirrors (1.17 GB for
+this one; ~47 GB for gate+up across 40 layers). Two header bugs were caught by the
+round-trip check itself (offsets read at the wrong header positions, and a name
+field overrunning into the dq plane), which is exactly what this slice exists to
+catch before any engine change.
+
+Next slice: the engine read path - map the sidecar when present, stage an expert
+from the two plane slices into the same cache slot, and pass xa_soa/xb_soa/
+soa_blocks (46080 per expert) from the swiglu wrapper. Gates unchanged.
+
+## Pointer trace: SoA indexes globally, so per-expert cache slots need a loader change
+
+mul_mat_q_process_tile passes `x_soa` **un-offset** while the raw path passes
+`offset_x + kb0`, which already contains `fastdiv(zt, channel_ratio)*stride_channel_x`
+(mmq.cuh:4124 and 3890-3897). The SoA loader then computes
+`blk = kbx0 + i*stride` and indexes the global planes as
+`dq[blk]` / `qs[blk*8 + kqsx]` with `soa_blocks` covering the whole tensor.
+
+Consequence: the artifact must be one global dq plane plus one global qs plane per
+tensor, addressed by a flat block index across all 384 experts (stride_channel_x
+is 46 080 blocks per expert, so the arithmetic lines up exactly with the packer's
+layout). It cannot be sliced per expert and dropped into a cache slot: the loader
+has no per-expert base and would index the wrong blocks.
+
+Two ways forward, and their costs:
+1. Whole-tensor residency: 1.17 GB per tensor, 47 GB for gate+up at 40 layers,
+   against 121.73 GiB usable with 92 GB already in the cache - only ~7 layers
+   would fit, i.e. <=0.7% overall. Not worth it.
+2. Per-expert SoA in the cache: needs a loader variant taking an expert base and
+   using local block indices, plus two-range staging (dq slice + qs slice) per
+   expert miss. That is a loader + staging change, still bit-identical by
+   construction, and it is the only variant that fits this machine's memory.
+
+So the sidecar work is real but the engine-side effort is a loader variant plus
+two-range staging, not just pointer plumbing; nothing was changed in the tree.
+
+## Minimal change set for two-plane per-expert staging (traced, zero-cost)
+
+Indexing, verified against the loader body (mmq.cuh:3076-3110):
+  dq_bytes = (soa_nblk*2 + 63) & ~63          -> per-expert: 46080*2 = 92160, already 64-B aligned
+  dq[blk] * scale, qs[blk*8 + kqsx]           with blk = kbx0 + i*stride
+  kbx0 already contains zt*stride_channel_x (mmq.cuh:4124), so blk is *global*
+For a per-expert slot holding [dq plane 92 160 B][qs plane 2 949 120 B] = one
+3 041 280 B slot, blk must become expert-local. A modulo in the inner loop is not
+acceptable (one integer divide per 8 weights), so the minimal zero-cost fix is to
+carry the channel offset explicitly:
+
+  add `int64_t soa_channel_blocks` next to `soa_blocks`, set to 0 when the
+  artifact is global, and in both SoA loaders compute
+      blk = (uint32_t)(kbx0 + i*stride - soa_channel_blocks)
+
+Touch points (6, all mechanical):
+  1. mul_mat_q_process_tile signature        mmq.cuh:3818
+  2. mul_mat_q signature                     mmq.cuh:4034
+  3. the three mul_mat_q_process_tile calls  mmq.cuh:4128, 4219, 4293
+  4-5. the two loader call sites             mmq.cuh:3890 (Q2_K), 3897 (IQ2_XXS)
+  6. args struct + wrapper plumbing          ds4_mmq.cu:1198 struct, 1281/1299/1672
+
+Because the subtraction is a no-op when soa_channel_blocks == 0, the
+absent-sidecar path (and the existing global-artifact path) is bit-identical by
+construction; only the per-expert path changes, and it feeds the same tile_x
+values. Staging then fills a slot from two ranges per miss: dq slice
+(92 160 B) and qs slice (2 949 120 B), i.e. two read jobs instead of one, same
+total bytes.
+
+## Attempted first slice of the soa_channel_blocks change: reverted, exact text needed
+
+Tried to introduce `int64_t soa_channel_blocks` through the SoA loaders and
+mul_mat_q so a per-expert slot could use expert-local block indices with a zero
+default (bit-identical for the raw and global-artifact paths). The patch applied
+to the blk-site, the two signatures' parameter lists and the three process_tile
+calls, but the loader signatures in the tree differ from the expected text
+(load_tiles_q2_K_soa / load_tiles_iq2_xxs_soa are multi-line declarations), so
+`soa_channel_blocks` was undeclared inside the loaders and the build failed at
+mmq.cuh:3091/4128/4219/4543.
+
+Reverted both files; `ds4-bench` rebuilds clean and the tree is unchanged. The
+next attempt must quote the loader declarations exactly as they appear in the
+tree (they span several lines and the parameter list order differs per loader),
+and should be done as a self-contained cycle with the bit-equality run available.
+
+## soa_channel_blocks plumbing landed (inert, verified bit-identical)
+
+Threaded `int64_t soa_channel_blocks` through the IQ2 SoA loader, both
+mul_mat_q_process_tile/mul_mat_q signatures, the four process_tile call sites, the
+two compact-launcher calls, mmq_args and ds4_mmq_fused_down. The loader now reads
+`blk = (uint32_t)((int64_t)(kbx0 + i*stride) - soa_channel_blocks)`, and every
+producer defaults the value to 0, so the raw path and the global-artifact path are
+identity transforms.
+
+Verification: pre-patch binary vs patched binary at 8K, gen 8 -
+frontier logits exact=True (max_abs 0); 184.12 vs 181.23 tps on a single run,
+inside noise and expected for an inert change. The Q2_K SoA loader is deliberately
+untouched (different pblk indexing; the V4.1 gate/up path is IQ2).
+
+Next slice (now purely additive): stage an expert slot from two ranges (dq slice
+92 160 B + qs slice 2 949 120 B) when a sidecar is mapped, and pass
+soa_channel_blocks = expert*46080 from the swiglu wrapper along with xa_soa/xb_soa
+and soa_blocks = 46080. Gates: bit-identical logits, then >=3 interleaved pairs
+plus a second session.
+
+## The SoA entry points already exist - reframing the next step
+
+cuda/mmq/ds4_mmq.h already declares both `ds4_mmq_iq2_xxs_moe_pair_soa(Wa_soa,
+Wb_soa, ...)` and the fused `ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(...)`, and the
+implementation derives `nblk = n_experts * M * (K/256)` and passes `Wa_soa`
+straight through as x_soa (ds4_mmq.cu:2059-2074). That is exactly the global
+layout my packer emits (one dq plane then one qs plane per tensor, 66 B/block), so
+no wrapper work is needed for a whole-tensor artifact: the sidecar only has to
+exist and be mapped, and the call switches to the *_soa entry.
+
+Mass arithmetic: gate+up for one layer is 2 x 1.17 GB = 2.34 GB, and the plan
+leaves ~17 GB free (121.73 GiB usable - 104.91 GiB planned), so ~7 of 40 layers
+fit in RAM. Full coverage would need the per-expert two-range scheme (which is
+what soa_channel_blocks was added for).
+
+Cheapest end-to-end validation of the payoff, given that 1/40 of the MoE time is
+~0.45% overall (below the end-to-end noise floor):
+1. pack layer-20 gate and up sidecars (packer already verified);
+2. map them and call the *_soa entry for that one layer only;
+3. gate on bit-identical frontier logits (the loader is documented bit-identical);
+4. measure the effect as MMQ kernel time for layer 20 in a rocprof trace, not as
+   end-to-end tps - that is the number that decides whether the per-expert scheme
+   is worth building.
+
+## Layer-specific sidecar switch: interfaces confirmed, implementation needs a fresh cycle
+
+Confirmed at the call site (rocm/ds4_rocm_moe_launch.cuh:1598):
+`ds4_mmq_iq2_xxs_moe_pair_swiglu(gate_w, up_w, x+off, selected_exec+pair_off,
+weights+pair_off, gate, up, mid, mid_h, M, K, tile_tokens, n_total_expert,
+n_expert, clamp, 0)` - the launcher already knows `layer_index`, and the
+non-fused branch right below shows the separate `moe_swiglu_weighted_f32_kernel`
+call that the `_soa` path would need, because
+`ds4_mmq_iq2_xxs_moe_pair_soa` has no swiglu epilogue.
+
+Three things the switch must get right, none of which is free to guess:
+1. `selected_exec` in this path can hold remapped/compacted expert ids, while the
+   SoA artifact is indexed by global expert id - the artifact variant must be fed
+   the unremapped ids (or the resident path must be bypassed for that layer).
+2. The `_soa` entry writes raw gate/up, so mid must come from the separate swiglu
+   kernel with the same clamp; whether that is bit-identical to the fused
+   epilogue has to be shown by the logit gate, not assumed.
+3. A resident artifact also removes that layer's gate/up staging reads, which is a
+   second, larger effect than the dequant saving - the trace has to separate them.
+
+Given the remaining budget in this session I did not start an edit I could not
+carry through the bit-exact and multi-pair gates; shipping an unverified kernel
+path would break the constraint that has held all session. The next cycle should
+implement: env-gated `DS4_V41_IQ2SOA_DIR` mmap of layer-20 gate/up sidecars, feed
+the unremapped ids, call `ds4_mmq_iq2_xxs_moe_pair_soa`, run the separate swiglu
+kernel, then gate on bit-identical logits and measure layer-20 MMQ kernel time.
+
+## Producer exists in-tree, and the fused SoA entry answers the SwiGLU hazard
+
+Producer: cuda/mmq/ds4_repack.h is the shared aligned-SoA layout library with
+ds4_repack_build_iq2_aligned() (IQ2 gate/up), the Q2_K down and Q8_0 dense builds,
+the GGUF catalog walk, a parallel repack driver and an FNV-1a artifact hash.  Its
+header states it is shared by tools/ds4_weight_server.cu (weight server
+--repack-iq2-aligned) and the engine's in-process self-load build in ds4_cuda.cu.
+So the artifacts can be produced with existing code rather than the Python
+prototype, which then only serves as the layout verifier.
+
+SwiGLU hazard resolved: ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(W_gate_soa, W_up_soa,
+W_down_soa, X, ids, router_weights, gate_f32, up_f32, mid_f32, down_f32, ...)
+already "computes clamp + SwiGLU + router weighting in mid_f32, then gathers and
+quantizes those rows for the Q2_K down MMQ", i.e. it is exactly this engine's
+fused gate/up+down path with the epilogue included - no separate swiglu kernel is
+needed and there is no fused-vs-separate equivalence question to prove.
+
+Remaining hazard is only the id mapping: selected_exec can be replaced by the
+resident/selected paths (rocm/ds4_rocm_moe_launch.cuh:887-954), while the artifact
+is indexed by global expert id, so the SoA path must either bypass those or be
+fed the unremapped ids.
+
+Smallest next implementation, now with no unknown semantics: env-gated mapping of
+the layer-20 gate/up/down artifacts (produced by ds4_repack_build_iq2_aligned and
+the Q2_K build), call ds4_mmq_iq2_xxs_q2_K_moe_fused_soa for that layer with the
+unremapped ids, and gate on bit-identical logits plus layer-20 kernel time.
+
+## Expert-id mapping resolved: the selected path uses slot indices, not global ids
+
+The resident/selected path hands the kernels *pointer tables*
+(`gate_slot_ptrs` / `up_slot_ptrs` / `down_slot_ptrs`) plus `selected_exec`, and
+the consumers index them as `table[id]` (e.g. moe_v41_down_wave_ptrs6_kernel).
+So in that path `id` is a **slot index into the staged tables**, whereas the raw
+MMQ path indexes `gate_w + expert*gate_expert_bytes` with the **global** expert id.
+
+Consequence, and why the switch is not a call-site edit: the SoA artifact is
+indexed by global id, so the layer-20 SoA branch must take the *original*
+`selected` tensor and **bypass the staging/selected machinery entirely** for that
+layer - no slot tables, no selected-read jobs - rather than reusing
+`selected_exec` inside the existing flow. That is a branch at the top of the
+launcher (before staging is set up), not a swap of the MMQ call.
+
+Implementation shape for a fresh cycle (now fully determined):
+1. env-gated base path, e.g. DS4_V41_IQ2SOA_DIR, expecting layer-20 gate/up/down
+   artifacts produced by ds4_repack_build_iq2_aligned + the Q2_K build;
+2. in routed_moe_launch, if the layer matches and the artifacts are mapped, skip
+   the streaming/selected path for that layer and call
+   ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(gate_soa, up_soa, down_soa, x, selected,
+   weights, gate, up, mid, down, ...) with the untouched global ids;
+3. gate on bit-identical frontier logits, then >=3 interleaved 32K pairs in one
+   session plus a second session, and read layer-20 kernel time from a trace to
+   decide whether the per-layer scheme is worth extending.
+
+No edit was started: the branch restructures staging for that layer, which cannot
+be carried through the gates with the remaining budget.
+
+## Env-gated layer-scoped SoA branch implemented (builds; artifact run pending)
+
+routed_moe_launch now has, ahead of the plan/staging setup:
+
+  DS4_V41_IQ2SOA_DIR + DS4_V41_IQ2SOA_LAYER select a layer whose three
+  aligned-SoA artifacts (l<layer>_gate.soa, _up.soa, _down.soa) are read once
+  into device tensors; when the layer matches and the V4.1 shape holds
+  (n_expert 6, 384 experts, mid 2304, in 5120, out 5120) the launcher calls
+  ds4_mmq_iq2_xxs_q2_K_moe_fused_soa with the caller's untouched global
+  `selected` ids and returns, bypassing staging/selected entirely.
+
+Inert by construction: with either env var unset the branch is skipped and the
+existing path runs unchanged. Verified to build; the artifact-run bit gate has not
+been executed yet, so nothing is promoted.
+
+## Layer-20 artifacts produced (gate + up); down needs the in-tree repack build
+
+findings/soa-l20/l20_gate.soa and l20_up.soa are packed from the real model with
+the verified tool:
+  blk.20.ffn_gate_exps.weight  384 experts, 17694720 blocks, 1167851584 B, identical
+  blk.20.ffn_up_exps.weight    384 experts, 17694720 blocks, 1167851584 B, identical
+
+The fused entry also needs an aligned Q2_K down artifact, whose layout is
+different (three planes: qs2 / sc4 / dm2, indexed by pairs - see
+load_tiles_q2_K_soa and `soa_npair`), and the in-tree producer for it is
+ds4_repack_build_iq2_aligned's Q2_K sibling in cuda/mmq/ds4_repack.h, used by
+tools/ds4_weight_server.cu and the in-process self-load build. The Python packer
+deliberately does not implement that layout; writing a second, unverified Q2_K
+packer is exactly the kind of guess that produced the two header bugs earlier.
+
+So the bit-exact gate cannot run yet: the fused SoA entry needs all three
+artifacts, gate+up are verified, down must come from ds4_repack. Next cycle:
+produce the Q2_K down artifact with the in-tree build for layer 20, then
+DS4_V41_IQ2SOA_DIR=$(pwd)/findings/soa-l20 DS4_V41_IQ2SOA_LAYER=20 and the logit
+gate, then the multi-pair measurements.
+
+## Q2_K repack producer traced: it builds device artifacts in-process, not files
+
+cuda/mmq/ds4_repack.h exposes the builders (ds4_repack_build_iq2_aligned,
+ds4_repack_build_q2k_aligned, ds4_repack_build_q8_aligned) which allocate through
+a caller-supplied ds4_repack_alloc_fn and hand back ds4_repack_artifact structs
+holding device pointers - i.e. they build *in-process device artifacts*, and the
+only in-tree caller is ds4_cuda.cu:4598 (the CUDA self-load build). File artifacts
+would come from tools/ds4_weight_server.cu, whose source is not in this checkout.
+
+Also: cuda/mmq/ds4_repack.o is in MMQ_OBJS for the Mer/CUDA build but is *not* in
+the ROCm object set used here (ROCM_MMQ_OBJS has no ds4_repack), so the producer is
+not compiled into ds4-bench at all.
+
+Consequence for the layer-20 gate: the Q2_K down artifact cannot be produced with
+an existing ROCm workflow. Two honest routes, both a bounded step rather than a
+guess:
+1. add cuda/mmq/ds4_repack to the ROCm build and call ds4_repack_build_q2k_aligned
+   (plus iq2 for gate/up) in-process with a device allocator, then feed those
+   pointers straight into ds4_mmq_iq2_xxs_q2_K_moe_fused_soa - which also removes
+   my file/env-dir mechanism entirely, since nothing needs to touch disk;
+2. extend the Python packer with the Q2_K three-plane layout - rejected earlier as
+   an unverified guess.
+
+Route 1 is the right one and is a small, well-scoped build + call-site change; the
+env-gated branch added earlier stays unpromoted and unused until then.
+
+## Smallest safe way to invoke the Q2_K producer for layer 20 (determined)
+
+CUDA caller pattern (ds4_cuda.cu:4585-4602): build ds4_repack_build_args with
+log_prefix/model_id/path/records/device/copy_chunk_bytes = 256 MB and *leave
+alloc_fn/alloc_ctx null* (the library's default allocator handles it), then call
+ds4_repack_build_q2k_aligned(args, artifacts, &part_bytes) and use the returned
+ds4_repack_artifact device pointers.
+
+ROCm build rule shape (Makefile:824-840): each mmq object is
+`cuda/mmq/<name>.rocm.o: <sources>` + `$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<`, and
+the object is listed in ROCM_MMQ_OBJS (Makefile:66), which currently has six
+entries and no ds4_repack.
+
+So the minimal safe invocation for layer 20 is:
+1. add `cuda/mmq/ds4_repack.rocm.o` (same pattern, sources = ds4_repack.cu +
+   ds4_repack.h) and append it to ROCM_MMQ_OBJS;
+2. in the SoA branch, ds4_repack_map_file + ds4_repack_collect_catalog on the model
+   path, keep only records whose name starts with "blk.20.", then call
+   ds4_repack_build_iq2_aligned and ds4_repack_build_q2k_aligned with the same args
+   shape the CUDA caller uses (256 MB staging, null allocator);
+3. pass the three artifact pointers straight to
+   ds4_mmq_iq2_xxs_q2_K_moe_fused_soa and drop the file/env-dir path entirely -
+   nothing needs to touch disk, and the two verified .soa files become only a
+   cross-check of the layout.
+
+That is a build-list change plus one call site, using the producer's own Q2_K
+layout, so no weight bytes are invented. The env-gated branch stays unpromoted
+until the bit-exact gate runs on those artifacts.
+
+## In-process Q2_K producer shim: written, not yet wired (build blocked on declaration scope)
+
+Wrote findings/soa-l20/ds4_rocm_repack.hip.pending: a self-contained shim that maps
+the model, collects the catalog, keeps blk.<layer>.* records, runs
+ds4_repack_build_iq2_aligned + ds4_repack_build_q2k_aligned with the CUDA caller's
+args shape (256 MB staging, null allocator) and returns the three artifact device
+pointers - i.e. the producer's own Q2_K layout, no invented bytes.
+
+Wiring attempt: added Makefile rules for cuda/mmq/ds4_repack.rocm.o and
+rocm/ds4_rocm_repack.rocm.o (appended to ROCM_MMQ_OBJS) and switched the launcher
+branch from the file/env-dir path to the in-process call. The build failed because
+the forward declarations of ds4_rocm_repack_layer and the fused SoA entry ended up
+inside routed_moe_launch's body rather than at file scope (same class of mistake as
+the earlier loader-signature patch), so the identifier was undeclared at the call
+site.
+
+Reverted rocm/ds4_rocm_moe_launch.cuh and Makefile; both binaries rebuild clean and
+git status shows no modified sources. The shim is parked as .pending next to the
+verified gate/up artifacts. Next attempt: place both extern "C" declarations at
+file scope above routed_moe_launch, keep the two Makefile rules, and switch the
+branch; then the bit-exact gate can finally run with a "blk.<layer>." record
+filter and DS4_V41_IQ2SOA_LAYER.
+
+## Layer-20 in-process SoA wiring builds (unpromoted, gate not yet run)
+
+Declarations moved to file scope above routed_moe_launch (the fix recorded last
+step) and the branch now drives the in-tree producer instead of files:
+
+  DS4_V41_IQ2SOA_MODEL + DS4_V41_IQ2SOA_LAYER
+    -> ds4_rocm_repack_layer(model, layer, &g, &u, &d): maps the GGUF, collects the
+       catalog, keeps blk.<layer>.* records, runs ds4_repack_build_iq2_aligned and
+       ds4_repack_build_q2k_aligned (256 MB staging, default allocator), and returns
+       the three artifact device pointers (producer's own Q2_K layout);
+    -> ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(g, u, d, x, selected /*global ids*/,
+       weights, gate, up, mid, down, ..., preserve_reduction = 1), returning before
+       staging is set up.
+
+Build: ds4-bench links clean with cuda/mmq/ds4_repack.rocm.o and
+rocm/ds4_rocm_repack.rocm.o added to ROCM_MMQ_OBJS.
+
+Still unpromoted and inert without both env vars. Cost notes for the gate run:
+the producer reads ~3.5 GB of layer-20 tensors once and allocates ~3.5 GB of device
+artifacts, so the first call is a one-off ~2-4 s plus memory the plan does not
+reserve - worth checking that admission still succeeds under the 92 GB cache.
+Next: run with the two env vars, compare frontier logits against the promoted
+binary (must be bit-identical), then the multi-pair measurement.
+
+## Layer-20 in-process SoA gate: FAILED (not bit-identical, and slower)
+
+Same binary, branch off vs on, 8K prefill:
+
+  off  183.33 tps, 44.68 s
+  on   169.45 tps, 48.35 s   ("V4.1 SoA repack layer 20 resident" logged once)
+  frontier logits: exact=False, max_abs = 2.84
+
+Two findings:
+1. The fused SoA pipeline does NOT reproduce the reference arithmetic. max_abs
+   2.84 is a semantic difference, not ULP rounding, so either
+   ds4_mmq_iq2_xxs_q2_K_moe_fused_soa's own gate/up/down flow (its gather,
+   quantization and reduction choices) differs from the staged V4.1 path by
+   design, or the artifact wiring selects the wrong planes/tensors. The branch
+   itself is behaving as coded (repack ran, the layer took the SoA route).
+2. It is also slower at this size: the one-off repack (~3.5 GB read + ~3.5 GB of
+   device artifacts) plus the fused pipeline costs more than the 1/40-layer
+   saving.
+
+Decision: the branch stays unpromoted and inert (needs both env vars). Closing the
+SoA line as a viable engine optimization for this build: the payoff ceiling was
+2-4% of prefill on one kernel while the cost is a full repack plus a numerically
+different pipeline. If it is ever revisited, the first question is whether
+ds4_mmq_iq2_xxs_q2_K_moe_fused_soa is expected to match the staged path at all -
+that must be answered before any artifact work.
+
+## Gate failure diagnosed: intentional numerical difference (Q8_K mid), not a mapping bug
+
+Evidence from the saved logits:
+  argmax identical (77179); top-5 the same five ids, positions 3/4 swapped
+  |delta| p50 0.423, p90 1.036, p99 1.627, max 2.842; 98.8% of the vocabulary moved
+  all top logits shrink (18.86 -> 16.76, 17.82 -> 16.27, 16.56 -> 14.68)
+
+That signature is a systematic precision loss, not mis-mapped tensors: a wrong
+plane or wrong tensor would give garbage, NaN or a different argmax entirely.
+
+Mechanism, from the fused entry: it passes allow_d2r = !preserve_reduction (so
+preserve_reduction=1 did select the raw MMQ reduction) but the fused pipeline
+"gathers and quantizes those rows for the Q2_K down MMQ" - i.e. it feeds the down
+projection Q8_K-quantized mid, whereas this engine's staged path feeds F16 mid
+(mid_h_hot, MID_F16=true). Q8 mid on the down input is a lossy step the staged
+path does not take, which explains a uniform, sign-consistent shrink of every
+top logit.
+
+So the SoA path as wired is a different numerical pipeline, and no amount of
+artifact work will make it bit-identical. The narrow fix, if SoA is ever pursued,
+is to use SoA only for gate/up: call ds4_mmq_iq2_xxs_moe_pair_soa (raw gate/up
+over the artifact), then the existing moe_swiglu_weighted_f32_kernel and F16 mid
+plus the staged Q2 down - which is bit-exact by construction and needs no fused
+entry.
+
+Branch stays unpromoted and inert; nothing further changed.
+
+## Assessment: gate/up-only SoA CAN preserve the staged arithmetic; implementation not landed
+
+Yes it can, through existing code: the launcher already contains the non-fused
+gate/up route - ds4_mmq_iq2_xxs_moe_pair (raw gate/up) followed by
+moe_swiglu_weighted_f32_kernel and f32_to_f16_kernel into iq2_hot_mid_h, then the
+staged Q2 down. Replacing only the gate/up call with
+ds4_mmq_iq2_xxs_moe_pair_soa (same impl, x_soa instead of raw, loader documented
+bit-identical) keeps F16 mid and the staged down untouched, so the result is
+bit-exact by construction - it is the same "raw write-back" path that already
+exists two lines below the fused call.
+
+Attempted exactly that: soa_gateup_ready hoisted to function scope, the SoA layer
+routed through ds4_mmq_iq2_xxs_moe_pair_soa, and the two `use_fused_swiglu`
+conditions changed to `use_fused_swiglu && !soa_gateup_ready` so the staged
+SwiGLU + F16 mid epilogue runs for that layer. The hoist did not apply (the anchor
+did not match) while the second edit removed the local declaration, so soa_dev was
+undeclared at the use site and the build failed; the auto-revert guard in the same
+command did not fire.
+
+Restored rocm/ds4_rocm_moe_launch.cuh from a saved copy; ds4-bench rebuilds with
+zero errors and git status shows no modified sources. The change is a 4-line edit
+once the anchors are taken verbatim from the file; remaining gate is the same
+bit-exact comparison, which should now pass, followed by the multi-pair run to see
+whether the dequant saving survives the repack cost.
+
+## Gate/up-only SoA also fails the bit gate (max_abs 15.2) - line closed for good
+
+Implemented the narrow variant exactly as assessed: the SoA layer's gate/up comes
+from ds4_mmq_iq2_xxs_moe_pair_soa (raw write-back), and the existing
+moe_swiglu_weighted_f32_kernel + f32_to_f16_kernel + staged Q2 down stay in charge
+(the epilogue conditions became use_fused_swiglu && !soa_gateup_ready). Build
+clean.
+
+Gate at 8K, same binary, branch off vs on:
+  off 183.90 tps, on 175.40 tps, decode 12.24 -> 6.47 tps
+  frontier logits exact=False, max_abs 15.21   (worse than the fused variant's 2.84)
+
+So the SoA gate/up values themselves do not match this engine's gate/up, i.e. the
+fault is in the artifact/loader contract rather than in the mid boundary. Likely
+candidates: the artifact's expert stride (soa_blocks = 384*2304*20 is the whole
+tensor, not per expert), or the ids the pair_soa entry receives versus the staged
+table order. Diagnosing that needs the loader-side block math checked against the
+producer's layout - work I cannot complete in this session, and not worth guessing
+at.
+
+Reverted rocm/ds4_rocm_moe_launch.cuh (branch returns to the previously committed
+fused variant, which is itself unpromoted and inert). ds4-bench rebuilds with zero
+errors and no sources are modified. The SoA line is closed: three variants
+(fused, gate/up-only) all fail the bit gate by orders more than the 2-4% upside.
