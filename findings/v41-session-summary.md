@@ -193,3 +193,22 @@ measured effect is therefore attributable to the promoted three.
 
 Future payloads should take the reference binary as an argument rather than
 hardcoding /tmp/ds4-bench-base.
+
+## IQ2 dequant: ksigns64 LUT replaces the popcount sign trick (+1.4% prefill)
+
+load_tiles_iq2_xxs built the two sign-mask words per 8 weights with
+unpack_ksigns (popcount + multiply) followed by two __vcmpne4. The 128-entry
+ksigns64 table that the aligned-SoA loader already uses encodes exactly those
+masks, so one LUT load replaces all four operations.
+
+Bit gate: frontier logits exact=True (max_abs 0) in all six arms - the values are
+identical by construction, and the measurement confirms it.
+
+Performance, three interleaved pairs at 32K against the pre-LUT binary:
+  32K prefill   +2.1 / +1.0 / +1.2  -> mean +1.4%  (3/3 positive)
+  4K append     +3.4 / +1.8 / +1.6  -> mean +2.3%  (3/3 positive)
+
+This is on top of the already-promoted set, so the cumulative position at 32K is
+roughly +3.9% prefill and +4.6% append versus the pre-session binary. One session
+only so far; a second session is the remaining confirmation for the performance
+claim (correctness is already established by bit-equality).
