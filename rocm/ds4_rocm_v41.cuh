@@ -1354,10 +1354,13 @@ static int g_v41_q8b4_pf_set;
 static void v41_q8b4_prefetch_publish(void) {
     if (g_v41_q8b4_pf_set) return;
     g_v41_q8b4_pf_set = 1;
-    const uint32_t on = getenv("DS4_ROCM_V41_Q8_BLOCKS4_PREFETCH") != NULL ? 1u : 0u;
+    /* Promoted: the unrolled blocks4 loop is on by default; =0 restores the
+     * plain loop. */
+    const char *pf_env = getenv("DS4_ROCM_V41_Q8_BLOCKS4_PREFETCH");
+    const uint32_t on = (pf_env != NULL && pf_env[0] == '0' && pf_env[1] == '\0') ? 0u : 1u;
     (void)hipMemcpyToSymbol(HIP_SYMBOL(g_v41_q8b4_pf), &on, sizeof(on), 0,
                             hipMemcpyHostToDevice);
-    if (on) fprintf(stderr, "ds4: V4.1 Q8 blocks4 register prefetch active\n");
+    if (on) fprintf(stderr, "ds4: V4.1 Q8 blocks4 unrolled loop active\n");
 }
 
 __global__ static void v41_q8_f32_blocks4_kernel(float *out,
@@ -1533,7 +1536,11 @@ extern "C" int ds4_gpu_dsv41_q8_projection_pair_rows(
         uint64_t offset_a, uint32_t outputs_a,
         uint64_t offset_b, uint32_t outputs_b,
         uint32_t width, const ds4_gpu_tensor *in) {
-    if (getenv("DS4_ROCM_V41_Q8_FUSE_QAKV") == NULL) return 0;
+    /* Promoted: q_a+kv fusion is on by default; =0 restores two launches. */
+    {
+        const char *e = getenv("DS4_ROCM_V41_Q8_FUSE_QAKV");
+        if (e != NULL && e[0] == '0' && e[1] == '\0') return 0;
+    }
     if (!out_a || !out_b || !model_map || !in || !width || width % 32u ||
         !outputs_a || !outputs_b || !ds4_rocm_is_gfx1151()) return 0;
     if (!cuda_tensor_has_elems2(in, width, 1u, 4u) ||
