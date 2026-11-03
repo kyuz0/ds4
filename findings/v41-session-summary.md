@@ -102,3 +102,16 @@ Remaining work, in value order:
 3. Kernel work under the shape-noise gate: MMQ IQ2 dequant instruction count
    (18.3% of prefill) and indexer GEMM tiling (12.7%, needs a top-k stability
    check because larger batches measured -10%).
+
+## 110K decode multi-pair (two interleaved pairs, bit-exact)
+
+Frontier 110592, gen 32, pre-session binary vs current defaults, 15 s warm-up:
+
+  pair1  prefill 140.39 -> 143.04 tps (+1.9%),  decode 10.360 -> 10.680 tps (+3.1%)
+  pair2  prefill 139.68 -> 143.37 tps (+2.6%),  decode 10.620 -> 11.140 tps (+4.9%)
+  frontier logits exact=True (max_abs 0) in both pairs
+
+Together with the three earlier single pairs, 110K decode is positive in five of
+five measurements (+3.1, +4.9, +5.2, +6.0, +8.9%) and prefill in five of five
+(+1.9, +2.6, +2.4, +2.9, +3.0%), always bit-identical. This closes the last figure
+that rested on single pairs per session.
