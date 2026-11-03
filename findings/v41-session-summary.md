@@ -511,3 +511,25 @@ partial conversion is the one outcome that could silently corrupt routing. The
 motivating measurement stands (keys carry ~4 bits of information in 32; 671 -> 89
 MB/token at 32K ratio 1, 2267 -> 302 MB/token at 110K), and the recipe is fully
 written down including this corrected scope.
+
+## FP4 index-cache pack/decode transform: verified bitwise on all captures
+
+tools/verify-index-fp4-pack.cu implements the pack/decode pair for the measured
+layout - 4 x E8M0 scale bytes (block size 32, matching v41_quantize_kernel's
+FP4_E8M0 path) + 64 nibble bytes holding 3 magnitude bits and 1 sign bit per value,
+68 B per 128-value key - and checks it against every captured cache:
+
+  all 10 captures, 127 keys x 128 values each:
+  packed_bytes=8636 vs f32_bytes=65024  bitwise_mismatches = 0
+
+Two real bugs were found and fixed by that check, both worth recording because they
+are the traps for this work:
+1. placing the four scale bytes at b[0..3] while nibbles started at b[1] made them
+   overlap - 1701 mismatches, every one a value from block 0/1/2;
+2. signed zero: testing `v < 0.0f` misses -0.0, so nine of the ten captures showed
+   1002 mismatches that were all `-0 != 0`. The sign bit must be tested directly,
+   which is exactly why v41_quantize_kernel re-applies
+   `(bits & 0x7fffffff) | (value_bits & 0x80000000)` after quantising.
+
+So the transform itself is now proven exact (not merely close), and the remaining
+work is the plumbing across the two writers and five readers already mapped.
