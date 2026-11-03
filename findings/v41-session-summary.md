@@ -81,3 +81,24 @@ Frontier 65536 plus a 4K append (69632), pre-session binary vs current defaults:
 That closes the context-coverage gap: the promoted set is now measured at 32K
 (+2.5% prefill, +2.3% append, 3 pairs), 64K (+3.0% / +3.6%, 2 pairs) and 110K
 (+2.4..3.0% / +3.4..4.5%, 3 pairs), with decode +5-9%, every arm bit-identical.
+
+## Final state check (after the 64K confirmation)
+
+Both shipped binaries carry the promoted paths: `ds4-bench` (3dc11904, 19:33) and
+`ds4-server` (58bda5ba, 17:34) each contain the fused-SwiGLU MMQ message, the Q8
+blocks4 unrolled-loop message and the decode-cache-grow message, i.e. the same
+code state the benchmarks measured. Only the three pre-existing dirty files
+(EXPERIMENTS.md, ds4_bench.c, ds4_help.c) remain modified, untouched by this work.
+
+Context coverage is now complete for the promoted set: 32K (+2.5% prefill, +2.3%
+append, 3 pairs), 64K (+3.0%, +3.6%, 2 pairs), 110K (+2.4..3.0%, +3.4..4.5%,
+3 pairs), decode +5-9%, all bit-identical.
+
+Remaining work, in value order:
+1. 110K decode multi-pair - the only figure still resting on single pairs per
+   session (two pairs would need ~54 min, inside the supervisor limit but tight).
+2. Deployment: rebuild the cockpit image from the host ds4-server and repeat one
+   API-level 32K pair; the container has been deliberately left untouched.
+3. Kernel work under the shape-noise gate: MMQ IQ2 dequant instruction count
+   (18.3% of prefill) and indexer GEMM tiling (12.7%, needs a top-k stability
+   check because larger batches measured -10%).
