@@ -368,3 +368,36 @@ selected compressed indices must not move, otherwise routing changes downstream.
 Measured prerequisite (cheap): confirm the read volume with rocprof FETCH_SIZE on
 v41_indexer_batch_warp8_kernel at 32K decode, and check the score deltas that an
 F16 key cache would introduce before committing to the change.
+
+## The index cache is FP4-valued but stored as F32 (7.5x avoidable traffic)
+
+Offline analysis of the captured layer-20 indexer cache
+(attention_core_index_20_index_cache3_8065_8192.raw, 127 keys x 128 values):
+
+  distinct values: 23, and they are exactly {0, +-0.0625, 0.125, 0.1875, 0.25,
+  0.375, 0.5, 0.75, 1, 1.5, 2, 3} - i.e. FP4 (E2M1) magnitudes times a per-block
+  power-of-two E8M0 scale, which is the engine's own DS4_V41_FP4_E8M0 format
+  (index_q is already quantised that way before scoring)
+  every value is an exact multiple of 1/16; max |v| = 3
+  F16-rounding the keys reproduces every value exactly (0/16256 changed), and the
+  F32-vs-F16 score delta over all 32 heads is 0 with 0/127 rank moves
+
+So the keys carry about 4 bits of information per value while occupying 32. Packed
+FP4_E8M0 (4 bits + one scale byte per 32 values) is ~7.5x smaller and reconstructs
+the same values, hence the same dot products and the same selected indices - a
+bit-exact change, not a shape-noise one.
+
+Traffic effect at the current rates (40 layers, whole key set per token):
+  32K  ratio 1: 671 MB -> 89 MB     110K ratio 1: 2267 MB -> 302 MB
+  32K  ratio 4: 168 MB -> 22 MB     110K ratio 4:  566 MB ->  75 MB
+
+Implementation path: store g->index_cache[] in the FP4_E8M0 layout the engine
+already produces (ds4_gpu_dsv41_quantize with DS4_V41_FP4_E8M0), have
+ds4_gpu_dsv41_indexer_scores_batch / v41_indexer_batch_warp8_kernel dequantise in
+registers, and keep the same dot-product order so the scores are identical. Gate:
+bit-identical frontier logits first (the values are unchanged by construction),
+then the usual multi-pair run with decode as the metric.
+
+Caveat to close first: the sample is one layer of one capture (127 keys). Confirm
+the codebook holds across layers and positions - e.g. two more layers from the same
+capture set or a fresh diag run - before implementing.
