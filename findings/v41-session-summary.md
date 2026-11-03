@@ -423,3 +423,37 @@ the FP4_E8M0 layout, update the level publish path that writes it
 (ds4.c:41045 copies 128 floats per key), and teach
 ds4_gpu_dsv41_indexer_scores_batch / v41_indexer_batch_warp8_kernel to dequantise in
 registers while keeping the dot-product order, then gate on bit-identical logits.
+
+## index_cache FP4 repack: exact diff identified, not started
+
+Inspection resolves the whole shape of the change:
+
+Allocation (ds4.c:40679-40680)
+  cap = ctx/(i<3?2:1)+1;  index_cache[i] = alloc(cap * 128 * sizeof(float))   -> F32, 512 B/key
+Publish (ds4.c:41044-41046), per new compressed key:
+  ds4_gpu_dsv41_quantize(g->index_k, 128, 1, DS4_V41_FP4_E8M0)   // FP4 quantise, still F32 storage
+  ds4_gpu_tensor_copy(g->index_cache[owner], (n_comp-1)*128*4, g->index_k, 0, 128*4)
+Score (rocm/ds4_rocm_v41.cuh: ds4_gpu_dsv41_indexer_scores_batch -> v41_indexer_batch_warp8_kernel)
+  reads keys as `const float *`, 128 floats per key.
+
+So the values are already quantised to FP4 and then copied as 32-bit floats: the
+publish path writes 512 B where 65 B (one E8M0 scale byte + 64 B of nibbles) carry
+the same information.
+
+Minimal bit-exact change set (five pieces):
+1. allocate index_cache[i] as cap * 65 bytes instead of cap * 512;
+2. add a "pack FP4_E8M0" kernel that writes the packed key (same scale/value
+   arithmetic the current in-place F32 quantiser uses, so the decoded values are
+   bit-identical);
+3. publish: run that kernel from g->index_k into the cache slot, replacing the
+   quantise + 128*4 copy;
+4. add a packed-key variant of the warp8 scoring kernel that loads the scale byte
+   and nibbles and dequantises into registers, keeping the per-head dot order;
+5. dispatch the packed variant wherever index_cache is scored.
+Gate: frontier logits bit-identical (the decoded values are unchanged), then the
+multi-pair run with decode as the metric.
+
+Not started: this is a new quantiser kernel plus a new scoring kernel on the decode
+hot path, and it cannot be written, built and gated in the remaining budget. A
+half-finished variant here would risk the indexer's correctness, which propagates
+into routing - clearly worse than deferring it.
