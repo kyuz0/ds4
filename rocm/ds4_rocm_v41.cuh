@@ -1568,6 +1568,10 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
     const unsigned char *weights = (const unsigned char *)cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "V4.1 Q8 projection");
     if (!weights) return 0;
+    /* Opt-in: round to bf16 inside the rowtile epilogue and report it with a
+     * return value of 2 so the caller can drop its separate rounding pass. */
+    const bool want_bf16 = ds4_q8_bf16_fused() && g_q8_round_request != 0;
+    int rounded_in_kernel = 0;
     if (rows == 1u && ds4_rocm_is_gfx1151()) {
         v41_q8b4_prefetch_publish();
         v41_q8b4_log_shape("rows1", width, outputs, (uint64_t)(width / 32u) * 34u, rows);
@@ -1582,9 +1586,16 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
         /* Query-B, including contiguous two-rank weight slices.
          * This numerical path rounds activations and decoded Q8 weights to
          * F16 before F32 accumulation; quality mode retains the F32 path. */
-        matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 16u><<<dim3(outputs / 256u, (rows + 63u) / 64u), 512u>>>(
+        if (want_bf16) {
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 16u, true><<<dim3(outputs / 256u, (rows + 63u) / 64u), 512u>>>(
+                (float *)out->ptr, weights, (const float *)in->ptr,
+                rows, width, outputs, UINT64_C(40) * 34u);
+            rounded_in_kernel = 1;
+        } else {
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 16u><<<dim3(outputs / 256u, (rows + 63u) / 64u), 512u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             rows, width, outputs, UINT64_C(40) * 34u);
+        }
     } else if (!g_quality_mode && rows >= 32u && rows <= 2048u && rows != 128u && ds4_rocm_is_gfx1151() &&
                ((width == 5120u && (outputs == 512u || outputs == 1280u || outputs == 2304u)) ||
                 (width == 2304u && outputs == 5120u))) {
@@ -1605,10 +1616,17 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
                     (float *)out->ptr, weights, (const float *)in->ptr,
                     rows, width, outputs, (uint64_t)(width / 32u) * 34u);
         } else {
+            if (want_bf16) {
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 8u, true><<<dim3((outputs + 255u) / 256u, (rows + 63u) / 64u), 512u>>>(
+                (float *)out->ptr, weights, (const float *)in->ptr,
+                    rows, width, outputs, (uint64_t)(width / 32u) * 34u);
+            rounded_in_kernel = 1;
+        } else {
             matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 8u>
                 <<<dim3((outputs + 255u) / 256u, (rows + 63u) / 64u), 512u>>>(
                     (float *)out->ptr, weights, (const float *)in->ptr,
                     rows, width, outputs, (uint64_t)(width / 32u) * 34u);
+        }
         }
     } else if (width == 1280u && outputs == 32768u && rows >= 32u && rows <= 2048u && ds4_rocm_is_gfx1151()) {
         /* Reuse sixteen query-B activation rows with the same F32 lane
@@ -1624,7 +1642,8 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
         matmul_q8_0_f32_batch_warp8_kernel<<<dim3((unsigned)(((uint64_t)outputs + 7u) / 8u), rows), 256>>>(
             (float *)out->ptr, weights, (const float *)in->ptr, width, outputs, rows, width / 32u);
     }
-    return cuda_ok(cudaGetLastError(), "V4.1 F32-input Q8 projection");
+    if (!cuda_ok(cudaGetLastError(), "V4.1 F32-input Q8 projection")) return 0;
+    return rounded_in_kernel ? 2 : 1;
 }
 
 extern "C" int ds4_gpu_dsv41_shared_gate_up_swiglu_bf16_rows(

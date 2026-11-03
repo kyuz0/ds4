@@ -202,6 +202,7 @@ int ds4_gpu_dsv41_q8_projection_pair_rows(
         uint64_t offset_b, uint32_t outputs_b,
         uint32_t width, const ds4_gpu_tensor *in);
 
+void ds4_gpu_dsv41_q8_set_round(int on);
 int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out,
                                     const void *model_map, uint64_t model_size,
                                     uint64_t weight_offset, uint32_t width,

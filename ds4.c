@@ -40759,6 +40759,9 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
         return ok && (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
     }
     if (weight->type == DS4_TENSOR_F16 || weight->type == DS4_TENSOR_Q8_0) {
+#ifdef DS4_ROCM_BUILD
+        if (weight->type == DS4_TENSOR_Q8_0) ds4_gpu_dsv41_q8_set_round(round ? 1 : 0);
+#endif
         const bool ok = weight->type == DS4_TENSOR_F16 ?
             ds4_gpu_dsv41_projection_rows(out, m->map, m->size, weight->abs_offset,
                 (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], 1u, in) :
@@ -40786,12 +40789,19 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
      * requested output rounding after either projection. */
     if (!g_ds41_dspark_verify_dense &&
         (weight->type == DS4_TENSOR_F16 || weight->type == DS4_TENSOR_Q8_0)) {
-        ok = weight->type == DS4_TENSOR_F16 ?
+#ifdef DS4_ROCM_BUILD
+        if (weight->type == DS4_TENSOR_Q8_0) ds4_gpu_dsv41_q8_set_round(round ? 1 : 0);
+#endif
+        const int rc = weight->type == DS4_TENSOR_F16 ?
             ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
                 weight->abs_offset, width, outputs, count, in) :
             ds4_gpu_dsv41_q8_projection_rows(out, m->map, m->size,
                 weight->abs_offset, width, outputs, count, in);
-        return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
+#ifdef DS4_ROCM_BUILD
+        /* rc == 2 means the projection rounded to bf16 in its epilogue. */
+        if (rc == 2) return 1;
+#endif
+        return rc && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
     }
 #endif
     /* Small decode batches retain scalar reductions before BF16 and sparse

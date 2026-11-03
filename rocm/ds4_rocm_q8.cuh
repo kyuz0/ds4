@@ -623,7 +623,19 @@ typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
  * into LDS as f16, while each wave owns 16 output rows and computes four
  * 16-token WMMA columns.  It is opt-in from host code because it only wins once
  * the token batch is large enough to amortize the bigger tile. */
-template <uint32_t M_TILE, uint32_t WARPS, uint32_t PAD=0>
+__device__ static float ds4_q8_bf16_round(float x) {
+    uint32_t bits = __float_as_uint(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return __uint_as_float(bits & 0xffff0000u);
+}
+
+__global__ static void ds4_q8_bf16_round_kernel(float *x, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) x[i] = ds4_q8_bf16_round(x[i]);
+}
+
+template <uint32_t M_TILE, uint32_t WARPS, uint32_t PAD=0, bool BF16_OUT=false>
 __launch_bounds__(WARPS * 32u, 1)
 __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
         float *out,
@@ -726,7 +738,10 @@ __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
 #pragma unroll
         for (uint32_t j = 0; j < 8u; j++) {
             const uint32_t row = warp_m + 2u * j + (lane >> 4u);
-            if (row < out_dim) out[(uint64_t)tok * out_dim + row] = acc[j];
+            if (row < out_dim) {
+                out[(uint64_t)tok * out_dim + row] =
+                    BF16_OUT ? ds4_q8_bf16_round(acc[j]) : acc[j];
+            }
         }
     }
 }

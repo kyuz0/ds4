@@ -96,6 +96,20 @@ __global__ static void matmul_f16_tinym24_wmma_kernel(
     for (uint32_t i=tid;i<M*BN;i+=WAVES*32u) { const uint32_t n=i/M,r=i-n*M; out[r+(uint64_t)(n0+n)*M]=sc[r+n*BM]; }
 }
 
+static int g_q8_round_request;
+extern "C" void ds4_gpu_dsv41_q8_set_round(int on) { g_q8_round_request = on ? 1 : 0; }
+
+static bool ds4_q8_bf16_fused(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_ROCM_Q8_FUSE_BF16") != NULL ? 1 : 0;
+    return cached != 0;
+}
+
+static void ds4_q8_round_output(float *out, uint64_t count) {
+    if (count == 0) return;
+    ds4_q8_bf16_round_kernel<<<(unsigned)((count + 255u) / 256u), 256>>>(out, count);
+}
+
 template <uint32_t BT>
 static void cuda_launch_q8_batch_sharedx_bt(
         float *out,
@@ -428,7 +442,8 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
                                                      x, n_tok, "q8_f16_out");
 }
 
-static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
+static int g_q8_bf16_in_kernel;
+static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map ||
         in_dim == 0u || out_dim == 0u || n_tok == 0u ||
         in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
@@ -620,7 +635,20 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 const dim3 grid((uint32_t)((out_dim + 255u) / 256u),
                                 (uint32_t)((n_tok + 63u) / 64u),
                                 1u);
-                matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u><<<grid, 512u>>>(
+                const bool fused_bf16 = ds4_q8_bf16_fused() && g_q8_round_request != 0;
+                if (fused_bf16) {
+                    matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 0u, true><<<grid, 512u>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+                    g_q8_bf16_in_kernel = 1;
+                    return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 16w bf16 launch");
+                }
+                matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 0u, false><<<grid, 512u>>>(
                         (float *)out->ptr,
                         reinterpret_cast<const unsigned char *>(wptr),
                         (const float *)x->ptr,
@@ -633,7 +661,19 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             const dim3 grid((uint32_t)((out_dim + 127u) / 128u),
                             (uint32_t)((n_tok + 63u) / 64u),
                             1u);
-            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u><<<grid, 256u>>>(
+            if (ds4_q8_bf16_fused() && g_q8_round_request != 0) {
+                matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u, 0u, true><<<grid, 256u>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    (const float *)x->ptr,
+                    (uint32_t)n_tok,
+                    (uint32_t)in_dim,
+                    (uint32_t)out_dim,
+                    blocks * 34u);
+                g_q8_bf16_in_kernel = 1;
+                return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 8w bf16 launch");
+            }
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u, 0u, false><<<grid, 256u>>>(
                     (float *)out->ptr,
                     reinterpret_cast<const unsigned char *>(wptr),
                     (const float *)x->ptr,
@@ -764,6 +804,21 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                            in_dim, out_dim, n_tok, blocks,
                                            use_dp4a);
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 launch");
+}
+
+/* Opt-in: guarantee every Q8 projection output is bf16-rounded when
+ * DS4_ROCM_Q8_FUSE_BF16 is set, either in-kernel (hot paths) or with one
+ * follow-up pass, so callers can drop their separate rounding pass. */
+static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
+    g_q8_bf16_in_kernel = 0;
+    const int ok = cuda_matmul_q8_0_tensor_labeled_impl(out, model_map, model_size,
+        weight_offset, in_dim, out_dim, x, n_tok, label);
+    if (ok && ds4_q8_bf16_fused() && g_q8_round_request != 0 && !g_q8_bf16_in_kernel) {
+        ds4_q8_round_output((float *)out->ptr, n_tok * out_dim);
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
