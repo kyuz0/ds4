@@ -115,3 +115,18 @@ Together with the three earlier single pairs, 110K decode is positive in five of
 five measurements (+3.1, +4.9, +5.2, +6.0, +8.9%) and prefill in five of five
 (+1.9, +2.6, +2.4, +2.9, +3.0%), always bit-identical. This closes the last figure
 that rested on single pairs per session.
+
+## Generalisation gate: bit-identical on an unseen prompt
+
+Every tuning measurement used speed-bench/promessi_sposi.txt, so the promoted set
+was re-checked against a prompt built from repository sources (698 827 bytes of
+README/AGENTS/Makefile/headers/kernels), never used for tuning:
+
+  frontier logits exact=True, max_abs 0, argmax identical
+  generated text identical (8 greedy tokens)
+
+So the promoted changes are input-independent at the bit level, not just on the
+tuning prompt. The timings from that run (prefill 164.74 -> 175.85 tps, decode
+11.34 -> 7.62 tps) are single runs with only 8 generated tokens, so decode is
+dominated by first-token cost and neither figure is evidence - the multi-pair
+measurements at gen 32-64 remain the numbers of record.
