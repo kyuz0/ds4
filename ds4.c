@@ -41112,8 +41112,30 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
     const bool profile = ds41_decode_stage_profile_on();
     double start = now_sec();
+    bool fused_qakv = false;
+#ifdef DS4_ROCM_BUILD
+    /* Opt-in: q_a and kv read the same norm row and share width/row_bytes, so
+     * one fused launch replaces two. Values are bit-identical. */
+    if (g->tp_world == 1u && l->attn_q_a->type == DS4_TENSOR_Q8_0 &&
+        l->attn_kv->type == DS4_TENSOR_Q8_0 &&
+        (uint32_t)l->attn_q_a->dim[0] == 5120u && (uint32_t)l->attn_kv->dim[0] == 5120u &&
+        ds4_gpu_dsv41_q8_projection_pair_rows(g->qr, g->kv, m->map, m->size,
+            l->attn_q_a->abs_offset, (uint32_t)l->attn_q_a->dim[1],
+            l->attn_kv->abs_offset, (uint32_t)l->attn_kv->dim[1],
+            5120u, g->norm)) {
+        fused_qakv = ds41_bf16(g->qr, (uint32_t)l->attn_q_a->dim[1]) &&
+                     ds41_bf16(g->kv, (uint32_t)l->attn_kv->dim[1]) &&
+                     ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
+                     ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
+        if (!fused_qakv) return false;
+    }
+    bool ok = fused_qakv ? true :
+        (ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
+         ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm));
+#else
     bool ok = ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
         ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm);
+#endif
     if (profile) ok = ds41_decode_stage_profile_mark("attn_q_a", il, start, ok);
     if (ok) {
         start = now_sec();
@@ -41121,7 +41143,7 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
                               g->tp_rank * q_dim, q_dim);
         if (profile) ok = ds41_decode_stage_profile_mark("attn_q_b", il, start, ok);
     }
-    if (ok) {
+    if (ok && !fused_qakv) {
         start = now_sec();
         ok = ds41_matmul(g->kv, m, l->attn_kv, g->norm, true) &&
             ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);

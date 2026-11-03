@@ -191,6 +191,17 @@ int ds4_gpu_dsv41_hc_project(ds4_gpu_dsv41_hc_plan **plan,
 void ds4_gpu_dsv41_hc_plan_free(ds4_gpu_dsv41_hc_plan *plan);
 
 /* Preserve V4.1 activation formats while applying Q8 weights. */
+/* Opt-in fused single-row Q8 pair projection (decode q_a + kv): one launch
+ * for two matrices that share width/row_bytes and the same input row.
+ * Returns 1 when enqueued, 0 when unsupported so callers keep the pair of
+ * single projections. Values are bit-identical to the single form. */
+int ds4_gpu_dsv41_q8_projection_pair_rows(
+        ds4_gpu_tensor *out_a, ds4_gpu_tensor *out_b,
+        const void *model_map, uint64_t model_size,
+        uint64_t offset_a, uint32_t outputs_a,
+        uint64_t offset_b, uint32_t outputs_b,
+        uint32_t width, const ds4_gpu_tensor *in);
+
 int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out,
                                     const void *model_map, uint64_t model_size,
                                     uint64_t weight_offset, uint32_t width,
