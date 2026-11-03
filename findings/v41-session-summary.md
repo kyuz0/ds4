@@ -401,3 +401,25 @@ then the usual multi-pair run with decode as the metric.
 Caveat to close first: the sample is one layer of one capture (127 keys). Confirm
 the codebook holds across layers and positions - e.g. two more layers from the same
 capture set or a fresh diag run - before implementing.
+
+### FP4 codebook verification across captures: 10/10 clean
+
+All available index_cache captures (five sessions x both arms, layer 20,
+positions 8065..8192, 16 256 values each):
+
+  values 16256, distinct 23, values outside the FP4(E2M1) x E8M0 codebook: 0,
+  max |v| = 3 - identical in every capture
+
+So the FP4-valued property is stable across sessions and across the two arms, not a
+one-off. No exceptions to report. Coverage limit worth stating: every capture is
+layer 20 (the diagnostic probe is layer-scoped) and the same level (index_cache3),
+so layers 0..19/21..39 and levels 0..2 are inferred rather than sampled - but the
+values are produced by one shared quantise path (the same one that already emits
+DS4_V41_FP4_E8M0 for index_q), so the property belongs to the format rather than to
+a layer.
+
+Implementation is the next step and is a real change: repack g->index_cache[] into
+the FP4_E8M0 layout, update the level publish path that writes it
+(ds4.c:41045 copies 128 floats per key), and teach
+ds4_gpu_dsv41_indexer_scores_batch / v41_indexer_batch_warp8_kernel to dequantise in
+registers while keeping the dot-product order, then gate on bit-identical logits.
