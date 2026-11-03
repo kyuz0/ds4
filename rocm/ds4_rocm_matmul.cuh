@@ -661,6 +661,26 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
             const dim3 grid((uint32_t)((out_dim + 127u) / 128u),
                             (uint32_t)((n_tok + 63u) / 64u),
                             1u);
+            /* Opt-in: PAD=8 removes the LDS bank conflicts the GEMM article's
+             * step 3 describes; only the shared-memory layout changes. */
+            static const bool pad8 = getenv("DS4_ROCM_Q8_PAD8") != NULL;
+            if (pad8) {
+                if (ds4_q8_bf16_fused() && g_q8_round_request != 0) {
+                    matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u, 8u, true><<<grid, 256u>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr, (uint32_t)n_tok, (uint32_t)in_dim,
+                        (uint32_t)out_dim, blocks * 34u);
+                    g_q8_bf16_in_kernel = 1;
+                    return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 8w bf16 pad8 launch");
+                }
+                matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u, 8u, false><<<grid, 256u>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr, (uint32_t)n_tok, (uint32_t)in_dim,
+                        (uint32_t)out_dim, blocks * 34u);
+                return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 8w pad8 launch");
+            }
             if (ds4_q8_bf16_fused() && g_q8_round_request != 0) {
                 matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u, 0u, true><<<grid, 256u>>>(
                     (float *)out->ptr,
