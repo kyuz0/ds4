@@ -457,3 +457,30 @@ Not started: this is a new quantiser kernel plus a new scoring kernel on the dec
 hot path, and it cannot be written, built and gated in the remaining budget. A
 half-finished variant here would risk the indexer's correctness, which propagates
 into routing - clearly worse than deferring it.
+
+## FP4 helpers inspected: the pack kernel is now fully specified
+
+Helpers that already exist (rocm/ds4_rocm_norm_rope.cuh:332-357):
+  dsv4_e2m1fn_value_dev(i)  - the 8 E2M1 magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6}
+  dsv4_e2m1fn_dequant_dev(x) - round-to-nearest of those magnitudes with sign,
+    implemented as a search that already determines the code index `best`
+And the current key quantiser (rocm/ds4_rocm_v41.cuh:61-86, v41_quantize_kernel with
+DS4_V41_FP4_E8M0) does, per 32-value block:
+  scale = pow2_ceil(max(amax, tiny) / 6)          -> a power of two
+  stored = dequant_e2m1(|v| / scale) * scale       -> F32, sign preserved
+
+Two consequences that make the repack cheap and bit-exact:
+1. the scale is always a power of two, so it needs one E8M0 byte per 32 values;
+2. the stored value is exactly value(code) * scale, so packing the code (3 magnitude
+   bits + 1 sign bit) and decoding with the same multiply reproduces the current F32
+   bits exactly - no re-rounding and no tolerance.
+
+So the pack kernel is: same per-block scale computation, code = the `best` index the
+dequant search already finds, emit nibble + one scale byte; the decode in the scorer
+is value(code) * 2^(exp-127). Storage 65 B/key instead of 512 B.
+
+Still not implemented: it is a new kernel pair on the decode hot path and the
+remaining budget cannot carry it through build, bit gate, multi-pair and a top-k
+stability check. Everything needed is now written down: allocation cap*65, the pack
+kernel semantics above, the publish replacement, a packed-key warp8 scoring variant
+keeping the per-head dot order, and the dispatch.
