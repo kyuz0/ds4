@@ -155,3 +155,41 @@ ds4_server.o + ds4_kvstore.o + rax) is healthy, not just present in the file lis
 With that, the release surface is complete and verified at the binary level:
 ds4, ds4-server and ds4-bench all build from the current sources, all contain the
 promoted paths, and all start correctly.
+
+## Reproducibility caveat: the reference binary is a build artifact, not a commit
+
+Every promoted A/B compared against `/tmp/ds4-bench-base`
+(sha256 17995cba…, 2026-11-03 08:59). That binary was captured from the working
+tree at the start of the jlimit work, i.e. it matches **no commit**: it postdates
+41bb7cf (which already contains the session's earlier diagnostic changes) and
+predates the promoted changes. After a reboot or /tmp cleanup the reference is
+gone and the +2.5%/+3.0%/+2.4% figures cannot be re-derived with that payload.
+
+To re-anchor future comparisons on versioned code instead, rebuild a reference
+from a worktree at the pre-promotion commit and capture it under findings/:
+
+  git worktree add /tmp/base-41bb7cf 41bb7cf
+  cd /tmp/base-41bb7cf && make -j8 ds4-bench \
+    CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o \
+      ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o \
+      cuda/mmq/ds4_ggml_stubs.rocm.o cuda/mmq/ds4_mmq.rocm.o cuda/mmq/quantize.rocm.o \
+      cuda/mmq/mmid.rocm.o cuda/mmq/mmvq.rocm.o cuda/mmq/d2r_stubs.rocm.o \
+      rocm/v41_gate_up/tiles/descriptors.o rocm/v41_gate_up/tiles/twin.o \
+      rocm/v41_gate_up/tiles/wide.o rocm/v41_gate_up/runtime.o \
+      rocm/halo/shared_gu/kernel.o rocm/halo/q2/runtime.o rocm/halo/q2/prepared.o \
+      rocm/halo/moe/runtime.o rocm/halo/moe/public/{wide,twin,descriptors}.o \
+      rocm/halo/moe/fresh/{wide,twin,descriptors}.o" \
+    CFLAGS="-O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE \
+      -fno-finite-math-only -fPIC -DDS4_ROCM_BUILD" \
+    DS4_LINK="/usr/bin/hipcc -std=c++20 -O3 -ffast-math -g -fno-finite-math-only \
+      -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument \
+      --offload-arch=gfx1151" \
+    DS4_LINK_LIBS="-lm -pthread -lhipblas -lhipblaslt -lrocblas"
+  cp /tmp/base-41bb7cf/ds4-bench findings/ref-bin-41bb7cf
+
+Note that 41bb7cf is *pre-session*, so a comparison against it also includes the
+session's earlier diagnostic-only changes; those are inert (env-gated) and the
+measured effect is therefore attributable to the promoted three.
+
+Future payloads should take the reference binary as an argument rather than
+hardcoding /tmp/ds4-bench-base.
