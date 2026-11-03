@@ -1177,6 +1177,7 @@ int ds4_mmq_moe_impl(
         /*ncols_max=*/ne_get_rows,
         /*x_soa=*/x_soa,
         /*soa_blocks=*/soa_blocks,
+        /*soa_channel_blocks=*/0,
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -1212,6 +1213,10 @@ struct ds4_mmq_fused_down {
      * fused_direct_soa doc in ds4_mmq.h); NULL = quantize internally. */
     const void  * input_q8_ext;
     size_t        input_q8_ext_bytes;
+    /* per-expert SoA blocks: subtract from the global block index so a cache
+     * slot holding one expert's dq/qs planes can be addressed directly.
+     * 0 keeps the global artifact and raw paths bit-identical. */
+    int64_t       soa_channel_blocks;
 };
 
 struct ds4_mmq_swiglu_epilogue {

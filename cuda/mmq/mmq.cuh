@@ -3057,7 +3057,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 // the loads are 8-byte aligned and fully coalesced; the unpack math is the
 // standard loader's, making tile_x bit-identical.
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_xxs_soa(
-    const char * __restrict__ x, const int64_t soa_nblk, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, const int64_t soa_nblk, const int64_t soa_channel_blocks, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -3088,7 +3088,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 
         // Flat block index; < 2^25 for both model shapes, so 32-bit element
         // indexing is safe.
-        const uint32_t blk = (uint32_t)(kbx0 + i*stride);
+        const uint32_t blk = (uint32_t)((int64_t)(kbx0 + i*stride) - soa_channel_blocks);
 
         const uint2 v = qs[blk*8u + kqsx];
         const int q2 = (int)v.x;
@@ -3815,7 +3815,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
-        const char * __restrict__ x_soa, const int64_t soa_blocks,
+        const char * __restrict__ x_soa, const int64_t soa_blocks, const int64_t soa_channel_blocks,
         const float * __restrict__ epilogue_gate, const float * __restrict__ epilogue_weights,
         float * __restrict__ epilogue_mid, half * __restrict__ epilogue_mid_h,
         const float epilogue_clamp) {
@@ -3894,7 +3894,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             }
         } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
             if (x_soa != nullptr) {
-                load_tiles_iq2_xxs_soa<mmq_y, need_check>(x_soa, soa_blocks, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+                load_tiles_iq2_xxs_soa<mmq_y, need_check>(x_soa, soa_blocks, soa_channel_blocks, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
             } else {
                 load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
             }
@@ -4031,7 +4031,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx, const char * __restrict__ x_soa, const int64_t soa_blocks,
+        const uint3 ntx, const char * __restrict__ x_soa, const int64_t soa_blocks, const int64_t soa_channel_blocks,
         const float * __restrict__ epilogue_gate, const float * __restrict__ epilogue_weights,
         float * __restrict__ epilogue_mid, half * __restrict__ epilogue_mid_h,
         const float epilogue_clamp) {
@@ -4125,7 +4125,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks,
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks, soa_channel_blocks,
              epilogue_gate ? epilogue_gate + offset_dst : nullptr,
              epilogue_weights,
              epilogue_mid ? epilogue_mid + offset_dst : nullptr,
@@ -4216,7 +4216,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks,
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks, soa_channel_blocks,
              epilogue_gate ? epilogue_gate + offset_dst : nullptr,
              epilogue_weights,
              epilogue_mid ? epilogue_mid + offset_dst : nullptr,
@@ -4290,7 +4290,7 @@ static __global__ void mul_mat_q(
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks,
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks, soa_channel_blocks,
          nullptr, nullptr, nullptr, nullptr, 0.0f);
 }
 
@@ -4448,7 +4448,7 @@ static __global__ void ds4_mmq_compact_mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx, const char * __restrict__ x_soa, const int64_t soa_blocks, const ds4_mmq_compact::List * __restrict__ compact,
+        const uint3 ntx, const char * __restrict__ x_soa, const int64_t soa_blocks, const int64_t soa_channel_blocks, const ds4_mmq_compact::List * __restrict__ compact,
         const float * __restrict__ epilogue_gate, const float * __restrict__ epilogue_weights,
         float * __restrict__ epilogue_mid, half * __restrict__ epilogue_mid_h,
         const float epilogue_clamp) {
@@ -4540,7 +4540,7 @@ static __global__ void ds4_mmq_compact_mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup, limit_j>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks,
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks, soa_channel_blocks,
              epilogue_gate ? epilogue_gate + offset_dst : nullptr,
              epilogue_weights,
              epilogue_mid ? epilogue_mid + offset_dst : nullptr,
@@ -4561,7 +4561,7 @@ struct mmq_args {
     // non-null (Q2_K / IQ2_XXS only) the kernel loads tiles from it and x is
     // ignored; soa_blocks = pair count (Q2_K) or block count (IQ2_XXS).
     // Trailing fields so existing aggregate initializers value-init them.
-    const char * x_soa; int64_t soa_blocks;
+    const char * x_soa; int64_t soa_blocks; int64_t soa_channel_blocks;
     // Optional non-stream-K MoE epilogue. The up MMQ result remains in a
     // register while gate, router weight and weighted SwiGLU are consumed.
     const float * epilogue_gate = nullptr;
@@ -4633,7 +4633,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                      blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                      channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                      sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                     ntx_fd, args.x_soa, args.soa_blocks, args.compact_list,
+                     ntx_fd, args.x_soa, args.soa_blocks, args.soa_channel_blocks, args.compact_list,
                      args.epilogue_gate, args.epilogue_weights, args.epilogue_mid,
                      args.epilogue_mid_h, args.epilogue_clamp);
             } else {
@@ -4643,7 +4643,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                      blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                      channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                      sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                     ntx_fd, args.x_soa, args.soa_blocks, args.compact_list,
+                     ntx_fd, args.x_soa, args.soa_blocks, args.soa_channel_blocks, args.compact_list,
                      args.epilogue_gate, args.epilogue_weights, args.epilogue_mid,
                      args.epilogue_mid_h, args.epilogue_clamp);
             }
@@ -4661,7 +4661,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd, args.x_soa, args.soa_blocks, args.epilogue_gate,
+                 ntx_fd, args.x_soa, args.soa_blocks, args.soa_channel_blocks, args.epilogue_gate,
                  args.epilogue_weights, args.epilogue_mid, args.epilogue_mid_h,
                  args.epilogue_clamp);
         } else {
@@ -4671,7 +4671,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd, args.x_soa, args.soa_blocks, args.epilogue_gate,
+                 ntx_fd, args.x_soa, args.soa_blocks, args.soa_channel_blocks, args.epilogue_gate,
                  args.epilogue_weights, args.epilogue_mid, args.epilogue_mid_h,
                  args.epilogue_clamp);
         }
@@ -4709,7 +4709,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, args.x_soa, args.soa_blocks, nullptr, nullptr, nullptr,
+             ntx_fd, args.x_soa, args.soa_blocks, args.soa_channel_blocks, nullptr, nullptr, nullptr,
              nullptr, 0.0f);
 
         if (!fixup_needed) {
@@ -4728,7 +4728,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, args.x_soa, args.soa_blocks, nullptr, nullptr, nullptr,
+             ntx_fd, args.x_soa, args.soa_blocks, args.soa_channel_blocks, nullptr, nullptr, nullptr,
              nullptr, 0.0f);
 
         if (!fixup_needed) {
