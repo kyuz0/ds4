@@ -779,6 +779,14 @@ static int routed_moe_full_table_is_cached(
            cuda_model_range_is_cached(model_map, down_offset, down_bytes);
 }
 
+extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
+        const void *W_gate, const void *W_up, const void *W_down,
+        const float *X, const int32_t *ids, const float *router_weights,
+        float *gate_f32, float *up_f32, float *mid_f32, float *down_f32,
+        int expert_mid_dim, int expert_in_dim, int out_dim, int n_tokens,
+        int n_experts, int n_expert_used, float clamp, int preserve_reduction,
+        cudaStream_t stream);
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -808,6 +816,66 @@ static int routed_moe_launch(
         uint32_t layer_index,
         uint32_t n_tokens,
         bool force_resident) {
+    /* Opt-in layer-scoped aligned-SoA path: map pre-built artifacts and run the
+     * fused SoA pipeline with the caller's original global expert ids, bypassing
+     * the staged/selected machinery for this layer. DS4_V41_IQ2SOA_DIR must hold
+     * l<layer>_gate.soa, l<layer>_up.soa and l<layer>_down.soa. */
+    {
+        static const char *soa_dir = getenv("DS4_V41_IQ2SOA_DIR");
+        static const long soa_layer = getenv("DS4_V41_IQ2SOA_LAYER") ?
+            strtol(getenv("DS4_V41_IQ2SOA_LAYER"), nullptr, 10) : -1;
+        if (soa_dir && soa_layer >= 0 && (long)layer_index == soa_layer &&
+            n_tokens >= 8u && n_tokens <= 2048u && n_expert == 6u &&
+            n_total_expert == 384u && expert_mid_dim == 2304u &&
+            expert_in_dim == 5120u && out_dim == 5120u && selected && weights && x &&
+            gate && up && mid && down) {
+            static ds4_gpu_tensor *soa_t[3];
+            static int soa_state;
+            if (soa_state == 0) {
+                static const char *suffix[3] = {"_gate.soa", "_up.soa", "_down.soa"};
+                soa_state = 1;
+                for (int i = 0; i < 3; i++) {
+                    char path[1024];
+                    const int n = snprintf(path, sizeof(path), "%s/l%ld%s",
+                                           soa_dir, soa_layer, suffix[i]);
+                    if (n <= 0 || (size_t)n >= sizeof(path)) { soa_state = -1; break; }
+                    FILE *fp = fopen(path, "rb");
+                    if (!fp) { soa_state = -1; break; }
+                    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); soa_state = -1; break; }
+                    const long sz = ftell(fp);
+                    if (sz <= 0 || fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); soa_state = -1; break; }
+                    void *host = malloc((size_t)sz);
+                    const int read_ok = host && fread(host, 1, (size_t)sz, fp) == (size_t)sz;
+                    fclose(fp);
+                    if (!read_ok) { free(host); soa_state = -1; break; }
+                    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc((uint64_t)sz);
+                    const int up_ok = t && ds4_gpu_tensor_write(t, 0, host, (uint64_t)sz);
+                    free(host);
+                    if (!up_ok) { soa_state = -1; break; }
+                    soa_t[i] = t;
+                }
+                if (soa_state == 1)
+                    fprintf(stderr, "ds4: V4.1 SoA layer %ld artifacts resident\n", soa_layer);
+            }
+            const void *maps[3] = {soa_t[0] ? soa_t[0]->ptr : NULL,
+                                   soa_t[1] ? soa_t[1]->ptr : NULL,
+                                   soa_t[2] ? soa_t[2]->ptr : NULL};
+            const int maps_ready = soa_state;
+            if (maps_ready == 1) {
+                const int rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
+                    maps[0], maps[1], maps[2],
+                    (const float *)x->ptr, (const int32_t *)selected->ptr,
+                    (const float *)weights->ptr,
+                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                    (float *)down->ptr,
+                    (int)expert_mid_dim, (int)expert_in_dim, (int)out_dim,
+                    (int)n_tokens, (int)n_total_expert, (int)n_expert,
+                    clamp, /*preserve_reduction=*/1, (cudaStream_t)0);
+                if (rc == 0 && cuda_ok(cudaGetLastError(), "V4.1 SoA fused MoE"))
+                    return 1;
+            }
+        }
+    }
     routed_moe_launch_plan plan;
     if (!routed_moe_build_plan(out, gate, up, mid, down, model_map, model_size,
                                gate_offset, up_offset, down_offset, gate_type, down_type,
