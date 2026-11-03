@@ -113,6 +113,17 @@ int ds4_gpu_dsv41_tensor_ops_available(void);
 /* Reuse exact BF16 views of FP4 queries/keys across score tiles. Invalid
  * casts retain the F32 arithmetic for the affected tile. */
 uint64_t ds4_gpu_dsv41_indexer_packed_bytes(uint32_t source_rows, uint32_t rows);
+#define DS4_INDEX_FP4_KEY_BYTES 68u
+/* Pack F32 indexer keys (already FP4_E8M0-valued) into the 68-byte packed cache. */
+int ds4_gpu_dsv41_index_fp4_pack(ds4_gpu_tensor *packed, const ds4_gpu_tensor *keys,
+                                 uint32_t n_keys, uint32_t dst_first, uint32_t src_first);
+/* Decode-side scorer reading the packed keys; same reduction order as the F32 twin. */
+int ds4_gpu_dsv41_indexer_scores_one_fp4(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
+                                         const ds4_gpu_tensor *weights,
+                                         const ds4_gpu_tensor *packed_keys, uint32_t source_rows);
+/* Diagnostic: bit-compare the packed decode against the F32 index cache. */
+int ds4_gpu_dsv41_index_fp4_verify(const ds4_gpu_tensor *packed, const ds4_gpu_tensor *keys,
+                                   uint32_t n_keys);
 int ds4_gpu_dsv41_indexer_pack(ds4_gpu_tensor *packed,
                               const ds4_gpu_tensor *q, const ds4_gpu_tensor *keys,
                               uint32_t source_rows, uint32_t rows);

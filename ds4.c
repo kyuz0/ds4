@@ -40438,7 +40438,7 @@ typedef struct {
     ds4_engram_table table[2];
     float rows[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM];
     ds4_gpu_tensor *window[40];
-    ds4_gpu_tensor *compressed[4], *index_cache[4];
+    ds4_gpu_tensor *compressed[4], *index_cache[4], *index_cache_fp4[4];
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
     ds41_prefill_row batch, *rows_view;
@@ -40488,6 +40488,7 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     for (uint32_t i = 0; i < 4; i++) {
         ds4_gpu_tensor_free(g->compressed[i]);
         ds4_gpu_tensor_free(g->index_cache[i]);
+        ds4_gpu_tensor_free(g->index_cache_fp4[i]);
         ds4_gpu_tensor_free(g->previous_kv[i]);
         ds4_gpu_tensor_free(g->previous_score[i]);
     }
@@ -40678,9 +40679,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
         g->compressed[i] = ds4_gpu_tensor_alloc(cap * 512u * sizeof(float));
         g->index_cache[i] = ds4_gpu_tensor_alloc(cap * 128u * sizeof(float));
+        g->index_cache_fp4[i] = ds4_gpu_tensor_alloc(((cap * DS4_INDEX_FP4_KEY_BYTES) + 15u) & ~(uint64_t)15u);
         g->previous_kv[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
         g->previous_score[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
-        if (!g->compressed[i] || !g->index_cache[i] || !g->previous_kv[i] || !g->previous_score[i]) goto fail;
+        if (!g->compressed[i] || !g->index_cache[i] || !g->index_cache_fp4[i] ||
+            !g->previous_kv[i] || !g->previous_score[i]) goto fail;
     }
 #ifdef DS4_ROCM_BUILD
 #define DS41_ALLOC(name, count) \
@@ -41044,6 +41047,8 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                 !ds4_gpu_dsv41_quantize(g->index_k, 128, 1, DS4_V41_FP4_E8M0) ||
                 !ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)(n_comp - 1u) * 128u * 4u,
                                      g->index_k, 0, 128u * 4u) ||
+                !ds4_gpu_dsv41_index_fp4_pack(g->index_cache_fp4[owner], g->index_cache[owner],
+                                              1u, n_comp - 1u, n_comp - 1u) ||
                 !ds41_rope(g->latent, 1, 512, il, rope_pos, false) ||
                 !ds4_gpu_dsv41_quantize(g->latent, 512, 1, DS4_V41_FP4_E4M3) ||
                 !ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)(n_comp - 1u) * 512u * 4u,
@@ -41075,6 +41080,11 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     return true;
 }
 
+static bool ds41_index_fp4_keys(void);
+static uint32_t owner_of_layer(uint32_t il) { return il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u; }
+static bool ds41_attention_pick_run(ds41_gpu_graph *g, uint32_t il, uint32_t n_comp, uint32_t top);
+static void ds41_index_dump_selected(ds41_gpu_graph *g, uint32_t il, uint32_t top);
+
 static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (g->pos + 1u) / ratio : 0;
@@ -41085,15 +41095,54 @@ static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
 #else
     if (!ds41_attention_candidates(g, il)) return false;
     if (!n_comp || !ds41_index_source(il)) return true;
+    if (!ds41_attention_pick_run(g, il, n_comp, top)) return false;
+    if (getenv("DS4_V41_INDEX_FP4_VERIFY") && ds41_index_fp4_keys())
+        (void)ds4_gpu_dsv41_index_fp4_verify(g->index_cache_fp4[owner_of_layer(il)],
+                                            g->index_cache[owner_of_layer(il)], n_comp);
+    ds41_index_dump_selected(g, il, top);
+    return true;
+}
+
+/* Selected-index dump for bit-exact gates: both arms must emit identical bytes. */
+static void ds41_index_dump_selected(ds41_gpu_graph *g, uint32_t il, uint32_t top) {
+    const char *path = getenv("DS4_V41_INDEX_DUMP");
+    if (!path || !*path || !top) return;
+    int32_t ids[DS4_N_INDEXER_TOP_K];
+    /* The dump must observe the completed top-k kernel, not whatever the buffer
+     * held when the read was enqueued. */
+    if (!ds4_gpu_synchronize()) return;
+    if (top > DS4_N_INDEXER_TOP_K ||
+        !ds4_gpu_tensor_read(g->selected_comp, 0, ids, (uint64_t)top * sizeof(int32_t))) return;
+    FILE *f = fopen(path, "ab");
+    if (!f) return;
+    const uint32_t head[2] = { g->pos, il };
+    fwrite(head, sizeof head, 1, f);
+    fwrite(ids, sizeof(int32_t), top, f);
+    fclose(f);
+}
+
+static bool ds41_attention_pick_run(ds41_gpu_graph *g, uint32_t il, uint32_t n_comp, uint32_t top) {
 #ifdef DS4_ROCM_BUILD
     if (n_comp > 1u && n_comp < DS4_N_INDEXER_TOP_K &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_TOPK")) {
         return ds4_gpu_dsv41_indexer_topk_batch(g->selected_comp, g->index_scores,
-                                               n_comp, 1u, g->pos, ratio);
+                                               n_comp, 1u, g->pos, ds4_layer_compress_ratio(il));
     }
 #endif
+    (void)il; (void)top;
     return ds4_gpu_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top);
 #endif
+}
+
+/* Opt-in: score the decode path from the packed 68-byte index keys instead of the
+ * 512-byte F32 cache. Read once; the packed cache is written by both publishers. */
+static bool ds41_index_fp4_keys(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROCM_V41_INDEX_FP4");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached == 1;
 }
 
 static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *m,
@@ -41107,8 +41156,11 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
 #if defined(DS4_ROCM_BUILD)
-            !ds4_gpu_dsv41_indexer_scores_one(g->index_scores, g->index_q, g->index_weights,
-                g->index_cache[owner], n_comp)) return false;
+            !(ds41_index_fp4_keys()
+                ? ds4_gpu_dsv41_indexer_scores_one_fp4(g->index_scores, g->index_q, g->index_weights,
+                      g->index_cache_fp4[owner], n_comp)
+                : ds4_gpu_dsv41_indexer_scores_one(g->index_scores, g->index_q, g->index_weights,
+                      g->index_cache[owner], n_comp))) return false;
 #elif defined(__APPLE__)
             !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
@@ -41644,6 +41696,8 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
         ds4_gpu_dsv41_quantize(b->index_k, DS4_N_INDEXER_HEAD_DIM, rows, DS4_V41_FP4_E8M0) &&
         ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)first * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
             b->index_k, 0, (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float)) &&
+        ds4_gpu_dsv41_index_fp4_pack(g->index_cache_fp4[owner], g->index_cache[owner],
+                                     rows, first, first) &&
         ds4_gpu_dsv41_rope_stride(b->latent, DS4_N_HEAD_DIM, 1, rows,
                                   first * ratio, ratio, true, false) &&
         ds4_gpu_dsv41_quantize(b->latent, DS4_N_HEAD_DIM, rows, DS4_V41_FP4_E4M3) &&

@@ -1,3 +1,4 @@
+#include "ds4_rocm_index_fp4.cuh"
 __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;

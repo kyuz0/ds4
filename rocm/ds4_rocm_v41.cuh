@@ -384,6 +384,32 @@ __global__ static void v41_indexer_scalar_warp8_kernel(
     }
     if (!lane) out[(uint64_t) row * width + key] = total;
 }
+
+/* Packed-key twin of v41_indexer_scalar_warp8_kernel: identical wave layout,
+ * identical per-head reduction tree and scale/weight boundary, only the key
+ * fetch changes (4 bits + per-32 scale instead of F32). */
+__global__ static void v41_indexer_scalar_warp8_fp4_kernel(
+        float *out, const float *q, const float *w, const unsigned char *pk, uint32_t width,
+        uint32_t start, uint32_t ratio) {
+    uint32_t key = blockIdx.x * 8u + threadIdx.x / 32, lane = threadIdx.x & 31, row = blockIdx.y;
+    if (key >= width) return;
+    if (key >= (start + row + 1) / ratio) {
+        if (!lane) out[(uint64_t) row * width + key] = -INFINITY;
+        return;
+    }
+    float k0 = ds4_index_fp4_load(pk, key, lane), k1 = ds4_index_fp4_load(pk, key, lane + 32u);
+    float k2 = ds4_index_fp4_load(pk, key, lane + 64u), k3 = ds4_index_fp4_load(pk, key, lane + 96u);
+    float total = 0;
+    for (uint32_t h = 0; h < 32; h++) {
+        const float *x = q + ((uint64_t) row * 32 + h) * 128 + lane;
+        float a = v41_mul(x[0], k0), b = v41_mul(x[32], k1), c = v41_mul(x[64], k2), d = v41_mul(x[96], k3);
+        float dot = v41_add(v41_add(a, c), v41_add(b, d));
+        for (int s = 16; s; s >>= 1) dot = v41_add(dot, __shfl_down(dot, s, 32));
+        total = v41_add(total, v41_mul(fmaxf(v41_mul(dot, 1.f / 64.f), 0.f), w[row * 32 + h]));
+    }
+    if (!lane) out[(uint64_t) row * width + key] = total;
+}
+
 enum {
     V41_IX_DISP_WIDE_GEMM = 0,
     V41_IX_DISP_WARP8_BATCH,
@@ -2430,3 +2456,58 @@ extern "C" int ds4_gpu_dsv41_markov_chain(
 }
 
 #endif
+
+/* Pack F32 indexer keys (already FP4_E8M0-valued) into the 68-byte packed cache.
+ * Purely additive: the F32 cache stays authoritative for every current reader. */
+extern "C" int ds4_gpu_dsv41_index_fp4_pack(ds4_gpu_tensor *packed,
+                                           const ds4_gpu_tensor *keys,
+                                           uint32_t n_keys, uint32_t dst_first,
+                                           uint32_t src_first) {
+    if (!packed || !keys || n_keys == 0u) return 0;
+    const uint64_t need = ((uint64_t)(dst_first + n_keys) * DS4_INDEX_FP4_KEY_BYTES + 15u) & ~(uint64_t)15u;
+    if (packed->bytes < need ||
+        keys->bytes < (uint64_t)(src_first + n_keys) * 128u * sizeof(float)) return 0;
+    const float *src = (const float *)keys->ptr + (uint64_t)src_first * 128u;
+    unsigned char *dst = (unsigned char *)packed->ptr +
+        (uint64_t)dst_first * DS4_INDEX_FP4_KEY_BYTES;
+    ds4_index_fp4_pack_kernel<<<n_keys, 128>>>(dst, src, n_keys);
+    return cuda_ok(cudaGetLastError(), "V4.1 index FP4 pack");
+}
+
+extern "C" int ds4_gpu_dsv41_indexer_scores_one_fp4(ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *packed_keys, uint32_t source_rows) {
+    if (!source_rows || source_rows > INT32_MAX ||
+        !cuda_tensor_has_f32(scores, source_rows) ||
+        !cuda_tensor_has_f32(q, 32u * 128u) ||
+        !cuda_tensor_has_f32(weights, 32u) ||
+        packed_keys->bytes < (uint64_t)source_rows * DS4_INDEX_FP4_KEY_BYTES) return 0;
+    v41_ix_dispatch_note(V41_IX_DISP_SCALAR_ONE, source_rows, 1u, source_rows - 1u, 1u);
+    v41_indexer_scalar_warp8_fp4_kernel<<<(source_rows + 7u) / 8u, 256>>>(
+        (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+        (const unsigned char *)packed_keys->ptr, source_rows, source_rows - 1u, 1u);
+    return cuda_ok(cudaGetLastError(), "V4.1 scalar warp indexer (fp4 keys)");
+}
+
+/* Diagnostic for gates: verify every packed key decodes back to the F32 cache bits. */
+extern "C" int ds4_gpu_dsv41_index_fp4_verify(const ds4_gpu_tensor *packed,
+                                             const ds4_gpu_tensor *keys, uint32_t n_keys) {
+    if (!packed || !keys || n_keys == 0u) return 0;
+    if (packed->bytes < (uint64_t)n_keys * DS4_INDEX_FP4_KEY_BYTES ||
+        keys->bytes < (uint64_t)n_keys * 128u * sizeof(float)) return 0;
+    ds4_gpu_tensor *host = ds4_gpu_tensor_alloc(sizeof(unsigned long long));
+    if (!host) return 0;
+    unsigned long long zero = 0;
+    int ok = ds4_gpu_tensor_write(host, 0, &zero, sizeof zero);
+    if (ok) {
+        ds4_index_fp4_verify_kernel<<<64, 256>>>((unsigned long long *)host->ptr,
+            (const unsigned char *)packed->ptr, (const float *)keys->ptr, n_keys);
+        ok = cuda_ok(cudaGetLastError(), "V4.1 index FP4 verify");
+    }
+    unsigned long long bad = ~0ull;
+    if (ok) ok = ds4_gpu_tensor_read(host, 0, &bad, sizeof bad);
+    ds4_gpu_tensor_free(host);
+    if (!ok) return -1;
+    fprintf(stderr, "ds4: index fp4 verify keys=%u mismatches=%llu\n", n_keys, bad);
+    return (int)(bad > 0x7fffffffull ? 0x7fffffff : bad);
+}
