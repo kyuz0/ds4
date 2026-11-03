@@ -40227,6 +40227,19 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
  */
 #define DS41_PREFILL_CAP 8192u
 #define DS41_INDEX_BATCH 32u
+/* Opt-in: number of query rows scored per indexer launch. The graph's
+ * index_scores buffer and the byte accounting both scale with this value, so a
+ * larger batch is charged to the session plan instead of being smuggled in. */
+static uint32_t ds41_index_batch_rows(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_ROCM_V41_INDEX_BATCH");
+        int v = (e && e[0]) ? atoi(e) : (int)DS41_INDEX_BATCH;
+        if (v < (int)DS41_INDEX_BATCH || v > 512) v = (int)DS41_INDEX_BATCH;
+        cached = v;
+    }
+    return (uint32_t)cached;
+}
 #ifdef DS4_ROCM_BUILD
 /* Linux readers publish into host staging; only the consumed chunk is uploaded. */
 #define DS41_ENGRAM_GPU_PREFETCH_ROWS(g) 0u
@@ -40340,7 +40353,7 @@ static uint32_t ds41_engram_host_capacity(uint32_t prefill, uint32_t carry) {
     X(pool_kv, DS4_N_HEAD_DIM) X(pool_score, DS4_N_HEAD_DIM) \
     X(index_q, DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM) \
     X(index_k, DS4_N_INDEXER_HEAD_DIM) X(index_weights, DS4_N_INDEXER_HEAD) \
-    X(index_scores, DS41_INDEX_BATCH * g->ctx) X(selected_comp, DS4_N_INDEXER_TOP_K) \
+    X(index_scores, ds41_index_batch_rows() * g->ctx) X(selected_comp, DS4_N_INDEXER_TOP_K) \
     X(index_packed, DS41_INDEX_PACKED_WORDS(g)) \
     X(selected_kv, DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
     X(block_scores, (g->ctx + 7u) / 8u) X(block_selected, 2048) \
@@ -41667,8 +41680,9 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_PACKED_INDEX");
     if (packed && !ds4_gpu_dsv41_indexer_pack(g->index_packed, b->index_q,
         g->index_cache[owner], n_comp, count)) return false;
-    for (uint32_t off = 0; off < count; off += DS41_INDEX_BATCH) {
-        const uint32_t rows = count - off < DS41_INDEX_BATCH ? count - off : DS41_INDEX_BATCH;
+    const uint32_t index_rows = ds41_index_batch_rows();
+    for (uint32_t off = 0; off < count; off += index_rows) {
+        const uint32_t rows = count - off < index_rows ? count - off : index_rows;
         const uint64_t q_bytes = DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         const uint64_t w_bytes = DS4_N_INDEXER_HEAD * sizeof(float);
         ds4_gpu_tensor *q = ds4_gpu_tensor_view(b->index_q, off * q_bytes, rows * q_bytes);
