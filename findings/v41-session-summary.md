@@ -337,3 +337,34 @@ LUT, which was 6/6 pairs positive across two sessions (+1.4% then +1.2%).
 Decision: keep the change (bit-identical, prefill-neutral, so it cannot regress
 correctness or prefill) but do not claim a decode gain from it - the promoted
 decode figure stays +5-7%.
+
+## Decode attention: the concrete target is the indexer key read volume
+
+Inspection of the decode attention path (ds41_attention, and the indexer dispatch in
+rocm/ds4_rocm_v41.cuh) narrows the 57%-of-token-time attention block to one
+dominant, measurable cost: every decode token re-reads the whole indexer key cache.
+
+g->index_cache[] is allocated as `cap * 128 * sizeof(float)` per level (ds4.c:40680),
+i.e. F32, 512 B per compressed key, and ds4_gpu_dsv41_indexer_scores_batch walks all
+n_comp keys for the single query row each token:
+
+  ctx  32K  ratio 1 -> 16.8 MB/layer ->  671 MB/token over 40 layers
+  ctx  32K  ratio 4 ->  4.2 MB/layer ->  168 MB/token
+  ctx 110K  ratio 1 -> 56.6 MB/layer -> 2267 MB/token
+  ctx 110K  ratio 4 -> 14.2 MB/layer ->  566 MB/token
+
+At ~11 tps that is 2-7 GB/s of pure indexer-key traffic, i.e. a large share of the
+attention block and of total decode bandwidth. The activations are already
+quantised elsewhere (index_q is FP4 E8M0 before scoring), so the keys are the odd
+one out.
+
+Concrete candidate, correctness-preserving in structure: store index_cache in a
+narrower type (F16 halves it, FP8_E4M3 quarters it) and have the indexer score
+kernels read that, dequantising in-register. Same dot products, ~2-4x fewer bytes
+per token, no extra passes. It does change the key values' precision, so it needs
+the shape-noise gate rather than bit-equality, plus a top-k stability check: the
+selected compressed indices must not move, otherwise routing changes downstream.
+
+Measured prerequisite (cheap): confirm the read volume with rocprof FETCH_SIZE on
+v41_indexer_batch_warp8_kernel at 32K decode, and check the score deltas that an
+F16 key cache would introduce before committing to the change.
