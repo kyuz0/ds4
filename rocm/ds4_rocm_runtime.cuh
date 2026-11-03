@@ -7028,6 +7028,18 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
+/* Opt-in tally: how much of the copy traffic comes through this API versus
+ * rocclr-internal copies. DS4_ROCM_COPY_TALLY=1 prints one line at exit. */
+static uint64_t g_copy_tally_calls;
+static uint64_t g_copy_tally_bytes;
+static int g_copy_tally_init;
+static void ds4_rocm_copy_tally_report(void) {
+    if (!g_copy_tally_init) return;
+    fprintf(stderr, "ds4: copy tally tensor_copy calls=%llu bytes=%.2f MiB\n",
+            (unsigned long long)g_copy_tally_calls,
+            (double)g_copy_tally_bytes / 1048576.0);
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
@@ -7036,6 +7048,12 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
         return 0;
     }
     if (bytes == 0) return 1;
+    if (g_copy_tally_init) { ++g_copy_tally_calls; g_copy_tally_bytes += bytes; }
+    else if (getenv("DS4_ROCM_COPY_TALLY") != NULL) {
+        g_copy_tally_init = 1;
+        atexit(ds4_rocm_copy_tally_report);
+        ++g_copy_tally_calls; g_copy_tally_bytes += bytes;
+    }
     return cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
                                    (const char *)src->ptr + src_offset,
                                    (size_t)bytes,
