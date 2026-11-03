@@ -130,3 +130,17 @@ tuning prompt. The timings from that run (prefill 164.74 -> 175.85 tps, decode
 11.34 -> 7.62 tps) are single runs with only 8 generated tokens, so decode is
 dominated by first-token cost and neither figure is evidence - the multi-pair
 measurements at gen 32-64 remain the numbers of record.
+
+## Release completeness: the interactive CLI was stale
+
+`ds4` (the interactive CLI) was still the Nov 1 binary and did not contain the
+promoted paths, while `ds4-bench` and `ds4-server` did. Rebuilt it from the current
+sources with the same ROCm object set; all three now carry the fused-SwiGLU MMQ
+and Q8 blocks4 unrolled-loop paths:
+
+  ds4        unrolled 1, fused 1   (rebuilt 21:07)
+  ds4-server unrolled 1, fused 1
+  ds4-bench  unrolled 1, fused 1
+
+So no shipped entry point remains on the old code. Nothing changed in the source
+tree - this was a build-state gap, not a code gap.
