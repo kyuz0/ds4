@@ -484,3 +484,30 @@ remaining budget cannot carry it through build, bit gate, multi-pair and a top-k
 stability check. Everything needed is now written down: allocation cap*65, the pack
 kernel semantics above, the publish replacement, a packed-key warp8 scoring variant
 keeping the per-head dot order, and the dispatch.
+
+## Correction: the index_cache repack touches six consumers, not one path
+
+Tracing every reference to g->index_cache[] in ds4.c shows the change is wider than
+the five-piece sketch recorded earlier:
+
+  writers
+    41045  compress path: quantise index_k to FP4_E8M0 then copy 128 floats
+    41645  prefill reuse: copy a range of keys from another cache level
+  readers
+    41111  ds4_gpu_dsv41_indexer_scores_one      (decode, single row)
+    41117  ds4_gpu_dsv41_indexer_scores_batch    (small batches)
+    41694  ds4_gpu_dsv41_indexer_scores_batch    (prefill tiles)
+    41692  ds4_gpu_dsv41_indexer_scores_packed   (packed-index path)
+    41682  ds4_gpu_dsv41_indexer_pack            (builds index_packed FROM the cache)
+
+So a dtype change must convert two writers, three score entry points and the
+index-packed builder together - i.e. it is a coordinated refactor of the indexer's
+storage layer, not a local edit. Landing it piecemeal would leave the indexer
+reading one layout while another writer wrote the other, which is precisely the
+failure mode that produces garbage selections rather than a measurable slowdown.
+
+Not implemented, deliberately: with the gate unavailable in the remaining budget a
+partial conversion is the one outcome that could silently corrupt routing. The
+motivating measurement stands (keys carry ~4 bits of information in 32; 671 -> 89
+MB/token at 32K ratio 1, 2267 -> 302 MB/token at 110K), and the recipe is fully
+written down including this corrected scope.
