@@ -237,3 +237,22 @@ inner loop, and is value-identical, so the bit gate applies unchanged.
 
 Note the ggml IQ2_XS loader at mmq.cuh:3163 has the same pattern but IQ2_XS is not
 this model's quantisation (gate/up are IQ2_XXS), so it would buy nothing here.
+
+### ksigns64 equivalence proven by exhaustion (all 128 indices)
+
+Host check of the table against the arithmetic it replaces, for every 7-bit index:
+  entry low  32 bits == __vcmpne4(unpack_ksigns(i) & 0x08040201, 0)
+  entry high 32 bits == __vcmpne4(unpack_ksigns(i) & 0x80402010, 0)
+  mismatches: 0 / 128
+
+So the committed mmq.cuh LUT change is not merely empirically identical on our
+prompts - it is identical for every possible sign index, which is why the bit gate
+passed in six arms across two sessions.
+
+Decode-side candidate needs one more fact before it can be written safely: the
+V4.1 decode path feeds `cuda_ksigns_iq2xs[sign]` into dev_iq2_dp4a_8, which then
+applies dev_unpack_iq2_signs to that value. That is, the table there is indexed by
+a 7-bit pattern and its *entries* are then run through the popcount trick, so the
+two formulations are not interchangeable without establishing what cuda_ksigns_iq2xs
+actually holds. The equivalent swap is only safe once that is checked the same way
+(exhaustive comparison over the table), which is the next step for that site.
