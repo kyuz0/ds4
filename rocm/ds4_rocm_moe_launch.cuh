@@ -528,7 +528,10 @@ static int routed_moe_q2_float_down_launch(
 
         constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
         const int no_n2 = 0;
-        const uint32_t wmma_mtiles = 4u;
+        /* Opt-in: 8 row-tiles per block for the hotlist WMMA down path (the
+         * 14% kernel). Per-row math is unchanged, so values stay identical. */
+        const uint32_t wmma_mtiles =
+            getenv("DS4_ROCM_V41_DOWN_MT8") != NULL ? 8u : 4u;
         if (!no_n2) {
             if (wmma_mtiles == 4u) {
                 constexpr uint32_t mt = 4u;
