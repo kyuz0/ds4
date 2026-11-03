@@ -321,3 +321,19 @@ Performance, 8K gen 64, three interleaved pairs, pre-change binary vs new:
 So the decode effect is probably +1..3%: positive but noisier than the prefill LUT
 (which was 3/3 in both sessions). A second session is required before treating the
 decode figure as established; correctness is already settled by bit-equality.
+
+### Decode sign-mask LUT - second session does NOT confirm the gain
+
+  session 1  decode +8.5 / -0.2 / +1.7  -> mean +3.3% (2/3), median +1.7%
+  session 2  decode +0.7 / +0.6 / -0.3  -> mean +0.3% (2/3), median +0.6%
+             prefill -0.9 / -0.2 / +0.1 -> mean -0.3% (neutral)
+  frontier logits exact=True in all six arms across both sessions
+
+So the decode-side swap is bit-identical (proven by exhaustion and gated twice) but
+its performance benefit is NOT established: the two sessions bracket +0.3..3.3%
+with one negative pair each, i.e. it sits at the noise floor. Compare the prefill
+LUT, which was 6/6 pairs positive across two sessions (+1.4% then +1.2%).
+
+Decision: keep the change (bit-identical, prefill-neutral, so it cannot regress
+correctness or prefill) but do not claim a decode gain from it - the promoted
+decode figure stays +5-7%.
