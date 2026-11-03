@@ -212,3 +212,28 @@ This is on top of the already-promoted set, so the cumulative position at 32K is
 roughly +3.9% prefill and +4.6% append versus the pre-session binary. One session
 only so far; a second session is the remaining confirmation for the performance
 claim (correctness is already established by bit-equality).
+
+### ksigns64 LUT - second session confirms
+
+Three interleaved pairs in a second session, pre-LUT binary vs LUT binary:
+  32K prefill  +0.4 / +2.2 / +1.1  -> mean +1.2% (3/3 positive)
+  4K append    +0.7 / +1.8 / +0.8  -> mean +1.1% (3/3 positive)
+  frontier logits exact=True in all six arms
+
+Both sessions agree (prefill +1.4% then +1.2%, append +2.3% then +1.1%), all pairs
+positive, logits identical throughout. Confirmed: ~+1.3% prefill and ~+1.7%
+append, so the cumulative position at 32K is ~+3.8% prefill and ~+4.0% append
+versus the pre-session binary, plus +5-7% decode.
+
+### Next candidate in the same class (decode side)
+
+The V4.1 decode IQ2 path has its own copy of the popcount trick:
+dev_unpack_iq2_signs(v) in rocm/ds4_rocm_moe.cuh:39 is byte-for-byte the same
+computation (popc, xor, multiply by 0x01010101) followed by two __vcmpne4, used by
+dev_iq2_dp4a_8 and dev_iq2_i8x8_lut - i.e. on the decode gate/up matvec. The same
+argument applies: a 128-entry mask table (cuda_ksigns_iq2xs is already used in this
+file for the other path) removes the popcount/multiply/compares from the decode
+inner loop, and is value-identical, so the bit gate applies unchanged.
+
+Note the ggml IQ2_XS loader at mmq.cuh:3163 has the same pattern but IQ2_XS is not
+this model's quantisation (gate/up are IQ2_XXS), so it would buy nothing here.
