@@ -787,6 +787,19 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         int n_experts, int n_expert_used, float clamp, int preserve_reduction,
         cudaStream_t stream);
 
+/* Declarations for the opt-in in-process aligned-SoA path.  Both headers that
+ * declare these are C++/std::vector based and are not included in this TU. */
+extern "C" int ds4_rocm_repack_layer(const char *model_path, int layer,
+                                    const void **out_gate, const void **out_up,
+                                    const void **out_down);
+extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
+        const void *W_gate, const void *W_up, const void *W_down,
+        const float *X, const int32_t *ids, const float *router_weights,
+        float *gate_f32, float *up_f32, float *mid_f32, float *down_f32,
+        int expert_mid_dim, int expert_in_dim, int out_dim, int n_tokens,
+        int n_experts, int n_expert_used, float clamp, int preserve_reduction,
+        cudaStream_t stream);
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -821,45 +834,20 @@ static int routed_moe_launch(
      * the staged/selected machinery for this layer. DS4_V41_IQ2SOA_DIR must hold
      * l<layer>_gate.soa, l<layer>_up.soa and l<layer>_down.soa. */
     {
-        static const char *soa_dir = getenv("DS4_V41_IQ2SOA_DIR");
         static const long soa_layer = getenv("DS4_V41_IQ2SOA_LAYER") ?
             strtol(getenv("DS4_V41_IQ2SOA_LAYER"), nullptr, 10) : -1;
-        if (soa_dir && soa_layer >= 0 && (long)layer_index == soa_layer &&
+        if (soa_layer >= 0 && (long)layer_index == soa_layer &&
             n_tokens >= 8u && n_tokens <= 2048u && n_expert == 6u &&
             n_total_expert == 384u && expert_mid_dim == 2304u &&
             expert_in_dim == 5120u && out_dim == 5120u && selected && weights && x &&
             gate && up && mid && down) {
-            static ds4_gpu_tensor *soa_t[3];
+            static const void *soa_dev[3];
             static int soa_state;
-            if (soa_state == 0) {
-                static const char *suffix[3] = {"_gate.soa", "_up.soa", "_down.soa"};
-                soa_state = 1;
-                for (int i = 0; i < 3; i++) {
-                    char path[1024];
-                    const int n = snprintf(path, sizeof(path), "%s/l%ld%s",
-                                           soa_dir, soa_layer, suffix[i]);
-                    if (n <= 0 || (size_t)n >= sizeof(path)) { soa_state = -1; break; }
-                    FILE *fp = fopen(path, "rb");
-                    if (!fp) { soa_state = -1; break; }
-                    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); soa_state = -1; break; }
-                    const long sz = ftell(fp);
-                    if (sz <= 0 || fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); soa_state = -1; break; }
-                    void *host = malloc((size_t)sz);
-                    const int read_ok = host && fread(host, 1, (size_t)sz, fp) == (size_t)sz;
-                    fclose(fp);
-                    if (!read_ok) { free(host); soa_state = -1; break; }
-                    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc((uint64_t)sz);
-                    const int up_ok = t && ds4_gpu_tensor_write(t, 0, host, (uint64_t)sz);
-                    free(host);
-                    if (!up_ok) { soa_state = -1; break; }
-                    soa_t[i] = t;
-                }
-                if (soa_state == 1)
-                    fprintf(stderr, "ds4: V4.1 SoA layer %ld artifacts resident\n", soa_layer);
-            }
-            const void *maps[3] = {soa_t[0] ? soa_t[0]->ptr : NULL,
-                                   soa_t[1] ? soa_t[1]->ptr : NULL,
-                                   soa_t[2] ? soa_t[2]->ptr : NULL};
+            if (soa_state == 0)
+                soa_state = ds4_rocm_repack_layer(getenv("DS4_V41_IQ2SOA_MODEL"),
+                                                  (int)soa_layer,
+                                                  &soa_dev[0], &soa_dev[1], &soa_dev[2]) ? 1 : -1;
+            const void *maps[3] = {soa_dev[0], soa_dev[1], soa_dev[2]};
             const int maps_ready = soa_state;
             if (maps_ready == 1) {
                 const int rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
