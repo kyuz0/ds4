@@ -300,3 +300,24 @@ Either way the call sites then pass the 7-bit index instead of the permuted byte
 (dev_iq2_pair_16 lines 68-69, the dp4a loop at 981, dev_iq2_i8x8_lut users), after
 which the normal bit gate and multi-pair run apply. Nothing was edited: an
 unverified change to the decode hot path would be worse than the 1-2% it buys.
+
+## Decode IQ2 sign masks via a local table (bit-exact; decode +3.3% in session 1)
+
+ksigns64 is not visible in the ROCm TU (`cuda/mmq/ggml-common.h` is not on its
+include path), so the 128-entry uint2 mask table was emitted beside the existing
+byte table in rocm/ds4_rocm_moe.cuh, generated from ksigns_iq2xs with the proven
+popcount trick and verified equal to ksigns64 for all 128 entries. dev_iq2_dp4a_8
+now takes the 7-bit index and reads that table; dev_dot_iq2_pair_16 and
+v41_iq2_pair32 pass the raw index instead of the permuted byte. dev_iq2_i8x8_lut
+and its byte-table users were deliberately left unchanged.
+
+Bit gate: frontier logits exact=True (max_abs 0) in all three pairs - which also
+confirms that the dev_dot_iq2_pair_16 callers really do pass indices.
+
+Performance, 8K gen 64, three interleaved pairs, pre-change binary vs new:
+  decode   +8.5 / -0.2 / +1.7  -> mean +3.3% (2/3 positive, median +1.7%)
+  prefill  +1.5 / -0.7 / -0.3  -> mean +0.2% (neutral, as expected)
+
+So the decode effect is probably +1..3%: positive but noisier than the prefill LUT
+(which was 3/3 in both sessions). A second session is required before treating the
+decode figure as established; correctness is already settled by bit-equality.

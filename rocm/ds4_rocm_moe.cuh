@@ -36,16 +36,55 @@ __device__ __forceinline__ static uint32_t dev_pack_half2_bits(float x, float y)
     return *reinterpret_cast<const uint32_t *>(&h);
 }
 
+/* Same two sign-mask words the popcount trick plus __vcmpne4 built, indexed by the
+ * 7-bit sign index; verified equal to ksigns64 for all 128 entries. */
+__device__ static const uint2 dev_iq2_sign_masks[128] = {
+    {0x00000000u, 0x00000000u}, {0x000000ffu, 0xff000000u}, {0x0000ff00u, 0xff000000u}, {0x0000ffffu, 0x00000000u},
+    {0x00ff0000u, 0xff000000u}, {0x00ff00ffu, 0x00000000u}, {0x00ffff00u, 0x00000000u}, {0x00ffffffu, 0xff000000u},
+    {0xff000000u, 0xff000000u}, {0xff0000ffu, 0x00000000u}, {0xff00ff00u, 0x00000000u}, {0xff00ffffu, 0xff000000u},
+    {0xffff0000u, 0x00000000u}, {0xffff00ffu, 0xff000000u}, {0xffffff00u, 0xff000000u}, {0xffffffffu, 0x00000000u},
+    {0x00000000u, 0xff0000ffu}, {0x000000ffu, 0x000000ffu}, {0x0000ff00u, 0x000000ffu}, {0x0000ffffu, 0xff0000ffu},
+    {0x00ff0000u, 0x000000ffu}, {0x00ff00ffu, 0xff0000ffu}, {0x00ffff00u, 0xff0000ffu}, {0x00ffffffu, 0x000000ffu},
+    {0xff000000u, 0x000000ffu}, {0xff0000ffu, 0xff0000ffu}, {0xff00ff00u, 0xff0000ffu}, {0xff00ffffu, 0x000000ffu},
+    {0xffff0000u, 0xff0000ffu}, {0xffff00ffu, 0x000000ffu}, {0xffffff00u, 0x000000ffu}, {0xffffffffu, 0xff0000ffu},
+    {0x00000000u, 0xff00ff00u}, {0x000000ffu, 0x0000ff00u}, {0x0000ff00u, 0x0000ff00u}, {0x0000ffffu, 0xff00ff00u},
+    {0x00ff0000u, 0x0000ff00u}, {0x00ff00ffu, 0xff00ff00u}, {0x00ffff00u, 0xff00ff00u}, {0x00ffffffu, 0x0000ff00u},
+    {0xff000000u, 0x0000ff00u}, {0xff0000ffu, 0xff00ff00u}, {0xff00ff00u, 0xff00ff00u}, {0xff00ffffu, 0x0000ff00u},
+    {0xffff0000u, 0xff00ff00u}, {0xffff00ffu, 0x0000ff00u}, {0xffffff00u, 0x0000ff00u}, {0xffffffffu, 0xff00ff00u},
+    {0x00000000u, 0x0000ffffu}, {0x000000ffu, 0xff00ffffu}, {0x0000ff00u, 0xff00ffffu}, {0x0000ffffu, 0x0000ffffu},
+    {0x00ff0000u, 0xff00ffffu}, {0x00ff00ffu, 0x0000ffffu}, {0x00ffff00u, 0x0000ffffu}, {0x00ffffffu, 0xff00ffffu},
+    {0xff000000u, 0xff00ffffu}, {0xff0000ffu, 0x0000ffffu}, {0xff00ff00u, 0x0000ffffu}, {0xff00ffffu, 0xff00ffffu},
+    {0xffff0000u, 0x0000ffffu}, {0xffff00ffu, 0xff00ffffu}, {0xffffff00u, 0xff00ffffu}, {0xffffffffu, 0x0000ffffu},
+    {0x00000000u, 0xffff0000u}, {0x000000ffu, 0x00ff0000u}, {0x0000ff00u, 0x00ff0000u}, {0x0000ffffu, 0xffff0000u},
+    {0x00ff0000u, 0x00ff0000u}, {0x00ff00ffu, 0xffff0000u}, {0x00ffff00u, 0xffff0000u}, {0x00ffffffu, 0x00ff0000u},
+    {0xff000000u, 0x00ff0000u}, {0xff0000ffu, 0xffff0000u}, {0xff00ff00u, 0xffff0000u}, {0xff00ffffu, 0x00ff0000u},
+    {0xffff0000u, 0xffff0000u}, {0xffff00ffu, 0x00ff0000u}, {0xffffff00u, 0x00ff0000u}, {0xffffffffu, 0xffff0000u},
+    {0x00000000u, 0x00ff00ffu}, {0x000000ffu, 0xffff00ffu}, {0x0000ff00u, 0xffff00ffu}, {0x0000ffffu, 0x00ff00ffu},
+    {0x00ff0000u, 0xffff00ffu}, {0x00ff00ffu, 0x00ff00ffu}, {0x00ffff00u, 0x00ff00ffu}, {0x00ffffffu, 0xffff00ffu},
+    {0xff000000u, 0xffff00ffu}, {0xff0000ffu, 0x00ff00ffu}, {0xff00ff00u, 0x00ff00ffu}, {0xff00ffffu, 0xffff00ffu},
+    {0xffff0000u, 0x00ff00ffu}, {0xffff00ffu, 0xffff00ffu}, {0xffffff00u, 0xffff00ffu}, {0xffffffffu, 0x00ff00ffu},
+    {0x00000000u, 0x00ffff00u}, {0x000000ffu, 0xffffff00u}, {0x0000ff00u, 0xffffff00u}, {0x0000ffffu, 0x00ffff00u},
+    {0x00ff0000u, 0xffffff00u}, {0x00ff00ffu, 0x00ffff00u}, {0x00ffff00u, 0x00ffff00u}, {0x00ffffffu, 0xffffff00u},
+    {0xff000000u, 0xffffff00u}, {0xff0000ffu, 0x00ffff00u}, {0xff00ff00u, 0x00ffff00u}, {0xff00ffffu, 0xffffff00u},
+    {0xffff0000u, 0x00ffff00u}, {0xffff00ffu, 0xffffff00u}, {0xffffff00u, 0xffffff00u}, {0xffffffffu, 0x00ffff00u},
+    {0x00000000u, 0xffffffffu}, {0x000000ffu, 0x00ffffffu}, {0x0000ff00u, 0x00ffffffu}, {0x0000ffffu, 0xffffffffu},
+    {0x00ff0000u, 0x00ffffffu}, {0x00ff00ffu, 0xffffffffu}, {0x00ffff00u, 0xffffffffu}, {0x00ffffffu, 0x00ffffffu},
+    {0xff000000u, 0x00ffffffu}, {0xff0000ffu, 0xffffffffu}, {0xff00ff00u, 0xffffffffu}, {0xff00ffffu, 0x00ffffffu},
+    {0xffff0000u, 0xffffffffu}, {0xffff00ffu, 0x00ffffffu}, {0xffffff00u, 0x00ffffffu}, {0xffffffffu, 0xffffffffu},
+};
+
 __device__ __forceinline__ static uint32_t dev_unpack_iq2_signs(uint32_t v) {
     const uint32_t p = __popc(v) & 1u;
     const uint32_t s = v ^ (p << 7u);
     return s * 0x01010101u;
 }
 
-__device__ __forceinline__ static int32_t dev_iq2_dp4a_8(uint64_t grid, uint32_t sign, const int8_t *q8, int32_t acc) {
-    const uint32_t signs = dev_unpack_iq2_signs(sign);
-    const int32_t sm0 = __vcmpne4(signs & 0x08040201u, 0);
-    const int32_t sm1 = __vcmpne4(signs & 0x80402010u, 0);
+__device__ __forceinline__ static int32_t dev_iq2_dp4a_8(uint64_t grid, uint32_t sign_idx, const int8_t *q8, int32_t acc) {
+    /* ksigns64[sign_idx] holds exactly the two masks the popcount trick plus
+     * __vcmpne4 used to build (verified for all 128 indices). */
+    const uint2 masks = dev_iq2_sign_masks[sign_idx & 0x7fu];
+    const int32_t sm0 = (int32_t)masks.x;
+    const int32_t sm1 = (int32_t)masks.y;
     const int32_t g0 = __vsub4((int32_t)(uint32_t)grid ^ sm0, sm0);
     const int32_t g1 = __vsub4((int32_t)(uint32_t)(grid >> 32) ^ sm1, sm1);
     acc = __dp4a(g0, *(const int32_t *)(q8 + 0), acc);
@@ -65,8 +104,8 @@ __device__ static int32_t dev_dot_q2_16(const uint8_t *q2, const int8_t *q8, int
 
 __device__ static int32_t dev_dot_iq2_pair_16(uint8_t grid0, uint32_t sign0, uint8_t grid1, uint32_t sign1, const int8_t *q8) {
     int32_t sum = 0;
-    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid0], cuda_ksigns_iq2xs[sign0], q8, sum);
-    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid1], cuda_ksigns_iq2xs[sign1], q8 + 8, sum);
+    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid0], sign0, q8, sum);
+    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid1], sign1, q8 + 8, sum);
     return sum;
 }
 
@@ -978,7 +1017,7 @@ __device__ __forceinline__ float v41_iq2_pair32(const cuda_block_iq2_xxs *w, con
     uint32_t a = (uint32_t) q[0] | ((uint32_t) q[1] << 16), b = (uint32_t) q[2] | ((uint32_t) q[3] << 16);
     int sum = 0;
 #pragma unroll
-    for (int j = 0; j < 4; j++) sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[(a >> (8 * j)) & 255], cuda_ksigns_iq2xs[(b >> (7 * j)) & 127], x->qs + p * 32 + j * 8, sum);
+    for (int j = 0; j < 4; j++) sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[(a >> (8 * j)) & 255], (b >> (7 * j)) & 127u, x->qs + p * 32 + j * 8, sum);
     sum *= 2 * (b >> 28) + 1;
     return .125f * dev_f16_to_f32(w->d) * x->d * (float) sum;
 }
