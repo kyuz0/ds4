@@ -277,3 +277,26 @@ pass the 7-bit index rather than the permuted byte, at three sites
 dev_iq2_i8x8_lut users). That is a multi-site edit on the decode hot path and was
 not started, because it cannot be completed and gated with the remaining budget:
 an unverified decode path would be worse than the small gain it buys.
+
+## Decode-side swap: blocked on table visibility, not on the maths
+
+The equivalence is proven (0/128 mismatches), but the swap could not be written
+this session because of a concrete missing fact: `rocm/ds4_rocm_moe.cuh` uses the
+*byte* tables (`cuda_ksigns_iq2xs`, `cuda_iq2xxs_grid`), while the mask table
+`ksigns64` lives in `cuda/mmq/ggml-common.h` - which is compiled into the
+`cuda/mmq` TUs and is not obviously included by the ROCm TU that builds
+`ds4_rocm.cu`. The definitions of the `cuda_`-prefixed tables were not located
+within the search budget either, so whether `ksigns64` is visible there is
+unverified.
+
+Two ways to unblock, both mechanical:
+1. include `cuda/mmq/ggml-common.h` in the ROCm TU (it guards itself with
+   GGML_COMMON_IMPL and only defines static const tables), or
+2. emit a 128-entry `uint2` mask table next to the existing byte table in
+   `rocm/ds4_rocm_moe.cuh`, generated once from the byte table and verified against
+   the 0/128 equivalence above.
+
+Either way the call sites then pass the 7-bit index instead of the permuted byte
+(dev_iq2_pair_16 lines 68-69, the dp4a loop at 981, dev_iq2_i8x8_lut users), after
+which the normal bit gate and multi-pair run apply. Nothing was edited: an
+unverified change to the decode hot path would be worse than the 1-2% it buys.
