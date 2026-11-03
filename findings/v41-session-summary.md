@@ -144,3 +144,14 @@ and Q8 blocks4 unrolled-loop paths:
 
 So no shipped entry point remains on the old code. Nothing changed in the source
 tree - this was a build-state gap, not a code gap.
+
+## Rebuilt binaries smoke-checked
+
+The freshly rebuilt entry points execute: `./ds4 --help` and
+`./ds4-server --help` both print their usage and exit 0, so the CLI/server relink
+(which uses a different object set from ds4-bench: ds4_cli.o + linenoise, and
+ds4_server.o + ds4_kvstore.o + rax) is healthy, not just present in the file list.
+
+With that, the release surface is complete and verified at the binary level:
+ds4, ds4-server and ds4-bench all build from the current sources, all contain the
+promoted paths, and all start correctly.
