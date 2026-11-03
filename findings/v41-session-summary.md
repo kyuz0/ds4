@@ -256,3 +256,24 @@ a 7-bit pattern and its *entries* are then run through the popcount trick, so th
 two formulations are not interchangeable without establishing what cuda_ksigns_iq2xs
 actually holds. The equivalent swap is only safe once that is checked the same way
 (exhaustive comparison over the table), which is the next step for that site.
+
+### Decode-side equivalence established (all 128 indices), swap not yet written
+
+Exact semantics of the decode composition, verified from the shipped tables:
+`dev_iq2_dp4a_8(..., cuda_ksigns_iq2xs[idx], ...)` passes the *byte entry*
+(ksigns_iq2xs is a 128-entry uint8 permutation, not the identity), and the callee
+then applies dev_unpack_iq2_signs to that byte and derives the two masks with
+__vcmpne4.
+
+Exhaustive check over all 128 indices:
+  vcmpne4(unpack_ksigns(ksigns_iq2xs[i]) & 0x08040201, 0) == ksigns64[i] low  word
+  vcmpne4(unpack_ksigns(ksigns_iq2xs[i]) & 0x80402010, 0) == ksigns64[i] high word
+  mismatches: 0 / 128
+
+So the whole byte-table + popcount + two-compare chain is exactly `ksigns64[i]`,
+and the decode swap is safe to write - but it requires changing the *callers* to
+pass the 7-bit index rather than the permuted byte, at three sites
+(dev_iq2_pair_16 lines 68-69 and the dp4a loop at line 981, plus the
+dev_iq2_i8x8_lut users). That is a multi-site edit on the decode hot path and was
+not started, because it cannot be completed and gated with the remaining budget:
+an unverified decode path would be worse than the small gain it buys.
