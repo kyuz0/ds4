@@ -5021,6 +5021,16 @@ static void tensor_expect_dense_quant_layout(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) ds4_die("internal error: missing tensor while validating dense quant layout");
+    if (getenv("DS4_DUMP_DENSE_TENSORS")) {
+        static int dumped;
+        if (dumped < 64) {
+            dumped++;
+            fprintf(stderr, "ds4: dense tensor %.*s type=%s dims=%llu,%llu bytes=%llu\n",
+                    (int)t->name.len, t->name.ptr, tensor_type_name(t->type),
+                    (unsigned long long)d0, (unsigned long long)d1,
+                    (unsigned long long)t->bytes);
+        }
+    }
     if (!tensor_type_is_dense_quant(t->type)) {
         fprintf(stderr,
                 "ds4: tensor %.*s has type %s, expected q8_0, q4_K, or q4_0\n",

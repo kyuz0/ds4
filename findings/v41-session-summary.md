@@ -1059,3 +1059,42 @@ the streaming ceiling, so they remain candidates - but they cannot be assessed w
 stage marks. The instrument needed is what the MoE path already has: hipEvent pairs around
 each attention leaf's launch, so per-stage GPU time is measured without host synchronisation.
 That is the next in-scope step and it is instrumentation, not an optimization.
+
+## Real attention tensor bytes (measured dump, all q8_0) shift the target
+
+DS4_DUMP_DENSE_TENSORS dump of the actual model, all dense tensors q8_0:
+
+  blk.N.attn_q_a.weight      5120x1280   6.96 MB
+  blk.N.attn_q_b.weight      1280x32768 44.56 MB
+  blk.N.attn_kv.weight       5120x512    2.79 MB
+  blk.N.attn_output_a.weight 4096x8192  35.65 MB
+  blk.N.attn_output_b.weight 8192x5120  44.56 MB
+  blk.N.ffn_{gate,up,down}_shexp      12.53 MB each (37.6 MB/layer)
+
+This corrects both of my earlier attention assumptions (single 5120x4096 o_proj; q4_K possibility -
+the model is q8_0 throughout for these) and gives byte traffic per decode token:
+
+  attention projections 134.5 MB/layer -> 5.38 GB/token  (59 %)
+    q_b 44.6 + o_b 44.6 + o_a 35.7 + q_a 7.0 + kv 2.8 MB per layer
+  routed experts         54.7 MB/layer -> 2.19 GB/token  (24 %)
+  shared expert          37.6 MB/layer -> 1.50 GB/token  (17 %)
+  total                 ~9.07 GB/token
+
+Reading 9.07 GB in an 83 ms token implies ~109 GB/s, i.e. 49 % of the measured 223 GB/s
+read-only ceiling. So decode is NOT globally bandwidth-saturated: the MoE kernels are (94 %
+of ceiling), but the attention-projection leaves are the largest byte consumer by far (59 %)
+and the whole-token average sits at only half the ceiling.
+
+Event-timing coverage audit: these four leaves have NO hipEvent instrumentation - only
+wall-clock stage marks, which the earlier check showed inflate 2.46x and yield impossible
+rates (q_b at 493 GB/s). So no per-leaf rate can be stated yet, and none was.
+
+Supported conclusions:
+- the largest decode weight traffic is the attention low-rank projections (q_b + o_a + o_b =
+  124.8 of 134.5 MB per layer), not the MoE experts;
+- at ~49 % of ceiling overall there is room in principle, unlike the saturated MoE kernels;
+- deciding which leaf is inefficient needs hipEvent pairs around those launches.
+
+Next in-scope step: add hipEvent timing for attn_q_a/q_b/kv/output_a/output_b launches (the
+same pattern the MoE decode profile already uses), then apply the bytes-vs-ceiling test per
+leaf. That is instrumentation; no kernel change is proposed until it reports.
