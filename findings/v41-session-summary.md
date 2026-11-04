@@ -533,3 +533,46 @@ are the traps for this work:
 
 So the transform itself is now proven exact (not merely close), and the remaining
 work is the plumbing across the two writers and five readers already mapped.
+
+## FP4 index keys: correct, but the optimization cannot pay off (measured)
+
+Implemented and gated: 68 B/key packed index cache (4 x E8M0 per-32 scale + 64 nibble
+bytes), written by both publishers, read by the decode scorer and both prefill batch
+scorers behind DS4_ROCM_V41_INDEX_FP4 (default-off).
+
+Correctness: frontier logits bit-identical at 8192 and 114688 (0/129280 both), selected
+indices byte-identical over 128 records of top-512, on-device verifier 0 mismatches.
+
+Performance, six interleaved 32K gen-64 off/on pairs over two sessions:
+  +3.0, +3.6, +1.1 (session 1, mean +2.5 %, all positive)
+  +3.4, +1.6, -2.2 (session 2, mean +0.9 %, sign flips)
+  combined mean +1.75 %, median +2.30 %, sd 2.18
+
+Verdict: not reproducible. Session 1 looked like a real +2.5 %, session 2 refuted it,
+so the effect is indistinguishable from DVFS/measurement noise. Do not promote.
+
+Why the ceiling is this low, and why more implementation work cannot fix it: at 32K the
+indexer reads 16384 keys x 512 B x 16 layers = 134 MB per token, but decode takes ~90 ms
+per token, so that is only ~1.4 GB/s - far below HBM bandwidth, and mostly L2-resident.
+Replacing 512 B with 68 B removes 116 MB/token, i.e. ~1.2 GB/s of demand on a device with
+hundreds of GB/s. The original motivation (671 MB/token at 32K, 2267 MB/token at 110K)
+was a real figure misinterpreted as a bottleneck: spread over a ~90 ms token it is a
+bandwidth fraction, not a limit. Even a perfect dequant-in-GEMM conversion of the last
+F32 reader (the wide-GEMM branch) would chase the same non-bottleneck.
+
+Consequences:
+- the F32 index cache must NOT be dropped on the strength of this work; with the packed
+  copy added, write traffic is currently 13 % higher for no measured gain;
+- the packed path stays opt-in and unshipped; it is kept only as a correct, gated
+  building block in case the indexer ever becomes bandwidth-bound (e.g. much longer
+  contexts on slower memory);
+- no further effort goes into this line. The next speed work should target where the
+  90 ms actually goes, not the index cache.
+
+Instrumentation notes for whoever revisits this:
+- frontier logits are captured at the end of prefill, so they cannot verify a decode-only
+  change; selected-index equality was the load-bearing check there;
+- rocm-smi --showclkfrq prints a "supported frequencies" table, not the live clock, and
+  warns the GPU is in a low-power state when sampled outside a run - the per-arm clock
+  capture in bench-fp4-index-decode-pairs.sh is therefore not yet trustworthy; prefill
+  stability (183.03/183.28/183.07 tps) was used as the stability proxy instead.
