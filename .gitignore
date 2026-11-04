@@ -128,3 +128,6 @@ findings/
 /bench-*-ab.sh
 /profile-*.sh
 /smoke-compact-*.sh
+
+# agentkit machine-local state (built binaries, runs, noise floors)
+/.agentkit/

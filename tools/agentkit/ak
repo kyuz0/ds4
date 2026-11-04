@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""ak - agentkit command line. Every command prints one JSON object on stdout.
+
+Exit codes: 0 = computed (read "ok" and the verdict fields), 3 = refused (read "error" and
+"fix"), 2 = usage error.
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from agentkit import ab, attrib, facts, gate, ledger  # noqa: E402
+from agentkit.common import Refuse, emit, refuse_payload  # noqa: E402
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="ak", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for mod in (facts, attrib, ab, gate, ledger):
+        mod.register(sub)
+    args = p.parse_args(argv)
+    try:
+        res = args.func(args)
+    except Refuse as e:
+        emit(refuse_payload(e))
+        return 3
+    emit(res)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
