@@ -885,3 +885,28 @@ Next experiment this supports (not yet run): raise concurrent weight loads per w
 routed gate/up and down kernels, a distinguishable change from the previously rejected
 wave-count experiments (waves 2/8, mt8, preload6), gated behind an env flag and measured as
 interleaved pairs with generated-text equality.
+
+## Measured memory baseline on this machine (spec assumption replaced by data)
+
+tools/measure-hbm-bandwidth.cu: 512 MB device-to-device copy, and a read-only streaming
+reduction over 512 MB of floats, 20 iterations each, two runs:
+
+  read-only  223.0 / 223.1 GB/s
+  copy       210.8 / 211.2 GB/s (read+write, i.e. ~105 GB/s read + ~105 GB/s write)
+
+Against these, the event-derived routed-expert rates are:
+
+  gate/up  43.3 GB/s = 19 % of read-only -> implied headroom 5.2x
+  down     34.7 GB/s = 16 % of read-only -> implied headroom 6.4x
+
+Notes, stated precisely:
+- the earlier 180 GB/s device-spec assumption was 24 % LOW; the machine sustains 223 GB/s
+  read-only, so the opportunity is larger than the spec implied, not smaller;
+- a GEMV only reads weights and writes a token-sized output, so read-only bandwidth is the
+  correct ceiling to compare against - not the copy figure;
+- this establishes the gap exists (5-6x) but not that it is reachable: a 1-token GEMV has one
+  row of arithmetic per weight loaded, and its occupancy limit may be structural. The next
+  check is a bounded experiment on the gate/up and down kernels, not a promise.
+
+Repository note: HBM measurement tools are new files (tools/measure-hbm-bandwidth.cu); no
+engine code was touched for this check.
