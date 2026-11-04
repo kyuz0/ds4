@@ -1584,12 +1584,25 @@ static void v41_q8b4_log_shape(const char *site, uint32_t width, uint32_t output
     fprintf(stderr, "ds4: q8b4 %s\n", key);
 }
 
+/* Decode-scoped leaf timing for the fused attention projections. Only single-token
+ * calls are accumulated, so prefill rows can never enter the totals. */
+static int ds4_leaf_profile_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_V41_LEAF_PROFILE");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 extern "C" int ds4_gpu_dsv41_q8_projection_pair_rows(
         ds4_gpu_tensor *out_a, ds4_gpu_tensor *out_b,
         const void *model_map, uint64_t model_size,
         uint64_t offset_a, uint32_t outputs_a,
         uint64_t offset_b, uint32_t outputs_b,
         uint32_t width, const ds4_gpu_tensor *in) {
+    const int leaf = ds4_leaf_profile_on() && in && in->bytes == (uint64_t)width * 4ull;
+    if (leaf) (void)ds4_gpu_v41_leaf_begin();
     /* Promoted: q_a+kv fusion is on by default; =0 restores two launches. */
     {
         const char *e = getenv("DS4_ROCM_V41_Q8_FUSE_QAKV");
@@ -1615,6 +1628,8 @@ extern "C" int ds4_gpu_dsv41_q8_projection_pair_rows(
     v41_q8_f32_blocks4_pair_kernel<<<(total + 7u) / 8u, 256u>>>(
         (float *)out_a->ptr, (float *)out_b->ptr, wa, wb,
         (const float *)in->ptr, width, outputs_a, outputs_b, row_bytes);
+    if (leaf) (void)ds4_gpu_v41_leaf_end("attn_q_a_kv_pair",
+        (unsigned long long)(((uint64_t)outputs_a + outputs_b) * width * 34ull / 32ull));
     return cuda_ok(cudaGetLastError(), "V4.1 Q8 fused pair projection");
 }
 
@@ -1887,6 +1902,8 @@ static bool v41_attn_out_pad8_enabled(void) {
 extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
         const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    const int leaf = ds4_leaf_profile_on() && n_tokens == 1u;
+    if (leaf) (void)ds4_gpu_v41_leaf_begin();
     const uint64_t a_bytes = UINT64_C(8192) * 128u * 34u, b_bytes = UINT64_C(5120) * 256u * 34u;
     if (!model_map || !n_tokens || !cuda_model_range_fits(model_size, out_a_offset, a_bytes) ||
         !cuda_model_range_fits(model_size, out_b_offset, b_bytes) ||
@@ -1970,6 +1987,8 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
         matmul_q8_0_f32_batch_warp8_kernel<<<dim3(640u, n_tokens), 256>>>((float *)out->ptr, b,
             (const float *)low->ptr, 8192u, 5120u, n_tokens, 256u);
     }
+    if (leaf) (void)ds4_gpu_v41_leaf_end("attn_output_pair",
+        (unsigned long long)(a_bytes + b_bytes));
     return cuda_ok(cudaGetLastError(), "V4.1 attention output projection");
 }
 
@@ -2590,6 +2609,7 @@ static void ds4_leaf_profile_print(void) {
                 g_leaf_prof[i].bytes / 1e6, gbs);
     }
 }
+
 
 extern "C" int ds4_gpu_v41_leaf_begin(void) {
     if (!g_leaf_ev_ready) {

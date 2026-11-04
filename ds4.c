@@ -40894,7 +40894,22 @@ static bool ds41_matmul_rows_batch(ds4_gpu_tensor *out, const ds4_model *m,
 static bool ds41_matmul_rows(ds4_gpu_tensor *out, const ds4_model *m,
                              const ds4_tensor *weight, const ds4_gpu_tensor *in,
                              uint32_t first, uint32_t count) {
+#ifdef DS4_ROCM_BUILD
+    /* Decode-scoped leaf timing: only single-row projections are accumulated. */
+    const int leaf = ds41_leaf_profile_on() && count == 1u;
+    char leaf_label[48] = {0};
+    if (leaf) {
+        size_t n = weight->name.len < sizeof(leaf_label) - 1 ? weight->name.len : sizeof(leaf_label) - 1;
+        memcpy(leaf_label, weight->name.ptr, n);
+        leaf_label[n] = 0;
+        (void)ds4_gpu_v41_leaf_begin();
+    }
+    const bool ok = ds41_matmul_rows_batch(out, m, weight, in, first, count, 1);
+    if (leaf) (void)ds4_gpu_v41_leaf_end(leaf_label, weight->bytes);
+    return ok;
+#else
     return ds41_matmul_rows_batch(out, m, weight, in, first, count, 1);
+#endif
 }
 
 static bool ds41_output_projection(ds41_gpu_graph *g, ds4_gpu_tensor *out,

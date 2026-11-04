@@ -1127,3 +1127,41 @@ MB/layer, 221 MB/s, rocprof 183 us, 19 % headroom, now leaf GB/s). The common ca
 consistent: a counter that is not scoped to the population being reasoned about. The rule
 adopted here: no rate is quoted unless the instrument's call counts can be reconciled with
 token count x layers.
+
+## Per-leaf decode rates, on a properly scoped instrument (g0/g16 subtraction)
+
+Instrument fix: the leaf profiler now covers the fused attention entry points
+(ds4_gpu_dsv41_q8_projection_pair_rows, ds4_gpu_dsv41_attention_output_batch) and
+ds41_matmul_rows, and decode-only scoping is done by subtracting a gen-0 run from a gen-16 run
+of the same 32K prefill. Call deltas then reconcile exactly: 640 = 16 tokens x 40 layers for
+every per-layer leaf, 128 for the 8-layer indexer, 32 for engram, 48/40 for the compressor.
+
+  leaf                d_calls  ms/token  MB/token  GB/s  %ceil(223)
+  attn_output_pair        640     15.48    3208.6   207     93
+  attn_q_a_kv_pair        640      2.00     389.9   195     87
+  ffn_down_shexp          640      2.52     501.4   199     89
+  ffn_gate_inp            640      1.86     314.6   169     76
+  engram_kv                32      3.71     629.1   170     76
+  indexer.attn_q_b        128      0.43      83.9   195     87
+  hc_attn_fn / hc_ffn_fn  640   0.64/0.63   39.3   61/62   28
+  indexer.proj            128      0.12       2.6    22     10
+  indexer.attn_k           40      0.08       0.3     4      2
+
+Findings that stand:
+- every leaf that streams real weight bytes runs at 87-93 % of the measured 223 GB/s
+  read-only ceiling (output pair 93 %, q_a+kv 87 %, shexp down 89 %, indexer q_b 87 %), so
+  like the MoE kernels these are bandwidth-saturated and hold no recoverable headroom;
+- the small leaves (hc_*, indexer) run at 2-28 % but carry 39 MB or less per token, so their
+  ceiling is latency, not bandwidth, and they are not worth kernel work.
+
+Label accounting, stated honestly: q_a+kv cannot be split into two timings because the
+promoted q_a+kv fusion issues ONE kernel (v41_q8_f32_blocks4_pair_kernel) - separating the
+times would mean undoing a promoted optimization. The output pair does issue two kernels and
+could be split if a specific question about o_a vs o_b arises; it was not needed here because
+the pair as a whole is already at 93 % of ceiling.
+
+What this leaves for the next assessment: the decoded leaves account for ~27.5 ms/token plus
+MoE routed ~11.3 ms and main attn_q_b ~9 ms, i.e. ~48 of the 83 ms. The remaining ~35 ms is
+NOT weight streaming - it is attention core/softmax, routing, index selection and sampling -
+so that is where any further decode work must go, and it needs its own instrument (events
+around those kernels) rather than more bandwidth analysis.
