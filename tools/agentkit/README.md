@@ -119,8 +119,13 @@ The real GPU idle time is `token_ms` minus GPU busy time, measured in the natura
 
 3. **Plan:**
    ```sh
-   ak ab plan spec.json [--out bench-ak-qakv.sh]
+   ak ab plan spec.json [--profile default] [--out bench-ak-qakv.sh]
    ```
+   The plan must fit the supervisor's `PAYLOAD_TIMEOUT` from `supervisor.d/<profile>.env`. Add `"est_run_s"`
+   (seconds per measured run; take it from `run_seconds_median` of an earlier analysis) and a plan that
+   needs more than 90 % of the timeout is refused, with a smaller pair count as the fix. See
+   `supervisor.d/README.md`.
+
    This generates a payload that runs in ABBA order (`ABBAABBA`). It unsets all `DS4_*` variables and checks that the backend is down. Each run gets a fixed warm-up and clock/temperature samples taken every second from sysfs, and the host details (kernel, cmdline, platform profile, boot id) are recorded. At the end the payload runs `ak ab analyze --write-result`, which also writes `$PI_RUN_DIR/result.json` (under 4 KiB) when launched by the supervisor. Launch the payload through `run_benchmark` / the supervisor as usual. Use `--out` if the supervisor only accepts payloads at a specific path.
 
 4. **Analyze** (automatic at the end of the payload; can be re-run):

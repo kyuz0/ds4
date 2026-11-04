@@ -125,9 +125,19 @@ def cmd_plan(args):
     arms = {n: _resolve_arm(root, cfg, n, spec["arms"][n]) for n in ("A", "B")}
     aa = arms["A"]["sha256"] == arms["B"]["sha256"] and arms["A"]["env"] == arms["B"]["env"]
     model = str(Path(spec["model"]).expanduser())
+    fit, warns = _fit_supervisor(root, args.profile, spec, pairs)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    run_dir = state_dir(root) / "runs" / ("%s-%s" % (spec["name"], stamp))
-    run_dir.mkdir(parents=True)
+    runs_root = state_dir(root) / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    for n in range(100):
+        run_dir = runs_root / ("%s-%s%s" % (spec["name"], stamp, "-%d" % n if n else ""))
+        try:
+            run_dir.mkdir()
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise Refuse("could not create a unique run directory in %s" % runs_root)
     warm = list(spec.get("warmup_args", cfg["warmup_args"]))
     runs = []
     for i, order in _order(pairs):
@@ -148,12 +158,47 @@ def cmd_plan(args):
     payload = Path(args.out) if args.out else run_dir / "payload.sh"
     payload.write_text(script)
     payload.chmod(0o755)
-    est = pairs * 2 * (manifest["timeout_s"])
     return {"ok": True, "kind": manifest["kind"], "run_dir": str(run_dir), "payload": str(payload),
             "order": "".join(r["arm"] for r in runs), "anchored": {n: a["anchored"] for n, a in arms.items()},
-            "max_runtime_s": est,
+            "runtime": fit, "warnings": warns,
             "next": "launch the payload through run_benchmark; after resume run "
                     "'ak ab analyze %s' if result.json is missing" % run_dir}
+
+
+def _profile_timeout(root, profile):
+    """PAYLOAD_TIMEOUT from supervisor.d/<profile>.env (the supervisor kills the payload after it)."""
+    path = Path(profile) if ("/" in profile or profile.endswith(".env")) else \
+        Path(root) / "supervisor.d" / (profile + ".env")
+    if not path.exists():
+        return None, str(path)
+    m = None
+    for line in path.read_text().splitlines():
+        hit = re.match(r"\s*PAYLOAD_TIMEOUT=([0-9]+)\s*(#.*)?$", line)
+        if hit:
+            m = int(hit.group(1))
+    return m, str(path)
+
+
+def _fit_supervisor(root, profile, spec, pairs):
+    limit, path = _profile_timeout(root, profile)
+    limit = limit or 3600
+    runs = pairs * 2
+    warm = int(spec.get("warmup_est_s", 60))
+    warns = []
+    if "est_run_s" in spec:
+        est = runs * (int(spec["est_run_s"]) + warm)
+        if est > 0.9 * limit:
+            fit_pairs = max(0, int(0.9 * limit // (2 * (int(spec["est_run_s"]) + warm))) // 2 * 2)
+            raise Refuse("plan needs ~%ds but the supervisor kills payloads after %ds (%s)"
+                         % (est, limit, path),
+                         fix="use pairs=%d per cycle (repeat cycles), shorten the case, or raise "
+                             "PAYLOAD_TIMEOUT in the profile" % fit_pairs if fit_pairs >= 4 else
+                             "shorten the case or raise PAYLOAD_TIMEOUT in the profile")
+    else:
+        est = None
+        warns.append("no est_run_s in spec: cannot check the %ds supervisor limit; set it from "
+                     "run_seconds_median of an earlier analysis" % limit)
+    return {"supervisor_limit_s": limit, "estimated_s": est, "profile": path}, warns
 
 
 def case_signature(case):
@@ -217,6 +262,19 @@ def _clock_median(path):
     return statistics.median(vals) if vals else None
 
 
+def _run_seconds(path):
+    """Measured-run duration from the first and last clock sample."""
+    if not path.exists():
+        return None
+    ts = []
+    for ln in path.read_text().splitlines():
+        try:
+            ts.append(float(ln.split()[0]))
+        except (ValueError, IndexError):
+            pass
+    return round(ts[-1] - ts[0]) if len(ts) >= 2 else None
+
+
 def _bootstrap_ci(xs, n=10000, seed=1):
     rng = random.Random(seed)
     k = len(xs)
@@ -250,7 +308,8 @@ def analyze_dir(run_dir, root=None):
         rows = _read_csv(rd / "profile.csv")
         if rc_txt != "0" or not rows:
             warnings.append("run %s rc=%s rows=%s" % (r["dir"], rc_txt, len(rows or [])))
-        data[r["idx"]] = {"rows": rows or [], "clock": _clock_median(rd / "clock.tsv")}
+        data[r["idx"]] = {"rows": rows or [], "clock": _clock_median(rd / "clock.tsv"),
+                          "seconds": _run_seconds(rd / "clock.tsv")}
     metrics = {}
     for metric in m["metrics"]:
         sign = _better(metric)
@@ -353,6 +412,8 @@ def analyze_dir(run_dir, root=None):
             "date": time.strftime("%Y-%m-%d"), "arms": arms, "verdicts": verdicts,
             "metrics": metrics, "noise_floor_pct": {k: v["floor_pct"] for k, v in floors.items()},
             "clock_median_mhz": clk, "clock_skew_pct": clock_skew, "gate": gate,
+            "run_seconds_median": (statistics.median(secs) if (secs := [d["seconds"] for d in
+                                   data.values() if d["seconds"]]) else None),
             "warnings": warnings[:12]}
 
 
@@ -392,6 +453,8 @@ def register(sub):
     a = s.add_parser("plan", help="validate a spec and generate an ABBA payload script")
     a.add_argument("spec")
     a.add_argument("--out", help="write the payload here (e.g. a bench-*.sh the supervisor accepts)")
+    a.add_argument("--profile", default=os.environ.get("SUP_PROFILE", "default"),
+                   help="supervisor profile whose PAYLOAD_TIMEOUT the plan must fit")
     a.set_defaults(func=cmd_plan)
     a = s.add_parser("analyze", help="paired statistics, noise floor, clocks and logits gate")
     a.add_argument("run_dir")

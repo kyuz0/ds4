@@ -250,6 +250,7 @@ class AB(unittest.TestCase):
         self.assertEqual(r["verdicts"]["prefill_tps@32768"], "win")
         self.assertEqual(r["verdicts"]["gen_steady_tps@32768"], "inconclusive")
         self.assertTrue(r["gate"]["pass"])
+        self.assertEqual(r["run_seconds_median"], 4)   # clock samples at t=0..4
 
     def test_no_floor_is_inconclusive(self):
         win = {(p, a): (180.0 if a == "A" else 186.0, 11.0) for p in range(4) for a in "AB"}
@@ -331,6 +332,28 @@ class Repo(unittest.TestCase):
         sp.write_text(json.dumps(spec))
         rc, out, _ = self.run_ak("ab", "plan", sp)
         self.assertEqual(rc, 3)
+
+    def test_plan_fits_supervisor_timeout(self):
+        self.run_ak("ab", "build", "HEAD~1")
+        self.run_ak("ab", "build", "HEAD")
+        (self.root / "supervisor.d").mkdir()
+        (self.root / "supervisor.d" / "default.env").write_text("PAYLOAD_TIMEOUT=3600\n")
+        spec = {"name": "t3", "model": "/m", "prompt": "p", "bench_args": [], "pairs": 4,
+                "est_run_s": 600, "arms": {"A": {"commit": "HEAD~1"}, "B": {"commit": "HEAD"}}}
+        sp = self.root / "spec.json"
+        sp.write_text(json.dumps(spec))
+        rc, out, _ = self.run_ak("ab", "plan", sp)
+        self.assertEqual(rc, 3)                      # 8 x 660 s > 0.9 x 3600 s
+        self.assertIn("3600", out["error"])
+        spec["est_run_s"] = 300
+        sp.write_text(json.dumps(spec))
+        rc, out, _ = self.run_ak("ab", "plan", sp)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["runtime"]["supervisor_limit_s"], 3600)
+        del spec["est_run_s"]
+        sp.write_text(json.dumps(spec))
+        rc, out, _ = self.run_ak("ab", "plan", sp)
+        self.assertTrue(any("est_run_s" in w for w in out["warnings"]))
 
     def test_plan_requires_build(self):
         spec = {"name": "t2", "model": "/m", "prompt": "p", "bench_args": [],
