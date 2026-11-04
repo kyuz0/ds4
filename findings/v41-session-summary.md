@@ -800,3 +800,28 @@ hoist) all landed within +-1.2 % for exactly this reason.
 Instrumentation left in place (all diagnostic, gated by DS4_ROCM_STREAM_CACHE_STATS /
 DS4_ROCM_STREAM_READ_PROFILE): staged-bytes, staged-jobs, staged-read-us and the per-job-count
 bucket histogram of wait/own-read/read>wait.
+
+## Cache-thrash check (from the existing log, no new run): no thrash, so no policy fix
+
+The reuse ledger from the same decode-scoped run answers whether the 57 large fetches are
+avoidable re-fetches:
+
+  allocs=8735  alloc=80.97 GiB  evictions=0  evicted=0.00 GiB
+
+Zero evictions over the whole run: every expert block is loaded once and retained, so the
+1.78 large fetches per token are cold first-touch loads of blocks the 84.87 GiB cache cannot
+already hold, not repeated re-fetches of the same experts. There is therefore no eviction or
+admission policy in scope that would remove them, and no scheduling change either (91 % of
+their read time is already hidden, and four attempts confirmed the remainder is tail).
+
+Broader objective, restated on evidence: at 32K the token splits as MoE ~26 % (routed 20.1,
+shared 3.8, route 1.4, stream 0.8), attention ~18 % with attn_output ~14 % of the token in
+aggregate, and q/kv projections ~12 %. Of the MoE part, the portion that looked like I/O
+stall is now explained and out of scope; the compute leaves are gate_resident (175 us) and
+down (109 us) per layer-token.
+
+Smallest remaining evidence check that could reopen decode optimization: a kernel-level
+breakdown (rocprof, not stage marks) of one decode token at 32K to attribute the ~90 ms
+between attention kernels and the routed GEMV/MMVQ kernels, since stage marks cannot see
+inside them. Until that exists, the next candidate is a guess and this line should stay
+closed.
