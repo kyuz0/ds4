@@ -1033,3 +1033,29 @@ Next in-scope assessment this method supports: apply the same bytes-vs-measured-
 to the attention leaves (attn_output ~14 % of token, attn_project ~11 %, attn_q_b ~8 %), since
 those are now the largest unexamined components and the test needs only their shapes plus
 event or stage timings.
+
+## Attention-leaf assessment attempted: current instruments cannot support it
+
+Applied the bytes-vs-ceiling method to the attention leaves using DS4_SHAPE V4.1 Flash
+(n_embd=5120, n_head=64, n_head_dim=512, n_lora_q=1280, n_lora_o=1024, n_out_group=8) and Q8_0
+weights (8.5 bits):
+
+  attn o_proj (5120 x 4096) 22.28 MB/layer   -> 891 MB/token over 12.0 ms = 74 GB/s
+  attn q_b   (1280 x 32768) 44.56 MB/layer   -> 1783 MB/token over 8.9 ms = 200 GB/s
+  attn q_a   (5120 x 1280)   6.96 MB/layer   -> 279 MB/token over 3.0 ms = 94 GB/s
+
+Those timings come from the stage-profile run, whose synchronize per boundary inflates wall
+time: the same run measured 205 ms/token against a real 83 ms/token, 2.46x inflation. Scaling
+the rates by that factor gives o_proj 182 GB/s (82 % of ceiling), q_a 232 GB/s and q_b
+493 GB/s - the last two ABOVE the measured 223 GB/s read-only ceiling, which is impossible.
+
+Therefore: the attention-leaf numbers above must not be read as rates, and no saturation or
+headroom claim is supported for these kernels. Two candidate explanations remain open (stage
+timings inflated non-uniformly, and/or my Q8_0 byte estimate for these specific projections is
+wrong), and the evidence does not distinguish them.
+
+What IS supported: unlike the MoE pair, nothing here shows the attention leaves already at
+the streaming ceiling, so they remain candidates - but they cannot be assessed with wall-time
+stage marks. The instrument needed is what the MoE path already has: hipEvent pairs around
+each attention leaf's launch, so per-stage GPU time is measured without host synchronisation.
+That is the next in-scope step and it is instrumentation, not an optimization.
