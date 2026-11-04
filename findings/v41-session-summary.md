@@ -971,3 +971,36 @@ overlap result.
 
 Two unit errors were made while computing these rates (MB/us vs GB/s); the final arithmetic
 is unit-checked (MB/1e3 over us/1e6) and the numbers above were recomputed that way.
+
+## Byte-basis and stage-coverage audit of the previous entry (partly corrected)
+
+Checked the two things the previous numbers depended on:
+
+1. What allocs/alloc_bytes measure. They are incremented when a RESIDENT CACHE ENTRY is
+   created (runtime.cuh:1874-1875, inside the resident-entry insert), so 80.97 GiB / 8735 is
+   the mean size of a resident expert entry (gate+up+down, padded), not "bytes read per
+   expert". It is a legitimate size proxy but not a read count, and gate_expert_bytes vs
+   down_expert_bytes are separate fields, so the 3.16 MB per matrix derived from it is an
+   allocation-based estimate.
+2. Whether gate/up and down cover the same experts. They do cover the same count, but my
+   label was wrong: the model selects 6 experts, not 8. The code's deepseek41 fast paths are
+   guarded by n_expert == 6u (moe_launch.cuh:1094/1137), and stream_resident_mask=0x3f is 6
+   bits set - i.e. ALL selected experts are resident at that moment, not "6 of 8".
+
+Recomputed with the corrected count (6 experts, allocation-based 3.16 MB per matrix):
+  gate/up  37.9 MB in 175 us = 217 GB/s = 97 % of the measured 223 GB/s read-only ceiling
+  down     19.0 MB in 109 us = 174 GB/s = 78 % of that ceiling
+
+The numerical rates in the previous entry were right; its explanation ("6 of 8 experts") was
+wrong, and the "bytes" are allocation sizes rather than read volumes. Because both stages are
+at 78-97 % of a measured ceiling, the conclusion is unchanged and is now supported by a
+corrected basis: the routed expert GEMVs are essentially bandwidth-saturated, so no kernel
+optimization is justified there.
+
+Also consistent: mask 0x3f fully resident explains gate_missing at 5.9 ms (nothing missing in
+the timed path) and why only 57 of 1280 decode calls stage any reads at all.
+
+Evidence-limits note: the per-matrix byte figure is allocation-derived and FF_EXP is not
+printed by the engine, so these rates carry maybe +-10 % - which does not change the
+"at/near ceiling" conclusion but does mean the 78 % for down should not be read as a precise
+headroom estimate.
