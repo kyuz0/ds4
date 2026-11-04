@@ -576,3 +576,28 @@ Instrumentation notes for whoever revisits this:
   warns the GPU is in a low-power state when sampled outside a run - the per-arm clock
   capture in bench-fp4-index-decode-pairs.sh is therefore not yet trustworthy; prefill
   stability (183.03/183.28/183.07 tps) was used as the stability proxy instead.
+
+## 32K decode apportionment (DS4_V41_DECODE_STAGE_PROFILE, 40 layers x 16 tokens)
+
+  moe_partial       861.3 ms  26.2%     attention      600.6 ms  18.3%
+  moe_routed        658.7 ms  20.1%     attn_output    251.8 ms   7.7%
+  attn_project      191.6 ms   5.8%     attn_q_b       142.4 ms   4.3%
+  moe_shared        124.6 ms   3.8%     before_attn    110.2 ms   3.4%
+  attn_decode        64.4 ms   2.0%     attn_select     54.7 ms   1.7%
+  after_attention    48.6 ms   1.5%     attn_q_a        47.3 ms   1.4%
+  moe_route          46.7 ms   1.4%     moe_stream_begin 26.5 ms  0.8%
+  attn_rope_window   13.4 ms   0.4%     attn_gather     12.3 ms   0.4%
+
+Total instrumented 3285 ms for 16 tokens; the per-stage synchronize inflates wall
+time (real decode ~90 ms/token), so read the shares, not the absolute ms.
+
+Two conclusions that redirect the work:
+- MoE is ~52 % of the token (moe_partial + moe_routed + moe_shared + route + stream
+  + finish) and attention ~35 %. MoE is the target.
+- attn_select, the indexer select that the whole packed-FP4 exercise optimised, is
+  1.7 % of the token. Independent confirmation that the repack could never have paid
+  off, from a different direction than the six-pair timing result.
+
+Next step: moe_partial is a bucket (router matmul + select, stream begin, shared expert,
+routed expert matmuls), not a single kernel, so instrument inside it before optimising
+anything - gate/up vs down vs stream-wait - rather than guessing which of the 26 % is real.
