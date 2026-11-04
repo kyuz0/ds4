@@ -825,3 +825,34 @@ breakdown (rocprof, not stage marks) of one decode token at 32K to attribute the
 between attention kernels and the routed GEMV/MMVQ kernels, since stage marks cannot see
 inside them. Until that exists, the next candidate is a guess and this line should stay
 closed.
+
+## rocprof decode-only kernel delta: NOT usable for choosing an optimization (checked, rejected)
+
+bench-decode-diff-rocprof.sh (gen-4 minus gen-0 trace of the same 8K prefill) reported
+456 ms of decode-only kernel time over 4 tokens, i.e. 114 ms/token, above the real 83 ms
+token - already a sign of attribution trouble. Per-kernel, for the entries whose call counts
+actually change between arms (so they are decode-attributable):
+
+  kernel                        calls  ms/token  us/call
+  v41_q8_f32_blocks4              484     22.18      183
+  moe_v41_gate_up_wave_ptrs<4>    166      6.88      166
+  v41_grouped_q8_f32_blocks4      160      6.76      169
+  pair_swiglu_bf16                160      4.74      119
+  moe_v41_down_wave_ptrs<4>       160      4.21      105
+  attention_split_f32_heads       152      2.67       70
+
+Quantizing 8 x 7168 floats costs about 2.3 us of traffic at 200 GB/s; the trace charges
+183 us, ~80x too much. Same factor for the other rows. The kernels are ~40x cheaper than the
+trace claims, so the timestamps are absorbing the serialized dependency waits of the decode
+chain (each kernel starts only when its predecessor's data lands) instead of measuring work.
+Rows with d_calls=0 (ds4_mmq_compact_mul_mat_q, moe_down_q2K_hotlist_wmma_n2) carry 22.6 and
+14.7 ms/token of "delta" with no extra calls at all, which cannot be decode work by
+construction.
+
+Conclusion: this trace cannot separate compute from stall on a serialized decode chain, so it
+does not support any optimization, and none was made on its basis. A usable version needs
+in-engine event timing around specific launches (the stage-profile machinery already does
+this per stage) or a trace that preserves per-stream concurrency, not a wall-time subtraction.
+
+This is the third instrument in this line whose aggregate output pointed somewhere the
+kernel-level physics did not, which is why the check above was done before touching code.
