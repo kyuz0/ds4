@@ -2,7 +2,7 @@
 """ak - agentkit command line. Every command prints one JSON object on stdout.
 
 Exit codes: 0 = computed (read "ok" and the verdict fields), 3 = refused (read "error" and
-"fix"), 2 = usage error.
+"fix"), 2 = usage error, 4 = internal error (a bug in ak; the JSON names the exception).
 """
 import argparse
 import os
@@ -26,6 +26,10 @@ def main(argv=None):
     except Refuse as e:
         emit(refuse_payload(e))
         return 3
+    except Exception as e:  # keep the one-JSON-object contract even on bugs
+        emit({"ok": False, "error": "internal error: %s: %s" % (e.__class__.__name__, e),
+              "fix": "this is a bug in ak; report the command line"})
+        return 4
     emit(res)
     return 0
 

@@ -132,8 +132,14 @@ def _require_ab(root, path, change_commit, cfg_sessions=None):
     if not wins:
         raise Refuse("A/B shows no 'win' verdict: %s" % a["verdicts"])
     gate = a.get("gate")
-    if gate is not None and not gate.get("pass"):
+    if not gate:
+        raise Refuse("A/B analysis has no logits gate (dump_logits was off)",
+                     fix="re-run the A/B with dump_logits enabled")
+    if not gate.get("pass"):
         raise Refuse("A/B logits gate failed")
+    if a.get("session_source") != "run":
+        raise Refuse("A/B session identity was not recorded at run time (no host.txt)",
+                     fix="use an analysis of a run produced by an 'ak ab plan' payload")
     b = a["arms"]["B"]["commit"]
     if change_commit and b:
         rc = subprocess.run(["git", "merge-base", "--is-ancestor", change_commit, b],
@@ -150,6 +156,11 @@ def cmd_advance(args):
     c = claims.get(args.id)
     if not c or c["kind"] != "change":
         raise Refuse("%s is not a change claim" % args.id, fix="ak ledger add --kind change ...")
+    if c["status"] in ("retracted", "rejected", "suspect"):
+        raise Refuse("%s is %s and cannot advance" % (args.id, c["status"]),
+                     fix="resolve it first: ak ledger show %s" % args.id)
+    if args.stage in ("gated", "measured", "confirmed") and not args.evidence:
+        raise Refuse("stage %s needs --evidence (an ak output file)" % args.stage)
     cur = STAGES.index(c["stage"])
     want = STAGES.index(args.stage)
     if want != cur + 1:

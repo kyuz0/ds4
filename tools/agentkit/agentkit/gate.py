@@ -66,7 +66,8 @@ def compare_dirs(da, db, mode="bit_exact", pattern="*.logits.json", k=10, tol=0.
         elif mode == "bit_exact" and not r["exact"]:
             fails.append(r["file"])
         elif mode == "argmax_stable" and not (r["argmax_equal"] and r["topk_set_equal"]
-                                              and r["max_abs"] <= tol + 1e-30):
+                                              and r["max_abs"] <= tol + 1e-30
+                                              and r["nonfinite_mismatch"] == 0):
             fails.append(r["file"])
     kinds = sorted({re.sub(r"_\d+.*", "", r["file"]) for r in rows})
     verdict = "pass" if not fails and not missing else "fail"
@@ -95,14 +96,18 @@ def cmd_required(args):
     rules = load_json(args.rules or _DEFAULT_RULES, "gate rules")["rules"]
     diff = git(root, "diff", "--unified=0", args.range, "--", *(args.paths or []))
     files, lines = [], {}
-    cur = None
+    cur, in_hunk = None, False
     for ln in diff.splitlines():
-        if ln.startswith("+++ b/"):
-            cur = ln[6:]
+        head = re.match(r"^diff --git a/(.*) b/(.*)$", ln)
+        if head:
+            # b/ path covers added, modified, renamed and deleted files alike
+            cur, in_hunk = head.group(2), False
             files.append(cur)
             lines[cur] = []
-        elif cur and (ln.startswith("+") or ln.startswith("-")) and not ln.startswith(("+++", "---")):
-            lines[cur].append(ln[1:])
+        elif ln.startswith("@@"):
+            in_hunk = True
+        elif cur and in_hunk and ln[:1] in ("+", "-"):
+            lines[cur].append(ln[1:])   # content lines, including ones starting with ++ or --
     required = {}
     for r in rules:
         fre = re.compile(r.get("file", ".*"))

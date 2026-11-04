@@ -1,4 +1,6 @@
 """ak rate / ak budget: bytes-vs-time arithmetic and time budgets that refuse double counting."""
+import re
+
 from .common import Refuse, count_expr, load_json, parse_bytes, parse_rate, parse_time
 
 # How a timing was obtained decides what it may be added to.
@@ -31,8 +33,12 @@ def rate(args):
         if args.calls is None or args.expect_calls is None:
             raise Refuse("--calls and --expect-calls go together",
                          fix="e.g. --calls 640 --expect-calls 'tokens*layers' --var tokens=16 --var layers=40")
-        names = dict(v.split("=", 1) for v in args.var or [])
-        names = {k: int(v) for k, v in names.items()}
+        names = {}
+        for v in args.var or []:
+            k, sep, val = v.partition("=")
+            if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", k) or not val.isdigit():
+                raise Refuse("--var %r must be name=integer" % v, fix="e.g. --var tokens=16")
+            names[k] = int(val)
         expected = count_expr(args.expect_calls, names)
         if expected != args.calls:
             errors.append("call count %d != expected %d (%s): the counter is not scoped to the "

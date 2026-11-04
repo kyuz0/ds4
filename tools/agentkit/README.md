@@ -32,6 +32,7 @@ python3 -m unittest discover -s tools/agentkit/tests    # synthetic-data tests
 - **Exit codes:**
   - `0` means the command computed a result. Read `ok`, `verdict` / `verdicts`, `errors` and `warnings`. `ok:false` with exit 0 means the inputs were valid but the result failed a check, such as a rate above the ceiling.
   - `3` means refused. Read `error` and `fix`.
+  - `4` means an internal error (a bug in `ak`); the output is still one JSON object.
   - `2` means a usage error.
 - **Units:** every quantity must carry a unit. Bytes are `B KB MB GB` (decimal) or `KiB MiB GiB`; times are `ns us ms s`; rates are `GB/s`. A bare number is refused.
 - **Machine-local state** lives in `.agentkit/` (gitignored): built binaries, worktrees, runs, noise floors and an optional `config.json` that overrides `tools/agentkit/config.json`. Override the location with `AK_STATE_DIR`.
@@ -113,7 +114,7 @@ The real GPU idle time is `token_ms` minus GPU busy time, measured in the natura
    }
    ```
    - `common_args` go to both the warm-up run and the measured run; `bench_args` go to the measured run only.
-   - `-m`, `--prompt-file`, `--csv` and the logits directory are set by `ak` and are refused in the spec.
+   - `-m`/`--model`, `--prompt-file`, `--csv` and the logits directory are set by `ak` and are refused in the spec (also in `--flag=value` form).
    - `pairs` must be even and at least 4.
    - A spec whose two arms have the same binary and env is an **A/A run**.
 
@@ -140,7 +141,7 @@ The real GPU idle time is `token_ms` minus GPU busy time, measured in the natura
      - Otherwise the verdict is `inconclusive`.
      - Without an A/A run for the same case, the verdict is always `inconclusive_no_noise_floor`.
      - A clock skew above 3 % between arms downgrades win or loss to `inconclusive_clock_skew`.
-   - **Noise floor:** an A/A run records it per case signature in `.agentkit/noise.json` (the most conservative value seen).
+   - **Noise floor:** an A/A run records it per case signature in `.agentkit/noise.json` (the most conservative value seen). The signature includes the args, env, the prompt's sha256 and the model's size and mtime, so a floor never carries over to a changed prompt or a re-quantised model.
    - **Logits gate:** frontier logits from every B run are compared bit-exactly with the first A run.
 
    **Run an A/A first for every new case.** That is the only way to know what +2 % means on this machine.
@@ -188,10 +189,13 @@ ak ledger show [ID] [--status suspect] ; ak ledger truth   # writes ledger/CURRE
   - with `--decode-path`, the gate must have compared decode logits.
 - **Weak A/B evidence:** `measured` and `confirmed` need an `ak ab` analysis that:
   - has kind `ab` and commit-anchored arms;
+  - has a passing logits gate (an A/B with `dump_logits: false` is not evidence);
+  - took its session id and date from the run's `host.txt`, not from when the analysis ran;
   - shows at least one `win`;
   - passed its logits gate;
   - has a candidate arm that contains the implementation commit.
-- **Same-session confirmation:** `confirmed` must come from a different session, i.e. a different boot id or a different day.
+- **Same-session confirmation:** `confirmed` must come from a different session, i.e. a different boot id or a different day, as recorded when the benchmark ran. Re-analysing an old run does not create a new session.
+- **Dead changes:** a change that is retracted, rejected or suspect cannot advance.
 
 **Retraction cascade:** retracting or rejecting a claim marks everything that depends on it (`--depends`) as `suspect`. `ledger/CURRENT.md` is the short current-truth page; the old findings files become history.
 

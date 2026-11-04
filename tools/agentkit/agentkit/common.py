@@ -42,7 +42,7 @@ _NUM = r"([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)"
 
 
 def _split(text, what):
-    m = re.fullmatch(r"\s*" + _NUM + r"\s*([A-Za-z/]+)\s*", str(text))
+    m = re.fullmatch(r"\s*" + _NUM + r"\s*([A-Za-z/µμ]+)\s*", str(text))
     if not m:
         raise Refuse("%s %r has no explicit unit" % (what, text),
                      fix="write the unit, e.g. 36.5MB, 3.2GiB, 175us, 8.7ms, 223GB/s")
@@ -60,7 +60,7 @@ def parse_bytes(text):
 
 def parse_time(text):
     value, unit = _split(text, "time")
-    u = unit.upper().replace("µ", "U")
+    u = unit.replace("µ", "u").replace("μ", "u").upper()  # micro sign and Greek mu
     if u not in _TIME_UNITS:
         raise Refuse("unknown time unit %r" % unit, fix="use ns, us, ms or s")
     return value * _TIME_UNITS[u]
@@ -83,7 +83,11 @@ def count_expr(expr, names):
         if name not in names:
             raise Refuse("call-count expression uses unknown name %r" % name,
                          fix="known names: %s" % ", ".join(sorted(names)))
-    return int(eval(text, {"__builtins__": {}}, dict(names)))  # noqa: S307 (validated)
+    try:
+        return int(eval(text, {"__builtins__": {}}, dict(names)))  # noqa: S307 (validated)
+    except (SyntaxError, TypeError, ValueError) as e:
+        raise Refuse("call-count expression %r is not valid (%s)" % (text, e.__class__.__name__),
+                     fix="e.g. 'tokens*layers' or '16*40'")
 
 
 # ---------------------------------------------------------------- paths

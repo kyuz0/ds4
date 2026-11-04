@@ -17,6 +17,9 @@ from .common import (Refuse, boot_id, git, load_json, repo_root, sha256_file, st
 from .gate import compare_dirs
 
 _DEFAULTS = Path(__file__).resolve().parent.parent / "config.json"
+# Flags ak sets itself; a spec must not override them (ds4_bench.c accepts -m and --model).
+_RESERVED_FLAGS = {"-m", "--model", "--prompt-file", "--csv", "--dump-frontier-logits-dir"}
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 AK = Path(__file__).resolve().parent.parent / "ak"
 
 
@@ -52,8 +55,12 @@ def cmd_build(args):
     log = out / "build.log"
     out.mkdir(parents=True, exist_ok=True)
     with open(log, "w") as fh:
-        rc = subprocess.run(cmd, shell=True, cwd=wt, stdout=fh, stderr=subprocess.STDOUT,
-                            timeout=args.timeout).returncode
+        try:
+            rc = subprocess.run(cmd, shell=True, cwd=wt, stdout=fh, stderr=subprocess.STDOUT,
+                                timeout=args.timeout).returncode
+        except subprocess.TimeoutExpired:
+            raise Refuse("build of %s exceeded %ds" % (sha[:10], args.timeout),
+                         fix="raise --timeout or check %s" % log)
     built = wt / cfg["bench_binary"]
     if rc != 0 or not built.exists():
         tail = log.read_text(errors="replace").splitlines()[-15:]
@@ -119,9 +126,11 @@ def cmd_plan(args):
         raise Refuse("pairs must be even and >= 4 so the ABBA order is balanced")
     common = list(spec.get("common_args", []))
     bench = list(spec["bench_args"])
-    for flag in ("--csv", "--dump-frontier-logits-dir", "-m", "--prompt-file"):
-        if flag in bench or flag in common:
-            raise Refuse("%s is set by ak; remove it from the spec" % flag)
+    for arg in bench + common:
+        name = str(arg).split("=", 1)[0]
+        if name in _RESERVED_FLAGS:
+            raise Refuse("%s is set by ak; remove it from the spec" % name,
+                         fix="model and prompt go in the spec's 'model' and 'prompt' fields")
     arms = {n: _resolve_arm(root, cfg, n, spec["arms"][n]) for n in ("A", "B")}
     aa = arms["A"]["sha256"] == arms["B"]["sha256"] and arms["A"]["env"] == arms["B"]["env"]
     model = str(Path(spec["model"]).expanduser())
@@ -145,7 +154,8 @@ def cmd_plan(args):
             runs.append({"idx": len(runs), "pair": i, "position": pos, "arm": arm,
                          "dir": "r%02d_%s" % (len(runs), arm)})
     case = {"model": model, "prompt": spec["prompt"], "common_args": common, "bench_args": bench,
-            "global_env": spec.get("env", {})}
+            "global_env": spec.get("env", {}), "model_id": _model_id(model),
+            "prompt_sha256": _prompt_sha(root, spec["prompt"])}
     manifest = {"name": spec["name"], "kind": "aa" if aa else "ab", "created": stamp,
                 "repo_head": git(root, "rev-parse", "HEAD"), "arms": arms, "case": case,
                 "case_signature": case_signature(case), "pairs": pairs, "runs": runs,
@@ -201,9 +211,29 @@ def _fit_supervisor(root, profile, spec, pairs):
     return {"supervisor_limit_s": limit, "estimated_s": est, "profile": path}, warns
 
 
+def _model_id(model):
+    """Size + mtime: hashing a 100+ GB model is not practical, but a re-quantised file changes these."""
+    try:
+        st = Path(model).stat()
+        return "%d:%d" % (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return "missing"
+
+
+def _prompt_sha(root, prompt):
+    p = Path(prompt) if Path(prompt).is_absolute() else Path(root) / prompt
+    try:
+        return sha256_file(p)
+    except OSError:
+        return "missing"
+
+
 def case_signature(case):
+    """Noise floors are only valid for the same workload: args, env, prompt content, model file."""
     keep = {k: case[k] for k in ("prompt", "common_args", "bench_args", "global_env")}
     keep["model"] = Path(case["model"]).name
+    keep["model_id"] = case.get("model_id")
+    keep["prompt_sha256"] = case.get("prompt_sha256")
     return json.dumps(keep, sort_keys=True)
 
 
@@ -236,7 +266,8 @@ def _payload(root, cfg, run_dir, m):
         L += ["echo \"=== run %d arm %s pair %d $(date -Is) ===\"" % (r["idx"], r["arm"], r["pair"]),
               "D=\"$RUN/%s\"; mkdir -p \"$D/logits\"" % r["dir"],
               "env %s timeout 600 %s > \"$D/warmup.log\" 2>&1" % (env, warm),
-              "( while :; do echo \"$(date +%s.%N) $(sclk) $(temp)\"; sleep 1; done ) > \"$D/clock.tsv\" & CLK=$!",
+              "( while :; do s=$(sclk); t=$(temp); echo \"$(date +%s.%N) ${s:--} ${t:--}\"; sleep 1; done )"
+              " > \"$D/clock.tsv\" & CLK=$!",
               "env %s timeout -k 60 %d %s > \"$D/bench.log\" 2>&1; echo $? > \"$D/rc\"" % (env, m["timeout_s"], meas),
               "kill $CLK 2>/dev/null; wait $CLK 2>/dev/null"]
     L += ["python3 -I %s ab analyze \"$RUN\" --write-result" % q(str(AK)), "exit 0", ""]
@@ -257,9 +288,23 @@ def _clock_median(path):
     if path.exists():
         for ln in path.read_text().splitlines():
             parts = ln.split()
-            if len(parts) >= 2 and parts[1].isdigit():
+            # "<ts> <sclk MHz|-> <temp mC|->": exactly three fields, so an empty clock
+            # reading can never shift the temperature into the clock column
+            if len(parts) == 3 and parts[1].isdigit():
                 vals.append(int(parts[1]))
     return statistics.median(vals) if vals else None
+
+
+def _run_session(run_dir):
+    """Session identity from host.txt, written by the payload when the benchmark ran."""
+    host = Path(run_dir) / "host.txt"
+    if host.exists():
+        lines = host.read_text(errors="replace").splitlines()
+        ids = [l.strip() for l in lines if _UUID.fullmatch(l.strip())]
+        date = lines[0][:10] if lines and re.match(r"\d{4}-\d{2}-\d{2}", lines[0]) else None
+        if ids and date:
+            return {"session": ids[-1], "date": date, "session_source": "run"}
+    return {"session": boot_id(), "date": time.strftime("%Y-%m-%d"), "session_source": "analysis_time"}
 
 
 def _run_seconds(path):
@@ -407,9 +452,12 @@ def analyze_dir(run_dir, root=None):
                 "env": a["env"]} for n, a in m["arms"].items()}
     if not all(a["anchored"] for a in m["arms"].values()):
         warnings.append("an arm is not commit-anchored; ledger will not accept this as promotion evidence")
+    sess = _run_session(run_dir)
+    if sess["session_source"] != "run":
+        warnings.append("host.txt missing or incomplete: session/date taken at analysis time; "
+                        "the ledger will not accept this as session evidence")
     return {"ok": True, "run_id": run_dir.name, "kind": m["kind"], "pairs": m["pairs"],
-            "order": "".join(r["arm"] for r in m["runs"]), "session": boot_id(),
-            "date": time.strftime("%Y-%m-%d"), "arms": arms, "verdicts": verdicts,
+            "order": "".join(r["arm"] for r in m["runs"]), **sess, "arms": arms, "verdicts": verdicts,
             "metrics": metrics, "noise_floor_pct": {k: v["floor_pct"] for k, v in floors.items()},
             "clock_median_mhz": clk, "clock_skew_pct": clock_skew, "gate": gate,
             "run_seconds_median": (statistics.median(secs) if (secs := [d["seconds"] for d in

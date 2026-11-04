@@ -81,6 +81,18 @@ class Units(unittest.TestCase):
         self.assertEqual(common.count_expr("tokens*layers", {"tokens": 16, "layers": 40}), 640)
         with self.assertRaises(common.Refuse):
             common.count_expr("__import__('os')", {})
+        with self.assertRaises(common.Refuse):
+            common.count_expr("2 3", {})
+
+    def test_micro_sign(self):
+        self.assertAlmostEqual(common.parse_time("175µs"), 175e-6)   # micro sign
+        self.assertAlmostEqual(common.parse_time("175μs"), 175e-6)   # greek mu
+
+    def test_cli_contract_on_bad_input(self):
+        rc, out, _ = ak("rate", "--bytes", "1GB", "--time", "1ms", "--calls", "1",
+                        "--expect-calls", "n", "--var", "foo")
+        self.assertEqual(rc, 3)
+        self.assertIn("name=integer", out["error"])
 
 
 class Facts(unittest.TestCase):
@@ -167,7 +179,8 @@ class Attribution(unittest.TestCase):
 
 def write_logits(d, name, values):
     d.mkdir(parents=True, exist_ok=True)
-    (d / name).write_text(json.dumps({"argmax_id": max(range(len(values)), key=values.__getitem__),
+    finite = [i for i, x in enumerate(values) if x is not None]
+    (d / name).write_text(json.dumps({"argmax_id": max(finite, key=values.__getitem__),
                                       "logits": values}))
 
 
@@ -191,11 +204,21 @@ class Gate(unittest.TestCase):
             rc, out, _ = ak("gate", "logits", t / "a", t / "c", "--mode", "argmax_stable",
                             "--tol", "1e-5")
             self.assertEqual(out["verdict"], "pass")
+            n = list(v)
+            n[2] = None                     # NaN/Inf dumped as null on one side only
+            write_logits(t / "d", "frontier_000064.logits.json", n)
+            rc, out, _ = ak("gate", "logits", t / "a", t / "d", "--mode", "argmax_stable",
+                            "--tol", "1")
+            self.assertEqual(out["verdict"], "fail")
 
 
-def make_run(root, kind, pairs, values, clocks=None, commits=("a" * 40, "b" * 40)):
+BOOT1 = "11111111-2222-3333-4444-555555555555"
+
+
+def make_run(root, kind, pairs, values, clocks=None, commits=("a" * 40, "b" * 40),
+             host=("2026-11-04T10:00:00+01:00", BOOT1), name=None, dump_logits=True):
     """values[(pair, arm)] -> (prefill_tps, gen_steady_tps). Writes a manifest + run dirs."""
-    run = Path(root) / ("run-" + kind)
+    run = Path(root) / (name or ("run-" + kind))
     runs = []
     for i, order in ab._order(pairs):
         for pos, arm in enumerate(order):
@@ -208,9 +231,11 @@ def make_run(root, kind, pairs, values, clocks=None, commits=("a" * 40, "b" * 40
                   "env": {}, "anchored": True}}
     m = {"name": "t", "kind": kind, "arms": arms, "case": case,
          "case_signature": ab.case_signature(case), "pairs": pairs, "runs": runs,
-         "metrics": ["prefill_tps", "gen_steady_tps"], "dump_logits": True}
+         "metrics": ["prefill_tps", "gen_steady_tps"], "dump_logits": dump_logits}
     run.mkdir(parents=True)
     (run / "manifest.json").write_text(json.dumps(m))
+    if host:
+        (run / "host.txt").write_text("%s\n7.2.14\nquiet\nbalanced\n%s\n" % host)
     for r in runs:
         d = run / r["dir"]
         d.mkdir()
@@ -221,7 +246,7 @@ def make_run(root, kind, pairs, values, clocks=None, commits=("a" * 40, "b" * 40
             w.writerow(["ctx_tokens", "prefill_tps", "gen_steady_tps"])
             w.writerow([32768, pf, gen])
         clk = (clocks or {}).get(r["arm"], 2900)
-        (d / "clock.tsv").write_text("".join("%d %d 50000\n" % (i, clk) for i in range(5)))
+        (d / "clock.tsv").write_text("".join("%d %s 50000\n" % (i, clk) for i in range(5)))
         write_logits(d / "logits", "frontier_032768.logits.json", [1.0, 2.0, 3.0])
     return run
 
@@ -267,6 +292,30 @@ class AB(unittest.TestCase):
         m = r["metrics"]["prefill_tps@32768"]
         self.assertAlmostEqual(m["mean_pct"], 0.0, places=6)
         self.assertAlmostEqual(m["order_effect_pct"], 3.0, places=6)
+
+    def test_session_from_run_not_analysis(self):
+        vals = {(p, a): (180.0, 11.0) for p in range(4) for a in "AB"}
+        r = ab.analyze_dir(make_run(self.tmp.name, "ab", 4, vals), root=self.tmp.name)
+        self.assertEqual((r["session"], r["date"], r["session_source"]), (BOOT1, "2026-11-04", "run"))
+        r = ab.analyze_dir(make_run(self.tmp.name, "ab", 4, vals, host=None, name="nohost"),
+                           root=self.tmp.name)
+        self.assertEqual(r["session_source"], "analysis_time")
+
+    def test_empty_clock_not_read_as_temperature(self):
+        # sclk() printed nothing: the payload writes '-' so temp stays in column 3
+        vals = {(p, a): (180.0, 11.0) for p in range(4) for a in "AB"}
+        r = ab.analyze_dir(make_run(self.tmp.name, "ab", 4, vals, clocks={"A": "-", "B": "-"}),
+                           root=self.tmp.name)
+        self.assertEqual(r["clock_median_mhz"], {"A": None, "B": None})
+        self.assertTrue(any("no clock samples" in w for w in r["warnings"]))
+
+    def test_signature_tracks_prompt_and_model(self):
+        base = {"model": "/m.gguf", "prompt": "p", "common_args": [], "bench_args": [],
+                "global_env": {}, "model_id": "1:1", "prompt_sha256": "aa"}
+        other = dict(base, prompt_sha256="bb")
+        requant = dict(base, model_id="2:2")
+        sigs = {ab.case_signature(c) for c in (base, other, requant)}
+        self.assertEqual(len(sigs), 3)
 
     def test_clock_skew_downgrades(self):
         common.write_json(self.state / "noise.json", {})
@@ -332,6 +381,13 @@ class Repo(unittest.TestCase):
         sp.write_text(json.dumps(spec))
         rc, out, _ = self.run_ak("ab", "plan", sp)
         self.assertEqual(rc, 3)
+        spec["pairs"] = 4
+        for bad in (["--model", "/other.gguf"], ["--model=/other.gguf"], ["-m", "/x"]):
+            spec["bench_args"] = ["--ctx-frontiers", "2048"] + bad
+            sp.write_text(json.dumps(spec))
+            rc, out, _ = self.run_ak("ab", "plan", sp)
+            self.assertEqual(rc, 3, bad)
+            self.assertIn("set by ak", out["error"])
 
     def test_plan_fits_supervisor_timeout(self):
         self.run_ak("ab", "build", "HEAD~1")
@@ -370,6 +426,20 @@ class Repo(unittest.TestCase):
         self.assertIn("decode_step_logits", gates)
         self.assertIn("prefill_frontier_logits", gates)
 
+    def test_gate_required_deleted_file_and_plusplus(self):
+        (self.root / "metal").mkdir()
+        (self.root / "metal" / "k.metal").write_text("kernel\n")
+        (self.root / "y.c").write_text("int y;\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "add")
+        (self.root / "metal" / "k.metal").unlink()
+        (self.root / "y.c").write_text("++n; /* router */\n")
+        self.git("commit", "-qam", "delete metal, edit y")
+        rc, out, _ = self.run_ak("gate", "required", "HEAD~1..HEAD")
+        req = {r["gate"]: r["files"] for r in out["required"]}
+        self.assertIn("metal/k.metal", req.get("metal_backend_untouched", []))
+        self.assertIn("y.c", req.get("selected_index_equality", []))
+
     def test_ledger_flow(self):
         rc, out, _ = self.run_ak("ledger", "add", "--kind", "hypothesis",
                                  "--text", "drain costs 11.6 ms per token")
@@ -395,16 +465,27 @@ class Repo(unittest.TestCase):
         gate_file = self.root / "gate.json"
         gate_file.write_text(json.dumps({"verdict": "pass", "gate": "bit_exact",
                                          "kinds": ["frontier"]}))
+        rc, out, _ = self.run_ak("ledger", "advance", c["id"], "gated")
+        self.assertEqual(rc, 3)  # JSON refusal, not a traceback
+        self.assertIn("--evidence", out["error"])
         rc, out, _ = self.run_ak("ledger", "advance", c["id"], "gated", "--evidence", gate_file,
                                  "--decode-path")
         self.assertEqual(rc, 3)  # decode change, no decode logits
         rc, out, _ = self.run_ak("ledger", "advance", c["id"], "gated", "--evidence", gate_file)
         self.assertEqual(rc, 0, out)
-        analysis = {"kind": "ab", "session": "s1", "date": "2026-11-04",
+        analysis = {"kind": "ab", "session": "s1", "date": "2026-11-04", "session_source": "run",
                     "arms": {"A": {"commit": base, "anchored": True},
                              "B": {"commit": head, "anchored": True}},
-                    "verdicts": {"prefill_tps@32768": "win"}, "gate": {"pass": True}}
+                    "verdicts": {"prefill_tps@32768": "win"}, "gate": None}
         a1 = self.root / "a1.json"
+        a1.write_text(json.dumps(analysis))
+        rc, out, _ = self.run_ak("ledger", "advance", c["id"], "measured", "--evidence", a1)
+        self.assertEqual(rc, 3)  # no logits gate in the A/B
+        analysis.update(gate={"pass": True}, session_source="analysis_time")
+        a1.write_text(json.dumps(analysis))
+        rc, out, _ = self.run_ak("ledger", "advance", c["id"], "measured", "--evidence", a1)
+        self.assertEqual(rc, 3)  # session not recorded at run time
+        analysis["session_source"] = "run"
         a1.write_text(json.dumps(analysis))
         rc, out, _ = self.run_ak("ledger", "advance", c["id"], "measured", "--evidence", a1)
         self.assertEqual(rc, 0, out)
@@ -417,6 +498,10 @@ class Repo(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         rc, out, _ = self.run_ak("ledger", "check-promote", c["id"])
         self.assertTrue(out["may_promote"], out)
+        rc, s, _ = self.run_ak("ledger", "set", c["id"], "--status", "suspect", "--reason", "test")
+        rc, out, _ = self.run_ak("ledger", "advance", c["id"], "promoted", "--commit", "HEAD")
+        self.assertEqual(rc, 3)  # a suspect change cannot be promoted
+        self.assertIn("suspect", out["error"])
         rc, out, _ = self.run_ak("ledger", "truth")
         text = Path(out["written"]).read_text()
         self.assertIn("Suspect", text)
