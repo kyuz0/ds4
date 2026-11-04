@@ -276,6 +276,11 @@ struct cuda_stream_layer_expert_cache {
 struct cuda_stream_v41_reuse_stats {
     uint64_t prepares, hits, logical_bytes, missing_bytes, d2d_bytes;
     uint64_t read_jobs, read_bytes, direct_bytes, copy_wait_us, failures;
+    /* Diagnostic: bytes and jobs actually staged by the selected-expert path.
+     * Accumulated where the jobs run, printed by the same statement below, so the
+     * value cannot be lost to a per-translation-unit copy of a header static. */
+    uint64_t staged_bytes, staged_jobs;
+    uint64_t staged_read_us;   /* sum of worker read durations (job read_end - read_start) */
 };
 
 struct cuda_stream_cache_stats {
@@ -513,13 +518,15 @@ static void cuda_stream_cache_stats_print(const char *label) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "V4.1 layer reuse %s: prepares=%llu hits=%llu "
                 "logical-bytes=%llu missing-bytes=%llu d2d-submitted-bytes=%llu "
                 "read-jobs=%llu read-returned-bytes=%llu direct-returned-bytes=%llu "
-                "copy-wait-us=%llu failures=%llu\n",
+                "copy-wait-us=%llu failures=%llu staged-bytes=%llu staged-jobs=%llu "
+                "staged-read-us=%llu\n",
                 label ? label : "", (unsigned long long)r.prepares,
                 (unsigned long long)r.hits, (unsigned long long)r.logical_bytes,
                 (unsigned long long)r.missing_bytes, (unsigned long long)r.d2d_bytes,
                 (unsigned long long)r.read_jobs, (unsigned long long)r.read_bytes,
                 (unsigned long long)r.direct_bytes, (unsigned long long)r.copy_wait_us,
-                (unsigned long long)r.failures);
+                (unsigned long long)r.failures, (unsigned long long)r.staged_bytes,
+                (unsigned long long)r.staged_jobs, (unsigned long long)r.staged_read_us);
     }
     if (!cuda_stream_cache_layer_stats_on()) return;
     for (uint32_t layer = 0;
@@ -5393,6 +5400,16 @@ static int cuda_stream_selected_finish_pending_missing(uint32_t compact_mask) {
                sizeof(g_stream_selected_pending));
         cuda_stream_resident_cache_release();
         return 0;
+    }
+    for (uint32_t i = 0; i < read_job_count; i++) {
+        g_stream_v41_reuse_stats.staged_bytes +=
+            g_stream_selected_pending.read_jobs[i].bytes;
+        g_stream_v41_reuse_stats.staged_jobs += 1;
+        if (g_stream_selected_pending.read_jobs[i].read_end >
+            g_stream_selected_pending.read_jobs[i].read_start)
+            g_stream_v41_reuse_stats.staged_read_us += (uint64_t)
+                ((g_stream_selected_pending.read_jobs[i].read_end -
+                  g_stream_selected_pending.read_jobs[i].read_start) * 1e6);
     }
     cuda_stream_read_jobs_free(g_stream_selected_pending.read_jobs,
                                read_job_count);

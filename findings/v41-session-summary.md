@@ -696,3 +696,38 @@ fewer bytes (higher residency) or a faster copy path, not more concurrency.
 
 No code change was made, deliberately: implementing the requested overlap would have added
 risk to a path the measurements show is not the mechanism.
+
+## Validated expert-staging accounting, and why overlap cannot happen today
+
+Instrumentation (diagnostic only, printed with DS4_ROCM_STREAM_CACHE_STATS): the selected
+read path now accumulates staged-bytes, staged-jobs and staged-read-us in
+cuda_stream_v41_reuse_stats, which is the struct whose printf already works, with the
+format/argument counts checked mechanically (13 specifiers, 13 arguments) after two earlier
+attempts produced stack garbage from a misaligned argument list.
+
+Valid numbers (2K/gen-32, decode-dominated), cold and warm runs identical:
+  staged 587 MB in 1368 jobs, calls 1280 -> 0.46 MB and ~1.07 jobs per layer-token
+  wait/call 380 us cold, 378 us warm (-1 %); decode 11.00 -> 11.04 tps (+0.4 %)
+  staged-read-us 0: the per-job read_start/read_end diagnostics are not populated on this
+  path, so worker read time is still unmeasured
+
+What this refutes: the stall is NOT bandwidth saturation (0.46 MB in 380 us is ~1.2 GB/s,
+far under any copy ceiling) and NOT cold page-cache miss latency (a warm rerun is
+unchanged). My earlier "22.7 MB at 64 GB/s = throughput wall" was wrong arithmetic on an
+unmeasured assumption, and is retracted.
+
+What it establishes: ~380 us per layer-token, ~14 % of the token, spent waiting on ~1 read
+job of ~0.43 MB, with 24 idle worker threads - i.e. one serialized job whose fixed cost
+dominates.
+
+Structural cause, confirmed in the code: there is exactly ONE pending slot
+(static cuda_stream_selected_pending g_stream_selected_pending, line 1930) and every new
+begin ABORTS an outstanding pending (cuda_stream_selected_abort_pending at lines 4894/3988).
+So layer L+1's fetch cannot start while layer L computes; cross-layer pipelining is
+impossible by construction. That is why moving the same begin earlier inside a layer
+(pre-attention hoist, banner-confirmed, six pairs, +1.2 %) could not help: there is nowhere
+for an early fetch to live.
+
+Next step (not attempted: needs a full build/gate cycle): double-buffer the selected pending
+slot behind an opt-in flag, so layer L's compute overlaps L+1's fetch, with per-slot pointer
+tables and abort semantics preserved.
