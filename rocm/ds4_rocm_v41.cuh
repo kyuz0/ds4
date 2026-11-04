@@ -2569,3 +2569,66 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_batch_fp4(ds4_gpu_tensor *scores,
         (const unsigned char *)packed->ptr, source_rows, start, ratio);
     return cuda_ok(cudaGetLastError(), "V4.1 causal FP4 index scores (packed keys)");
 }
+
+/* Per-leaf GPU timing for the attention projections: hipEvents around the launch, so the
+ * number is device time rather than the host-inflated stage marks. Gated by the caller. */
+enum { DS4_LEAF_PROFILE_SLOTS = 32 };
+static struct { char label[48]; double ms; unsigned long long calls, bytes; } g_leaf_prof[DS4_LEAF_PROFILE_SLOTS];
+static int g_leaf_prof_n;
+static cudaEvent_t g_leaf_ev[2];
+static int g_leaf_ev_ready;
+
+static void ds4_leaf_profile_print(void) {
+    double tot = 0;
+    for (int i = 0; i < g_leaf_prof_n; i++) tot += g_leaf_prof[i].ms;
+    fprintf(stderr, "ds4: leaf profile (per-token total %.2f ms across %d leaves)\n", tot, g_leaf_prof_n);
+    for (int i = 0; i < g_leaf_prof_n; i++) {
+        const double gbs = g_leaf_prof[i].ms > 0 ?
+            g_leaf_prof[i].bytes / 1e9 / (g_leaf_prof[i].ms / 1000.0) : 0;
+        fprintf(stderr, "ds4:   %-34s %9.2f ms %6llu calls %9.1f MB total %6.1f GB/s\n",
+                g_leaf_prof[i].label, g_leaf_prof[i].ms, g_leaf_prof[i].calls,
+                g_leaf_prof[i].bytes / 1e6, gbs);
+    }
+}
+
+extern "C" int ds4_gpu_v41_leaf_begin(void) {
+    if (!g_leaf_ev_ready) {
+        if (cudaEventCreate(&g_leaf_ev[0]) != cudaSuccess ||
+            cudaEventCreate(&g_leaf_ev[1]) != cudaSuccess) return 0;
+        g_leaf_ev_ready = 1;
+        atexit(ds4_leaf_profile_print);
+    }
+    return cudaEventRecord(g_leaf_ev[0]) == cudaSuccess;
+}
+
+/* Group per-layer tensors (blk.17.attn_q_b.weight) under the leaf name so the
+ * table holds leaves, not layers. */
+static const char *ds4_leaf_canon(const char *label) {
+    if (strncmp(label, "blk.", 4) != 0) return label;
+    const char *dot = strchr(label + 4, '.');
+    return dot ? dot + 1 : label;
+}
+
+extern "C" int ds4_gpu_v41_leaf_end(const char *label_in, unsigned long long bytes) {
+    const char *label = ds4_leaf_canon(label_in);
+    if (!g_leaf_ev_ready) return 0;
+    if (cudaEventRecord(g_leaf_ev[1]) != cudaSuccess ||
+        cudaEventSynchronize(g_leaf_ev[1]) != cudaSuccess) return 0;
+    float ms = 0;
+    if (cudaEventElapsedTime(&ms, g_leaf_ev[0], g_leaf_ev[1]) != cudaSuccess) return 0;
+    for (int i = 0; i < g_leaf_prof_n; i++) {
+        if (strncmp(g_leaf_prof[i].label, label, sizeof(g_leaf_prof[i].label)) == 0) {
+            g_leaf_prof[i].ms += ms; g_leaf_prof[i].calls += 1;
+            g_leaf_prof[i].bytes += bytes;
+            return 1;
+        }
+    }
+    if (g_leaf_prof_n < DS4_LEAF_PROFILE_SLOTS) {
+        snprintf(g_leaf_prof[g_leaf_prof_n].label, sizeof(g_leaf_prof[0].label), "%s", label);
+        g_leaf_prof[g_leaf_prof_n].ms = ms;
+        g_leaf_prof[g_leaf_prof_n].calls = 1;
+        g_leaf_prof[g_leaf_prof_n].bytes = bytes;
+        g_leaf_prof_n += 1;
+    }
+    return 1;
+}

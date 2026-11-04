@@ -1098,3 +1098,32 @@ Supported conclusions:
 Next in-scope step: add hipEvent timing for attn_q_a/q_b/kv/output_a/output_b launches (the
 same pattern the MoE decode profile already uses), then apply the bytes-vs-ceiling test per
 leaf. That is instrumentation; no kernel change is proposed until it reports.
+
+## Leaf-timing coverage audit: FAILED, and it located the real launch points
+
+The hipEvent leaf profiler (DS4_V41_LEAF_PROFILE, hooking ds41_matmul) was run at 32K/gen-16.
+Audit result: it does NOT cover the five targets and it DOES include prefill.
+
+  observed leaves: attn_compressor_kv, indexer.attn_k, hc_attn_fn, hc_ffn_fn, ffn_gate_inp,
+  ffn_down_shexp, engram_kv, attn_compressor_gate, indexer.attn_q_b, indexer.proj
+  attn_q_a / attn_q_b / attn_kv / attn_output_a / attn_output_b: ABSENT
+
+Two concrete defects:
+1. coverage: the main attention projections do not go through ds41_matmul on this path. They
+   use dedicated fused calls - ds4_gpu_dsv41_q8_projection_pair_rows (the fused q_a+kv pair),
+   ds4_gpu_dsv41_attention_output_batch and ds4_gpu_dsv41_attention_output_tp_batch (the
+   low-rank o_a/o_b pair) - so hooking ds41_matmul cannot see them.
+2. prefill contamination: attn_compressor_kv shows 32832 calls (= 32768 prefill rows + 64),
+   and its computed 324 GB/s exceeds the measured 223 GB/s ceiling, which by itself proves
+   the numbers are not decode-only.
+
+Therefore no per-leaf rate is claimed, again, and the previously published rate tables from
+this instrument are void. The fix needed is specific and small: instrument the three fused
+attention entry points named above, and gate the accumulation on n_tokens == 1 so prefill
+rows cannot enter the totals.
+
+This is the fifth instrument in this line that produced plausible-but-wrong numbers (22.7
+MB/layer, 221 MB/s, rocprof 183 us, 19 % headroom, now leaf GB/s). The common cause is
+consistent: a counter that is not scoped to the population being reasoned about. The rule
+adopted here: no rate is quoted unless the instrument's call counts can be reconciled with
+token count x layers.

@@ -40775,14 +40775,33 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
 static bool g_ds41_dspark_verify_dense;
 #endif
 
+/* Opt-in per-leaf timing for the dense projections: true device time per weight. */
+static int ds41_leaf_profile_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_V41_LEAF_PROFILE");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
 #ifdef DS4_ROCM_BUILD
+    const int leaf_profile = ds41_leaf_profile_on();
+    char leaf_label[48] = {0};
+    if (leaf_profile) {
+        size_t n = weight->name.len < sizeof(leaf_label) - 1 ? weight->name.len : sizeof(leaf_label) - 1;
+        memcpy(leaf_label, weight->name.ptr, n);
+        leaf_label[n] = 0;
+        (void)ds4_gpu_v41_leaf_begin();
+    }
     if (weight->type == DS4_TENSOR_F32 && weight->dim[0] == 5120u &&
         (weight->dim[1] == 128u || weight->dim[1] == 384u)) {
         const bool ok = ds4_gpu_dsv41_f32_projection_rows(out, m->map, m->size,
             weight->abs_offset, (uint32_t)weight->dim[0],
             (uint32_t)weight->dim[1], 1u, in);
+        if (leaf_profile) (void)ds4_gpu_v41_leaf_end(leaf_label, weight->bytes);
         return ok && (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
     }
     if (weight->type == DS4_TENSOR_F16 || weight->type == DS4_TENSOR_Q8_0) {
@@ -40794,6 +40813,7 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                 (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], 1u, in) :
             ds4_gpu_dsv41_q8_projection_rows(out, m->map, m->size, weight->abs_offset,
                 (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], 1u, in);
+        if (leaf_profile) (void)ds4_gpu_v41_leaf_end(leaf_label, weight->bytes);
         return ok && (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
     }
 #endif

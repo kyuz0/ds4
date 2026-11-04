@@ -127,6 +127,9 @@ int ds4_gpu_dsv41_indexer_scores_batch_fp4(ds4_gpu_tensor *scores, const ds4_gpu
                                            const ds4_gpu_tensor *packed_keys,
                                            const ds4_gpu_tensor *keys, uint32_t source_rows,
                                            uint32_t rows, uint32_t start, uint32_t ratio);
+/* Per-leaf device timing for the dense projections (diagnostic). */
+int ds4_gpu_v41_leaf_begin(void);
+int ds4_gpu_v41_leaf_end(const char *label, unsigned long long bytes);
 /* Diagnostic: bit-compare the packed decode against the F32 index cache. */
 int ds4_gpu_dsv41_index_fp4_verify(const ds4_gpu_tensor *packed, const ds4_gpu_tensor *keys,
                                    uint32_t n_keys);
