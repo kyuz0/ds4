@@ -42780,7 +42780,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+#ifdef DS4_ROCM_BUILD
+        if (drain && ds41_leaf_profile_on()) {
+            const double drain_t0 = now_sec();
+            if (!ds4_gpu_end_commands()) ok = false;
+            (void)ds4_gpu_v41_leaf_host_note("host_drain",
+                                             (now_sec() - drain_t0) * 1000.0);
+        } else if (drain && !ds4_gpu_end_commands()) ok = false;
+#else
         if (drain && !ds4_gpu_end_commands()) ok = false;
+#endif
 #ifdef DS4_ROCM_BUILD
         if (ds41_tp_failed(g)) ok = false;
 #else

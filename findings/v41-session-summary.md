@@ -1322,3 +1322,30 @@ Remaining candidate from the measured recommendation is the host-side one: local
 session bookkeeping) by timing the enqueue-drain points that already exist in the decode loop,
 before changing any of them - the drains are documented as protecting the Engram table and
 token publication, so removing them blind risks correctness.
+
+## Host drain measured: 11.58 ms/token, one drain per layer - the largest item found
+
+Opt-in host timing around the decode loop's `ds4_gpu_end_commands()` drain (leaf profiler,
+g0/g16 subtraction, decode-scoped):
+
+  host_drain   640 calls (40 layers x 16 tokens)   11.58 ms/token   = 14 % of an 83 ms token
+
+Updated budget: 61.1 ms of GPU kernel time + 11.6 ms of drain = 72.7 of ~83 ms, leaving ~10 ms.
+
+Why it happens: queue_layers (multi-layer enqueue) requires `!g->streaming` on ROCm
+(ds4.c:42744-42751), and decode runs with SSD streaming enabled, so `drain` is true for EVERY
+layer: `!queue_layers || il == 13 || il + 1u == DS4_N_LAYER`. Each drain blocks the host for
+~290 us (11.58 ms / 40).
+
+Why it is a candidate rather than an obvious win: the drains exist for a reason - layer 13 is
+drained before the Engram table overwrite at layer 14, and the final drain publishes the token.
+But with this workload the mask is 0x3f (all six selected experts resident) and only 57 of
+1280 layer-tokens stage any streamed read, so the great majority of layers drain
+unnecessarily: nothing was streamed, nothing needs settling.
+
+Candidate, smallest reversible form: keep the layer-13 and final drains unconditionally, and
+skip the per-layer drain for layers that did not stream anything (tracked by the existing
+pending-state / missing-mask bookkeeping). Value at stake is up to 11.6 ms/token (14 %) with a
+correctness argument that is inspectable in the same file. NOT implemented here: it touches
+enqueue ordering and the Engram/publication guarantees, so it needs its own build + bit-exact
+gate + paired measurement cycle rather than an end-of-cycle patch.

@@ -2642,6 +2642,24 @@ static const char *ds4_leaf_canon(const char *label) {
 
 /* Call and byte accounting for a leaf that shares a fused kernel: no independent
  * event timing exists, so only counts and bytes are recorded. */
+/* Host-side span (no GPU events): used for enqueue/drain time, which is CPU blocking. */
+extern "C" int ds4_gpu_v41_leaf_host_note(const char *label, double ms) {
+    if (!g_leaf_ev_ready) { if (!ds4_gpu_v41_leaf_begin()) return 0; }
+    for (int i = 0; i < g_leaf_prof_n; i++) {
+        if (strncmp(g_leaf_prof[i].label, label, sizeof(g_leaf_prof[i].label)) == 0) {
+            g_leaf_prof[i].ms += ms; g_leaf_prof[i].calls += 1;
+            return 1;
+        }
+    }
+    if (g_leaf_prof_n < DS4_LEAF_PROFILE_SLOTS) {
+        snprintf(g_leaf_prof[g_leaf_prof_n].label, sizeof(g_leaf_prof[0].label), "%s", label);
+        g_leaf_prof[g_leaf_prof_n].ms = ms;
+        g_leaf_prof[g_leaf_prof_n].calls = 1;
+        g_leaf_prof_n += 1;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_v41_leaf_note(const char *label, unsigned long long bytes) {
     if (!g_leaf_ev_ready) {
         if (!ds4_gpu_v41_leaf_begin()) return 0;
