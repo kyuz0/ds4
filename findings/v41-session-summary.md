@@ -1197,3 +1197,36 @@ Budget: leaves total 36.1 ms/token; plus MoE routed ~11.3 ms that is 47.4 ms of 
 token. The remaining ~35.6 ms is NOT weight streaming - it is attention core/softmax, routing,
 index selection and sampling - so any further decode work must target that, with its own
 event-based instrument (the stage marks are 2.46x inflated and cannot be used).
+
+## attn_core and attn_select measured with events (decode-scoped)
+
+Event spans added around the attention core (decode_heads + bf16 + rope) and the indexer
+selection, reusing the existing leaf-profiler events. g0/g16 subtraction, same 32K/gen-16
+setup, both reconcile at 640 calls = 16 x 40:
+
+  attn_core    3.83 ms/token  (4.6 % of an 83 ms token)
+  attn_select  2.72 ms/token  (3.3 %)
+
+Updated token budget, all event-based:
+  dense-projection leaves            36.1 ms
+  attn_core                           3.8 ms
+  attn_select                         2.7 ms
+  MoE routed expert math             11.3 ms
+  ---------------------------------------
+                                     54.0 ms of ~83 ms
+  unattributed                      ~29.0 ms (35 %)
+
+So 65 % of the decode token is now measured with device-event timings that pass the
+bytes-vs-ceiling cross-check, and every weight-streaming component among them runs at 87-93 %
+of the measured 223 GB/s ceiling.
+
+What the remaining ~29 ms is not: weight streaming (all of those kernels are accounted). It
+must be the small non-streaming kernels plus host gaps - hc_mix/hc_weighted_sum and norm/bf16
+per layer, the x/mid quantize kernels (7 us each), the router matmul, the LM head
+(output.weight is 703 MB, ~3.2 ms even at ceiling, and it is not yet in the table), sampling,
+and any queue/synchronisation gaps between the ordered command buffers.
+
+Next instrument target, in order of expected size: the LM head (one launch, easy to wrap, and
+it streams 703 MB), then per-layer hc/norm/bf16 aggregate, then the host-side gaps. That is
+the only remaining place where a real optimization could live, and none should be attempted
+before those numbers exist.

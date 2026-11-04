@@ -40775,6 +40775,26 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
 static bool g_ds41_dspark_verify_dense;
 #endif
 
+/* Event spans around kernels that are not dense projections (attention core, selection). */
+static int ds41_leaf_span_open;
+static bool ds41_leaf_begin(const char *label) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_V41_LEAF_PROFILE");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    ds41_leaf_span_open = cached > 0;
+    if (!ds41_leaf_span_open) return true;
+    (void)label;
+    return ds4_gpu_v41_leaf_begin() != 0;
+}
+
+static bool ds41_leaf_end(const char *label, bool ok) {
+    if (!ds41_leaf_span_open) return ok;
+    ds41_leaf_span_open = 0;
+    return ok && ds4_gpu_v41_leaf_end(label, 0) != 0;
+}
+
 /* Opt-in per-leaf timing for the dense projections: true device time per weight. */
 static int ds41_leaf_profile_on(void) {
     static int cached = -1;
@@ -41304,7 +41324,8 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     }
     if (ok) {
         start = now_sec();
-        ok = ds41_attention_select(g, m, l, il);
+        ok = ds41_leaf_begin("attn_select") && ds41_attention_select(g, m, l, il);
+        ok = ds41_leaf_end("attn_select", ok);
         if (profile) ok = ds41_decode_stage_profile_mark("attn_select", il, start, ok);
     }
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
@@ -41317,13 +41338,15 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
     if (ok) {
         start = now_sec();
-        ok = ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
+        ok = ds41_leaf_begin("attn_core") &&
+             ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
                 l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
                 g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
                 g->selected_kv, 0, attended, NULL, 0,
                 heads, DS4_N_HEAD_DIM) &&
              ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) &&
              ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true);
+        ok = ds41_leaf_end("attn_core", ok);
         if (profile) ok = ds41_decode_stage_profile_mark("attn_decode", il, start, ok);
     }
     if (ok && !projected) {
