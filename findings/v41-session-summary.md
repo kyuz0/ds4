@@ -1299,3 +1299,26 @@ Next optimization implied by this, in order of size and safety:
 2. reduce synchronisation points on the decode path (the enqueue-drain pattern at queue_layer
    boundaries) - needs measuring gaps first, not guessing;
 3. nothing else: the bandwidth and small-kernel avenues are both measured closed.
+
+## Pre-norm bf16 fusion REJECTED on the kernel contract (not implemented)
+
+The candidate was to drop the standalone `ds41_bf16(g->x, N_EMBD)` that precedes
+`ds41_norm`, saving ~40 launches per token. Code inspection rules it out:
+
+  ds41_bf16(x, w)       = ds4_gpu_dsv41_quantize(x, w, 1, DS4_V41_BF16)   /* rounds x in place */
+  ds41_norm(out, in, m, weight) = rms_norm_weight(in) && bf16(out)
+  call site: ds41_bf16(g->x, ...) && ds41_norm(g->norm, g->x, ...)
+
+The norm reads the BF16-ROUNDED x, so removing that launch feeds unrounded F32 into the RMS
+reduction and cannot be bit-exact. The change is therefore outside the bit-exact lane, and its
+benefit ceiling is ~0.3 ms (0.4 %): the measured hc/norm spans cost 4.1 ms for ~560 launches,
+i.e. ~7 us per launch, so one launch per layer is 40 of 560.
+
+Rejected on both counts - it is not bit-exact, and even if it were it is worth <0.5 %. No code
+was changed.
+
+Remaining candidate from the measured recommendation is the host-side one: localising the
+~21.9 ms that is not GPU kernel time (launch/queue gaps, the D2H logits read, sampling,
+session bookkeeping) by timing the enqueue-drain points that already exist in the decode loop,
+before changing any of them - the drains are documented as protecting the Engram table and
+token publication, so removing them blind risks correctness.
