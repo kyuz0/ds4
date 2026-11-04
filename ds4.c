@@ -40777,19 +40777,23 @@ static bool g_ds41_dspark_verify_dense;
 
 /* Event spans around kernels that are not dense projections (attention core, selection). */
 static int ds41_leaf_span_open;
+static int ds41_leaf_depth;
 static bool ds41_leaf_begin(const char *label) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("DS4_V41_LEAF_PROFILE");
         cached = (v && *v && *v != '0') ? 1 : 0;
     }
-    ds41_leaf_span_open = cached > 0;
-    if (!ds41_leaf_span_open) return true;
+    if (cached <= 0) { ds41_leaf_span_open = 0; return true; }
+    if (ds41_leaf_depth++ > 0) return true;   /* nested: outer span already covering */
+    ds41_leaf_span_open = 1;
     (void)label;
     return ds4_gpu_v41_leaf_begin() != 0;
 }
 
 static bool ds41_leaf_end(const char *label, bool ok) {
+    if (ds41_leaf_depth == 0) return ok;
+    if (--ds41_leaf_depth > 0) return ok;     /* still inside the outer span */
     if (!ds41_leaf_span_open) return ok;
     ds41_leaf_span_open = 0;
     return ok && ds4_gpu_v41_leaf_end(label, 0) != 0;
@@ -41575,25 +41579,29 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
+    (void)ds41_leaf_begin("hc_norm_pre_attn");
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
         const uint32_t i = il == 1 ? 0 : 1;
         if (!ds41_matmul(g->engram_kv, m, l->engram_kv, g->engram_rows, true) ||
             !ds4_gpu_dsv41_engram_add(g->residual, g->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
-            return false;
+            return ds41_leaf_end("hc_norm_pre_attn", false);
     }
-    return ds41_hc_mix(g, m, l, false) &&
+    return ds41_leaf_end("hc_norm_pre_attn",
+        ds41_hc_mix(g, m, l, false) &&
         ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm));
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
-    return ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
+    (void)ds41_leaf_begin("hc_norm_post_attn");
+    return ds41_leaf_end("hc_norm_post_attn",
+        ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
         ds41_hc_mix(g, m, l, true) &&
         ds4_gpu_hc_weighted_sum_split_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
+        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->ffn_norm));
 }
 
 static bool ds41_decode_stage_profile_on(void) {

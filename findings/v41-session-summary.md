@@ -1263,3 +1263,39 @@ bytes-vs-ceiling.
 Next instrument target: bracket ds41_hc_mix, ds41_norm and ds41_bf16 with the same spans to
 aggregate the per-layer small-kernel time; that should account for most of the 26 ms and will
 show whether the remainder is kernel time or host gaps.
+
+## hc/norm/bf16 spans measured: only 4.1 ms, so the remainder is not small-kernel GPU time
+
+Both spans reconcile at 640 calls (16 x 40), nesting-safe so inner bf16/norm calls do not
+clobber the outer event pair:
+
+  hc_norm_pre_attn   2.07 ms/token
+  hc_norm_post_attn  2.03 ms/token
+
+Updated, fully event-based budget:
+
+  dense-projection leaves     36.1 ms      attn_core     3.8 ms
+  MoE routed expert math      11.3 ms      lm_head       3.1 ms
+  hc/norm pre + post           4.1 ms      attn_select   2.7 ms
+                             --------
+                              61.1 ms of ~83 ms
+  unattributed               ~21.9 ms (26 %)
+
+Decision rule applied: the hc/norm spans were the candidate for "many small launches are the
+cost", and they explain only 16 % of the previously unattributed time. So kernel fusion of the
+hc/norm chain has a ceiling of about 1 ms even if every launch vanished - it is NOT the
+target, and no fusion work should be started for it.
+
+The remaining ~21.9 ms is therefore not GPU kernel time in any of the components measured:
+every weight-streaming kernel is at 87-102 % of ceiling, attention core/select/hc/norm are all
+accounted, and the sum is still 22 ms short of the 83 ms token. By elimination it is host-side:
+launch/queue gaps between ordered command buffers (~560 hc/norm launches per token alone, plus
+the projection and MoE launches), the D2H logits read, sampling, and session bookkeeping.
+
+Next optimization implied by this, in order of size and safety:
+1. reduce launch count per layer where it costs nothing numerically (folding the pre-norm bf16
+   into the norm launch removes ~40 launches/token; requires a bit-exact A/B because it
+   changes the dtype the norm kernel reads);
+2. reduce synchronisation points on the decode path (the enqueue-drain pattern at queue_layer
+   boundaries) - needs measuring gaps first, not guessing;
+3. nothing else: the bandwidth and small-kernel avenues are both measured closed.
