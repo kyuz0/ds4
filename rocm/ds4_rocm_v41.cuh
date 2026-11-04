@@ -570,6 +570,34 @@ static bool v41_indexer_wide_head_enabled(void) {
     return cached;
 }
 
+
+/* Packed-key twin of v41_indexer_batch_warp8_kernel: same wave layout, same
+ * ((((0+a)+b)+c)+d) head reduction and the same asm v_mul_f32 weight boundary. */
+__global__ static void v41_indexer_batch_warp8_fp4_kernel(
+        float *out, const float *q, const float *w, const unsigned char *pk, uint32_t width,
+        uint32_t start, uint32_t ratio) {
+    uint32_t key = blockIdx.x * 8u + threadIdx.x / 32, lane = threadIdx.x & 31, row = blockIdx.y;
+    if (key >= width) return;
+    if (key >= (start + row + 1) / ratio) {
+        if (!lane) out[(uint64_t) row * width + key] = -INFINITY;
+        return;
+    }
+    float k0 = ds4_index_fp4_load(pk, key, lane), k1 = ds4_index_fp4_load(pk, key, lane + 32u);
+    float k2 = ds4_index_fp4_load(pk, key, lane + 64u), k3 = ds4_index_fp4_load(pk, key, lane + 96u);
+    float total = 0;
+    for (uint32_t h = 0; h < 32; h++) {
+        const float *x = q + ((uint64_t) row * 32 + h) * 128 + lane;
+        float a = v41_mul(x[0], k0), b = v41_mul(x[32], k1), c = v41_mul(x[64], k2), d = v41_mul(x[96], k3);
+        float dot = v41_add(v41_add(v41_add(v41_add(0.0f, a), b), c), d);
+        for (int s = 16; s; s >>= 1) dot = v41_add(dot, __shfl_down(dot, s, 32));
+        float weighted;
+        asm volatile("v_mul_f32 %0, %1, %2" : "=v"(weighted)
+            : "v"(fmaxf(v41_mul(dot, 1.f / 64.f), 0.f)), "v"(w[row * 32 + h]));
+        total = v41_add(total, weighted);
+    }
+    if (!lane) out[(uint64_t) row * width + key] = total;
+}
+
 extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
                                                   const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
                                                   uint32_t source_rows, uint32_t rows, uint32_t start, uint32_t ratio) {
@@ -2510,4 +2538,34 @@ extern "C" int ds4_gpu_dsv41_index_fp4_verify(const ds4_gpu_tensor *packed,
     if (!ok) return -1;
     fprintf(stderr, "ds4: index fp4 verify keys=%u mismatches=%llu\n", n_keys, bad);
     return (int)(bad > 0x7fffffffull ? 0x7fffffff : bad);
+}
+
+/* Packed-key batch scorer. Mirrors the F32 dispatch exactly, including the wide
+ * GEMM branch, which keeps using the F32 keys because it is a different reduction. */
+extern "C" int ds4_gpu_dsv41_indexer_scores_batch_fp4(ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *packed,
+        const ds4_gpu_tensor *keys, uint32_t source_rows, uint32_t rows, uint32_t start,
+        uint32_t ratio) {
+    if ((ratio != 1u && ratio != 2u) || !source_rows || !rows || rows > UINT32_MAX - start ||
+        (start + rows) / ratio > source_rows || source_rows > INT32_MAX || rows > INT32_MAX ||
+        !cuda_tensor_has_elems2(scores, source_rows, rows, 4u) ||
+        !cuda_tensor_has_elems2(q, rows, 32u * 128u, 4u) ||
+        !cuda_tensor_has_elems2(keys, source_rows, 128u, 4u) ||
+        !cuda_tensor_has_elems2(weights, rows, 32u, 4u) ||
+        packed->bytes < (uint64_t)source_rows * DS4_INDEX_FP4_KEY_BYTES) return 0;
+    if (!ds4_rocm_is_gfx1151()) return ds4_gpu_dsv41_indexer_scores_batch(
+        scores, q, weights, keys, source_rows, rows, start, ratio);
+    const uint32_t head_cap = v41_indexer_wide_head_enabled() ? 131072u : 65536u;
+    if (!g_quality_mode && g_cublas_ready && rows >= 31u && rows <= 32u &&
+        source_rows >= 16384u && source_rows <= head_cap &&
+        (start + 1u) / ratio >= source_rows - source_rows / 8u) {
+        v41_ix_dispatch_note(V41_IX_DISP_WIDE_GEMM, source_rows, rows, start, ratio);
+        return v41_indexer_head_gemm((float *)scores->ptr, (const float *)q->ptr,
+            (const float *)weights->ptr, (const float *)keys->ptr, source_rows, rows, start, ratio);
+    }
+    v41_ix_dispatch_note(V41_IX_DISP_WARP8_BATCH, source_rows, rows, start, ratio);
+    v41_indexer_batch_warp8_fp4_kernel<<<dim3((source_rows + 7u) / 8u, rows), 256u>>>(
+        (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+        (const unsigned char *)packed->ptr, source_rows, start, ratio);
+    return cuda_ok(cudaGetLastError(), "V4.1 causal FP4 index scores (packed keys)");
 }

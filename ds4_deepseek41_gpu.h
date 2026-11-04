@@ -121,6 +121,12 @@ int ds4_gpu_dsv41_index_fp4_pack(ds4_gpu_tensor *packed, const ds4_gpu_tensor *k
 int ds4_gpu_dsv41_indexer_scores_one_fp4(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
                                          const ds4_gpu_tensor *weights,
                                          const ds4_gpu_tensor *packed_keys, uint32_t source_rows);
+/* Prefill batch scorer reading the packed keys (wide GEMM still uses F32 keys). */
+int ds4_gpu_dsv41_indexer_scores_batch_fp4(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
+                                           const ds4_gpu_tensor *weights,
+                                           const ds4_gpu_tensor *packed_keys,
+                                           const ds4_gpu_tensor *keys, uint32_t source_rows,
+                                           uint32_t rows, uint32_t start, uint32_t ratio);
 /* Diagnostic: bit-compare the packed decode against the F32 index cache. */
 int ds4_gpu_dsv41_index_fp4_verify(const ds4_gpu_tensor *packed, const ds4_gpu_tensor *keys,
                                    uint32_t n_keys);

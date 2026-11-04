@@ -41165,8 +41165,11 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
             !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
 #else
-            !ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
-                g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
+            !(ds41_index_fp4_keys()
+                ? ds4_gpu_dsv41_indexer_scores_batch_fp4(g->index_scores, g->index_q, g->index_weights,
+                      g->index_cache_fp4[owner], g->index_cache[owner], n_comp, 1, pos, ratio)
+                : ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
+                      g->index_cache[owner], n_comp, 1, pos, ratio))) return false;
 #endif
     }
     return ds41_attention_pick(g, il);
@@ -41744,8 +41747,11 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
         bool ok = q && weights && (packed ?
             ds4_gpu_dsv41_indexer_scores_packed(g->index_scores, q, weights,
                 g->index_cache[owner], g->index_packed, n_comp, rows, start + off, ratio, count, off) :
-            ds4_gpu_dsv41_indexer_scores_batch(g->index_scores,
-                q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio));
+            (ds41_index_fp4_keys()
+                ? ds4_gpu_dsv41_indexer_scores_batch_fp4(g->index_scores, q, weights,
+                      g->index_cache_fp4[owner], g->index_cache[owner], n_comp, rows, start + off, ratio)
+                : ds4_gpu_dsv41_indexer_scores_batch(g->index_scores,
+                      q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio)));
         ds4_gpu_tensor_free(weights);
         ds4_gpu_tensor_free(q);
         const bool batch_topk =
