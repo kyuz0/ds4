@@ -591,9 +591,18 @@ Instrumentation notes for whoever revisits this:
 Total instrumented 3285 ms for 16 tokens; the per-stage synchronize inflates wall
 time (real decode ~90 ms/token), so read the shares, not the absolute ms.
 
+CORRECTION (same log, re-parsed): the stage marks are nested, so the first reading of
+this table double counted. moe_partial is the parent of moe_route/moe_stream_begin/
+moe_shared/moe_routed (53.8 vs 53.5 ms per token across 40 layers - verified equal), and
+attention is a parent of the attn_* marks. Real shares per token: MoE ~26 % (routed 20.1,
+shared 3.8, route 1.4, stream 0.8), attention parent ~18 %, plus attn_q_a+q_b+project+rope
+~12 % and attn_output 7.7 %. So MoE is the largest single bucket but NOT 52 %, and no
+child may be added to its parent. bench-decode-apportion-32k.sh now reports parents and
+children separately to make the mistake unrepeatable.
+
 Two conclusions that redirect the work:
-- MoE is ~52 % of the token (moe_partial + moe_routed + moe_shared + route + stream
-  + finish) and attention ~35 %. MoE is the target.
+- MoE routed expert matmuls (20.1 %) are the largest single bucket; attention parent
+  ~18 % with a further ~12 % in projections.
 - attn_select, the indexer select that the whole packed-FP4 exercise optimised, is
   1.7 % of the token. Independent confirmation that the repack could never have paid
   off, from a different direction than the six-pair timing result.

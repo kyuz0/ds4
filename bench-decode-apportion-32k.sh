@@ -31,9 +31,21 @@ for ln in open(sys.argv[1]):
     tot[m.group(2)] += float(m.group(3)); cnt[m.group(2)] += 1
 if not tot:
     print("no stage lines found"); sys.exit(0)
-grand = sum(tot.values())
-print(f"total instrumented {grand:.1f} ms over {max(cnt.values())} tokens/layer-samples")
-for label, ms in tot.most_common(30):
-    print(f"  {label:34s} {ms:9.1f} ms  {100*ms/grand:5.1f}%  n={cnt[label]}")
+# Stage marks are nested: moe_partial is the parent of moe_route/moe_stream_begin/
+# moe_shared/moe_routed, so a flat sum double counts. Report parents and children
+# separately and never add a child to its parent.
+PARENT = {"moe_partial": ["moe_route", "moe_stream_begin", "moe_shared", "moe_routed"],
+          "attention": ["attn_select", "attn_decode", "attn_gather", "attn_sum_partial",
+                        "attn_output", "attn_rope_window"]}
+kids = {k for v in PARENT.values() for k in v}
+top = {l: ms for l, ms in tot.items() if l not in kids}
+grand = sum(top.values())
+print(f"top-level total {grand:.1f} ms over {max(cnt.values())} layer-samples")
+for label, ms in sorted(top.items(), key=lambda kv: -kv[1])[:20]:
+    extra = ""
+    if label in PARENT:
+        ch = ", ".join(f"{k} {100*tot[k]/ms:.0f}%" for k in PARENT[label] if k in tot)
+        extra = f"  [{ch}]"
+    print(f"  {label:22s} {ms:9.1f} ms {100*ms/grand:5.1f}%{extra}")
 PY
 exit 0
