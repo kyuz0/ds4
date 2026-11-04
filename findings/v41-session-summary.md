@@ -856,3 +856,32 @@ this per stage) or a trace that preserves per-stream concurrency, not a wall-tim
 
 This is the third instrument in this line whose aggregate output pointed somewhere the
 kernel-level physics did not, which is why the check above was done before touching code.
+
+## Attribution validated with in-engine events; routed GEMVs run at 19-24 % of achievable bandwidth
+
+Check performed: take the hipEvent-based MoE decode profile (sound instrument: per-launch
+events around known work, 2560 layer-token samples) and compare each stage's time against the
+exact weight bytes that stage must read. This is the validation the rocprof subtraction failed.
+
+  gate/up   175 us/layer-token, reads 7.57 MB  -> 43.3 GB/s
+  down      109 us/layer-token, reads 3.78 MB  -> 34.7 GB/s
+  mid-quant   7.2 us, x-quant 7.5 us (these are the kernels rocprof charged 183 us each -
+               25x and 24x lower, confirming the trace was absorbing dependency waits)
+  routed expert math total 11.3 ms/token (13.6 % of an 83 ms token), consistent with the
+  ~20 % moe_routed share from the stage profile
+
+Two things this establishes:
+1. attribution can be validated by checking microseconds against bytes moved; the event
+   profile passes that test and the rocprof delta does not;
+2. the routed expert GEMVs achieve 43.3 and 34.7 GB/s against ~180 GB/s realistic LPDDR5X
+   bandwidth, i.e. 24 % and 19 % - so the 1-token GEMV weight-load path is occupancy/ILP
+   limited with roughly 4x of headroom in a 11.3 ms/token component.
+
+Caveat stated rather than assumed: the ~180 GB/s reference is a device spec, not a measured
+baseline on this machine. Before acting, that reference should be confirmed with a
+memory-bound kernel (e.g. a large copy or a wide matmul) in the same session.
+
+Next experiment this supports (not yet run): raise concurrent weight loads per wave in the
+routed gate/up and down kernels, a distinguishable change from the previously rejected
+wave-count experiments (waves 2/8, mt8, preload6), gated behind an env flag and measured as
+interleaved pairs with generated-text equality.
