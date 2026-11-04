@@ -1004,3 +1004,32 @@ Evidence-limits note: the per-matrix byte figure is allocation-derived and FF_EX
 printed by the engine, so these rates carry maybe +-10 % - which does not change the
 "at/near ceiling" conclusion but does mean the 78 % for down should not be read as a precise
 headroom estimate.
+
+## Dimensions audited: 2304x5120, three equal matrices, rates 94 % / 75 % of ceiling
+
+Checked the concrete model shape instead of assuming it. DS4_SHAPE "DeepSeek V4.1 Flash"
+(ds4.c:641-678) is n_embd=5120, n_ff_exp=2304, n_expert=384, n_expert_used=6, n_layer=40.
+The 7168x2048 I used earlier is the "DeepSeek V4 Pro" shape (ds4.c:678-692) and is wrong for
+this model.
+
+  gate  = 2304x5120 = 11.80M weights -> 3.04 MB at 2.0625 bits/weight
+  up    = same 3.04 MB
+  down  = 5120x2304 = same count -> 3.04 MB
+  per expert 9.12 MB nominal vs 9.49 MB measured allocation (4 % padding)
+
+So the three matrices ARE equal-sized, the allocation total is representative but slightly
+high, and the right byte basis is 3.04 MB per matrix:
+
+  gate/up  6 x 2 x 3.04 = 36.5 MB in 175 us = 209 GB/s = 94 % of the measured 223 GB/s
+  down     6 x     3.04 = 18.2 MB in 109 us = 167 GB/s = 75 % of the measured 223 GB/s
+
+Revised conclusion, and only this: the routed gate/up path is essentially at the measured
+read-only ceiling (94 %), and down is at 75 %. Neither leaves meaningful bandwidth headroom,
+so no kernel optimization of these two is justified. The 78 %/97 % and earlier 43/35 GB/s
+figures are superseded; the direction of the conclusion is unchanged but it now rests on the
+model's real dimensions.
+
+Next in-scope assessment this method supports: apply the same bytes-vs-measured-ceiling test
+to the attention leaves (attn_output ~14 % of token, attn_project ~11 %, attn_q_b ~8 %), since
+those are now the largest unexamined components and the test needs only their shapes plus
+event or stage timings.
