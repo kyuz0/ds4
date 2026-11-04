@@ -941,3 +941,33 @@ routed expert kernels. The earlier plan to raise concurrent weight loads per wav
 justified by these numbers and is not started. Before that idea can be revisited, the event
 stages must be scoped precisely (which experts and which matrices each covers) so that a
 byte-per-stage figure can be formed from measured, not nominal, bytes.
+
+## Stage coverage traced: gate_resident is a 6-of-8 expert subset, and the kernels are saturated
+
+Tracing the hipEvent boundaries to their launches resolves the earlier contradiction:
+
+- DS4_ROCM_MOE_DECODE_PROFILE_GATE_RESIDENT_* wraps the launch that takes
+  stream_resident_mask (moe_launch.cuh:3120-3136), i.e. only the RESIDENT selected experts;
+- GATE_MISSING_* wraps the complementary missing-expert launch (measured 5.9 ms total, i.e.
+  a small streamed tail, consistent with the earlier 91 %-overlapped finding);
+- DOWN_* wraps the down-projection launch (3340-3352);
+- so no stage covers all eight experts, which is why dividing nominal 8-expert bytes by these
+  times produced an impossible 346 GB/s.
+
+Correct byte-per-stage calculation, using MEASURED per-expert bytes (reuse ledger:
+80.97 GiB / 8735 allocs = 9.49 MB per gate+up+down block = 3.16 MB per matrix, against the
+3.78 MB a nominal 7168x2048 IQ2_XXS matrix would occupy) and the resident count from the logs
+(stream_resident_mask=0x3f, i.e. 6 of 8):
+
+  gate/up  37.9 MB in 175 us = 217 GB/s = 97 % of the measured 223 GB/s read-only ceiling
+  down     19.0 MB in 109 us = 174 GB/s = 78 % of that ceiling
+
+Conclusion, now self-consistent with every prior measurement: the routed expert GEMVs run at
+78-97 % of what this machine can stream, so there is no bandwidth headroom to recover and no
+kernel optimization is justified here. The earlier "43.3/34.7 GB/s, 5-6x headroom" figures
+were wrong twice over (wrong expert count, wrong byte basis) and are superseded by this
+mapping. gate_missing at 5.9 ms confirms the streaming tail is small, matching the 91 %
+overlap result.
+
+Two unit errors were made while computing these rates (MB/us vs GB/s); the final arithmetic
+is unit-checked (MB/1e3 over us/1e6) and the numbers above were recomputed that way.
