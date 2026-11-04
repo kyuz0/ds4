@@ -40439,6 +40439,7 @@ typedef struct {
     float rows[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM];
     ds4_gpu_tensor *window[40];
     ds4_gpu_tensor *compressed[4], *index_cache[4], *index_cache_fp4[4];
+    int route_prefetched;
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
     ds41_prefill_row batch, *rows_view;
@@ -41342,15 +41343,22 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (!bias) return false;
     const bool profile = ds41_decode_stage_profile_on();
     double start = now_sec();
-    bool ok = ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) &&
-        ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
-            m->map, m->size, bias->abs_offset, 0, 0, token,
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
-            g->route_logits);
+    bool ok = true;
+    const int prefetched = g->route_prefetched;   /* keep for the fetch guard below */
+    g->route_prefetched = 0;
+    if (prefetched) {
+        /* router and expert fetch already issued pre-attention */
+    } else {
+        ok = ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) &&
+            ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
+                m->map, m->size, bias->abs_offset, 0, 0, token,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+                g->route_logits);
+    }
     if (profile) ok = ds41_decode_stage_profile_mark("moe_route", il, start, ok);
     if (!ok) return false;
 #ifdef DS4_ROCM_BUILD
-    if (g->streaming) {
+    if (g->streaming && !prefetched) {
         start = now_sec();
         ok = ds41_stream_selected_begin(g, m, l, il);
         if (profile) ok = ds41_decode_stage_profile_mark(
@@ -41895,10 +41903,39 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
+/* Opt-in overlap: the router needs only this layer's norm, which exists before
+ * attention runs, and the expert fetch is pure I/O. Doing both here lets the
+ * ~0.27 ms/layer delivery of streamed experts overlap the attention stage
+ * instead of stalling moe_routed at the point of use. Engages only when the env
+ * is set; the banner proves the path ran, so an inert arm cannot be misread. */
+static bool ds41_moe_route_prefetch(ds41_gpu_graph *g, const ds4_model *m,
+                                    const ds4_layer_weights *l, uint32_t il, uint32_t token) {
+    const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
+    if (!bias) return false;
+    if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
+        !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
+            m->map, m->size, bias->abs_offset, 0, 0, token,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+            g->route_logits) ||
+        !ds41_stream_selected_begin(g, m, l, il)) return false;
+    g->route_prefetched = 1;
+    static int logged;
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr, "ds4: V4.1 pre-attention route+fetch active\n");
+    }
+    return true;
+}
+
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
     const bool profile = ds41_decode_stage_profile_on();
     bool ok = ds41_graph_before_moe(g, m, l, il);
+#ifdef DS4_ROCM_BUILD
+    const int prefetch_route = getenv("DS4_ROCM_V41_PREFETCH_ROUTE") &&
+        getenv("DS4_ROCM_V41_PREFETCH_ROUTE")[0] != '0' && g->streaming && g->pos > 0u;
+    if (ok && prefetch_route) ok = ds41_moe_route_prefetch(g, m, l, il, (uint32_t)token);
+#endif
     if (ok) ok = ds41_moe(g, m, l, il, (uint32_t)token);
     const double start = now_sec();
     if (ok) ok = ds41_graph_after_moe(g);
@@ -41933,6 +41970,19 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l, uint32_t il, int token) {
+    if (getenv("DS4_ROCM_V41_DECODE_PATH_DIAG")) {
+        static int logged_decode_path;
+        if (!logged_decode_path) {
+            logged_decode_path = 1;
+            fprintf(stderr, "ds4: decode path tp_world=%u streaming=%d quality=%d imatrix=%d "
+                    "images=%u islands_supported=%d -> %s\n", g->tp_world, (int)g->streaming,
+                    (int)g->quality, (int)g->imatrix, g->image_count,
+                    ds4_gpu_decode_graphs_supported(),
+                    (g->tp_world != 2 || g->streaming || g->quality || g->imatrix ||
+                     g->image_count || getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER"))
+                        ? "graph_layer" : "islands");
+        }
+    }
     if (g->tp_world != 2 || g->streaming || g->quality || g->imatrix ||
         g->image_count || getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER") ||
         g_expert_profile.active || getenv("DS4_CUDA_MOE_PROFILE") ||

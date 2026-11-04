@@ -642,3 +642,33 @@ Keep the default (env unset = wait for everything); no code change.
 Next measurement before the next attempt: miss rate and bytes streamed per token
 (the logs show resident_mask=0x3f, i.e. 6 of 8 experts resident), because that decides
 whether prefetch-across-layers can help at all or whether the fix must reduce bytes.
+
+## Pre-attention route+fetch hoist: engages, correct, but the stall does not move
+
+Implementation (opt-in DS4_ROCM_V41_PREFETCH_ROUTE, banner in the same patch): the router
+and ds41_stream_selected_begin run after the layer norm and before attention, so the
+per-layer expert delivery could overlap the attention stage; moe_partial skips its own
+router/fetch exactly once via g->route_prefetched.
+
+Verification, all six arms completed:
+  banner: 0 in every off arm, 1 in every on arm (engagement proven, not assumed)
+  generated text: IDENTICAL in all three pairs of both sessions (185 chars)
+  frontier logits: exact in both sessions
+  decode: +1.9/-0.2/+3.3 (session 1) and +1.7/-0.4/+0.9 (session 2)
+          combined +1.20 % over 6 pairs, 4/6 positive, sd ~1.6
+
+Verdict: not evidence. The mechanism check is what settles it - split_finish_missing went
+from 2771 ms to 2733 ms (-1.4 %), i.e. the point-of-use wait did not shrink. If the fetch
+had really overlapped attention (18 % of the token, ~15 ms), that stall should have
+collapsed toward zero and decode should have gained ~15 %. It did not move at all.
+
+Interpretation: issuing the fetch earlier does not make it overlap, because it is enqueued
+into the same execution stream that attention then occupies; the reads are also
+direct-returned, so there is no staging stage that could proceed independently. Hiding this
+stall needs the fetch on an independent stream with the compute stream waiting on an event,
+not a reordering of calls inside one layer.
+
+Keep the flag opt-in and unshipped. Remaining per-layer-token budget for anyone continuing:
+stall 352 us, gate_resident 175 us, down 109 us - the stall is still the largest single
+item, and the fix has to be a real overlap primitive (separate stream + event), not more
+reordering.
