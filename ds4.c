@@ -41356,6 +41356,14 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         if (profile) ok = ds41_decode_stage_profile_mark(
             "moe_stream_begin", il, start, ok);
         if (!ok) return false;
+        if (profile) {
+            /* Drain here so the routed stage below measures expert math with the
+             * weights resident, and the fetch latency is attributed to the stream
+             * rather than hiding inside moe_routed. */
+            start = now_sec();
+            ok = ds41_decode_stage_profile_mark("moe_stream_wait", il, start, ok);
+            if (!ok) return false;
+        }
     }
 #endif
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);

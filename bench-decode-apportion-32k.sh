@@ -14,13 +14,15 @@ export LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
 { echo "provenance $(date -Is) trial=$TRIAL"; git log -1 --format='commit: %h %ci %s'
   echo "case 32768 frontier, gen 16, DS4_V41_DECODE_STAGE_PROFILE=1"; } > "$OUT/provenance.txt"
 cat "$OUT/provenance.txt"
-timeout -k 60 1800 env DS4_V41_DECODE_STAGE_PROFILE=1 DS4_BENCH_DEV_STAT=1 \
+timeout -k 60 1800 env DS4_V41_DECODE_STAGE_PROFILE=1 DS4_ROCM_MOE_DECODE_PROFILE=1 DS4_BENCH_DEV_STAT=1 \
   ./ds4-bench --rocm -m "$MODEL" --prompt-file "$PROMPT" \
     --ctx-frontiers 32768 --ctx-alloc 40960 --gen-tokens 16 \
     --ssd-streaming --ssd-streaming-cache-experts 92GB \
     --csv "$OUT/profile.csv" > "$OUT/profile.log" 2>&1
 echo "[rc] $?"
 tail -1 "$OUT/profile.csv"
+echo "--- routed MoE internal split (existing event profiler):"
+grep -iE "moe profile|gate_resident|gate_full|gate_missing|down |mid_quant|xquant|prep" "$OUT/profile.log" | tail -20
 python3 -B - "$OUT/profile.log" <<'PY'
 import collections, re, sys
 tot = collections.Counter(); cnt = collections.Counter()
@@ -34,7 +36,7 @@ if not tot:
 # Stage marks are nested: moe_partial is the parent of moe_route/moe_stream_begin/
 # moe_shared/moe_routed, so a flat sum double counts. Report parents and children
 # separately and never add a child to its parent.
-PARENT = {"moe_partial": ["moe_route", "moe_stream_begin", "moe_shared", "moe_routed"],
+PARENT = {"moe_partial": ["moe_route", "moe_stream_begin", "moe_stream_wait", "moe_shared", "moe_routed"],
           "attention": ["attn_select", "attn_decode", "attn_gather", "attn_sum_partial",
                         "attn_output", "attn_rope_window"]}
 kids = {k for v in PARENT.values() for k in v}

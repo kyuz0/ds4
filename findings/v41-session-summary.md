@@ -610,3 +610,35 @@ Two conclusions that redirect the work:
 Next step: moe_partial is a bucket (router matmul + select, stream begin, shared expert,
 routed expert matmuls), not a single kernel, so instrument inside it before optimising
 anything - gate/up vs down vs stream-wait - rather than guessing which of the 26 % is real.
+
+## Rejected: partial gate/up waiting for streamed experts (DS4_ROCM_V41_ENABLE_PARTIAL_GATEUP)
+
+The internal event profiler (DS4_ROCM_MOE_DECODE_PROFILE) finally located the real decode
+stall, after my own moe_stream_wait probe misled me: draining right after the prefetch is
+issued measures enqueue cost (0.6 ms), not I/O latency. The wait surfaces at point of use:
+
+  gate_resident        111.3 ms  26% of routed MoE
+  split_finish_missing 220.5 ms  51%   wait for streamed experts before computing
+  down                  69.8 ms  16%
+  xquant+mid_quant       9.3 ms   2%
+
+So decode IS partly SSD-starved (~12-17 % of the token), and the previous "streaming is a
+non-issue" conclusion was a sampling artifact.
+
+The obvious fix already existed as an opt-in: wait only for gate/up, letting the down fetch
+overlap gate/up math. Three interleaved 32K gen-64 pairs, same binary, banner-confirmed
+(o1/o3 absent, p1/p3 present, so the arm really took the path):
+
+  -3.3 %, +2.5 %, -1.9 %   mean -0.92 %, sign flips
+
+Rejected. Mechanism: the stall is bounded by SSD delivery, not by scheduling. Overlapping
+gate/up does not shorten it because the down weights are still needed afterwards, so total
+I/O and the critical path are unchanged. Cutting this wait requires either fewer streamed
+bytes, a higher resident hit rate, or overlap across layers (prefetch layer L+1 during layer
+L's attention) - not a finer-grained wait inside one layer.
+
+Keep the default (env unset = wait for everything); no code change.
+
+Next measurement before the next attempt: miss rate and bytes streamed per token
+(the logs show resident_mask=0x3f, i.e. 6 of 8 experts resident), because that decides
+whether prefetch-across-layers can help at all or whether the fix must reduce bytes.
