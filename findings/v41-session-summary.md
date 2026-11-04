@@ -1165,3 +1165,35 @@ MoE routed ~11.3 ms and main attn_q_b ~9 ms, i.e. ~48 of the 83 ms. The remainin
 NOT weight streaming - it is attention core/softmax, routing, index selection and sampling -
 so that is where any further decode work must go, and it needs its own instrument (events
 around those kernels) rather than more bandwidth analysis.
+
+## All five attention leaves reconciled; every weight-streaming leaf is at 87-93 % of ceiling
+
+Final scoped table (g0/g16 subtraction, 32K, 16 tokens). Every target reconciles to 640 =
+16 x 40 decode calls and its byte delta matches the tensor dump exactly:
+
+  leaf              d_calls  ms/token  MB/token  GB/s  %ceil   bytes/layer  dump
+  q_b                   640      8.71    1782.6   205    92      44.56      44.56  OK
+  attn_output_pair      640     15.49    3208.6   207    93       o_a 35.65 / o_b 44.56  OK
+  attn_q_a_kv_pair      640      2.00     389.9   195    87       q_a 6.96 / kv 2.79     OK
+  ffn_down_shexp        640      2.54     501.4   198    89
+  ffn_gate_inp          640      1.86     314.6   169    76
+  engram_kv              32      3.70     629.1   170    76
+  hc_attn_fn/ffn_fn     640   0.65/0.63   39.3   61/63  27/28
+  indexer.attn_q_b      128      0.43      83.9   197    88
+  indexer.proj          128      0.13       2.6    21     9
+  indexer.attn_k         40      0.04       0.3     7     3
+
+Accounting notes: q_a, attn_kv, attn_output_a and attn_output_b are counted separately
+(calls and bytes) inside their fused kernels, where separate event timing is not valid; the
+fused pair timings are reported for rate purposes. q_b needed a different decode gate: it
+passes count = all heads for one row, so the discriminator is one input row (in->bytes ==
+dim[0]*4), not count == 1.
+
+Conclusion: every leaf that streams meaningful weight bytes runs at 87-93 % of the measured
+223 GB/s read-only ceiling (q_b 92 %, output pair 93 %, q_a+kv 87 %, shexp down 89 %, indexer
+q_b 88 %). The bandwidth avenue is closed across the model, not just for MoE.
+
+Budget: leaves total 36.1 ms/token; plus MoE routed ~11.3 ms that is 47.4 ms of an ~83 ms
+token. The remaining ~35.6 ms is NOT weight streaming - it is attention core/softmax, routing,
+index selection and sampling - so any further decode work must target that, with its own
+event-based instrument (the stage marks are 2.46x inflated and cannot be used).

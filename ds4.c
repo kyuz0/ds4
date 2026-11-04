@@ -40896,7 +40896,10 @@ static bool ds41_matmul_rows(ds4_gpu_tensor *out, const ds4_model *m,
                              uint32_t first, uint32_t count) {
 #ifdef DS4_ROCM_BUILD
     /* Decode-scoped leaf timing: only single-row projections are accumulated. */
-    const int leaf = ds41_leaf_profile_on() && count == 1u;
+    /* One input row == one token: q_b passes count = all heads for that single row,
+     * so the row width in `in` is the decode discriminator, not `count`. */
+    const int leaf = ds41_leaf_profile_on() && in &&
+        in->bytes == (uint64_t)weight->dim[0] * 4ull;
     char leaf_label[48] = {0};
     if (leaf) {
         size_t n = weight->name.len < sizeof(leaf_label) - 1 ? weight->name.len : sizeof(leaf_label) - 1;

@@ -5,7 +5,7 @@ set -uo pipefail
 G=/home/dani/code/v4.1-ds4
 MODEL=/home/dani/models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf
 PROMPT=speed-bench/promessi_sposi.txt
-TRIAL="${1:-1}"; case "$TRIAL" in 1|2|3|4|5) ;; *) echo "*** trial 1-5 ***"; exit 1 ;; esac
+TRIAL="${1:-1}"; case "$TRIAL" in 1|2|3|4|5|6|7) ;; *) echo "*** trial 1-7 ***"; exit 1 ;; esac
 cd "$G" || exit 1
 curl -sf --max-time 3 http://127.0.0.1:8000/v1/models >/dev/null 2>&1 && { echo "*** backend running ***"; exit 1; }
 OUT="$G/findings/bench-leaf-profile$TRIAL-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$OUT"
@@ -42,6 +42,9 @@ for k in sorted(set(a) | set(b)):
     mb_, cb, bb = b.get(k, (0.0, 0, 0.0))
     dms, dc, dmb = mb_ - ma, cb - ca, bb - ba
     if dc <= 0 and dms <= 0: continue
+    if dms <= 0:
+        print(f"{k[:26]:26s}{dc:8d}{'(fused)':>10s}{dmb/tokens:10.1f}{'-':>8s}{'-':>7s}")
+        continue
     gbs = dmb * 1e6 / (dms * 1e-3) / 1e9 if dms > 0 else 0
     print(f"{k[:26]:26s}{dc:8d}{dms/tokens:10.2f}{dmb/tokens:10.1f}{gbs:8.0f}{gbs/ceil*100:7.0f}")
 PY

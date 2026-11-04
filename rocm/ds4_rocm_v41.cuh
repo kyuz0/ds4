@@ -1584,6 +1584,8 @@ static void v41_q8b4_log_shape(const char *site, uint32_t width, uint32_t output
     fprintf(stderr, "ds4: q8b4 %s\n", key);
 }
 
+extern "C" int ds4_gpu_v41_leaf_note(const char *label, unsigned long long bytes);
+
 /* Decode-scoped leaf timing for the fused attention projections. Only single-token
  * calls are accumulated, so prefill rows can never enter the totals. */
 static int ds4_leaf_profile_on(void) {
@@ -1628,8 +1630,13 @@ extern "C" int ds4_gpu_dsv41_q8_projection_pair_rows(
     v41_q8_f32_blocks4_pair_kernel<<<(total + 7u) / 8u, 256u>>>(
         (float *)out_a->ptr, (float *)out_b->ptr, wa, wb,
         (const float *)in->ptr, width, outputs_a, outputs_b, row_bytes);
-    if (leaf) (void)ds4_gpu_v41_leaf_end("attn_q_a_kv_pair",
-        (unsigned long long)(((uint64_t)outputs_a + outputs_b) * width * 34ull / 32ull));
+    if (leaf) {
+        const uint64_t per_out = (uint64_t)width * 34ull / 32ull;   /* q8_0 bytes per output row */
+        (void)ds4_gpu_v41_leaf_end("attn_q_a_kv_pair",
+            (unsigned long long)(((uint64_t)outputs_a + outputs_b) * width * 34ull / 32ull));
+        (void)ds4_gpu_v41_leaf_note("attn_q_a", (unsigned long long)(outputs_a * per_out));
+        (void)ds4_gpu_v41_leaf_note("attn_kv",  (unsigned long long)(outputs_b * per_out));
+    }
     return cuda_ok(cudaGetLastError(), "V4.1 Q8 fused pair projection");
 }
 
@@ -1987,8 +1994,11 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
         matmul_q8_0_f32_batch_warp8_kernel<<<dim3(640u, n_tokens), 256>>>((float *)out->ptr, b,
             (const float *)low->ptr, 8192u, 5120u, n_tokens, 256u);
     }
-    if (leaf) (void)ds4_gpu_v41_leaf_end("attn_output_pair",
-        (unsigned long long)(a_bytes + b_bytes));
+    if (leaf) {
+        (void)ds4_gpu_v41_leaf_end("attn_output_pair", (unsigned long long)(a_bytes + b_bytes));
+        (void)ds4_gpu_v41_leaf_note("attn_output_a", (unsigned long long)a_bytes);
+        (void)ds4_gpu_v41_leaf_note("attn_output_b", (unsigned long long)b_bytes);
+    }
     return cuda_ok(cudaGetLastError(), "V4.1 attention output projection");
 }
 
@@ -2627,6 +2637,30 @@ static const char *ds4_leaf_canon(const char *label) {
     if (strncmp(label, "blk.", 4) != 0) return label;
     const char *dot = strchr(label + 4, '.');
     return dot ? dot + 1 : label;
+}
+
+
+/* Call and byte accounting for a leaf that shares a fused kernel: no independent
+ * event timing exists, so only counts and bytes are recorded. */
+extern "C" int ds4_gpu_v41_leaf_note(const char *label, unsigned long long bytes) {
+    if (!g_leaf_ev_ready) {
+        if (!ds4_gpu_v41_leaf_begin()) return 0;
+    }
+    for (int i = 0; i < g_leaf_prof_n; i++) {
+        if (strncmp(g_leaf_prof[i].label, label, sizeof(g_leaf_prof[i].label)) == 0) {
+            g_leaf_prof[i].calls += 1;
+            g_leaf_prof[i].bytes += bytes;
+            return 1;
+        }
+    }
+    if (g_leaf_prof_n < DS4_LEAF_PROFILE_SLOTS) {
+        snprintf(g_leaf_prof[g_leaf_prof_n].label, sizeof(g_leaf_prof[0].label), "%s", label);
+        g_leaf_prof[g_leaf_prof_n].ms = 0.0;
+        g_leaf_prof[g_leaf_prof_n].calls = 1;
+        g_leaf_prof[g_leaf_prof_n].bytes = bytes;
+        g_leaf_prof_n += 1;
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_v41_leaf_end(const char *label_in, unsigned long long bytes) {
