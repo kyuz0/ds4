@@ -910,3 +910,34 @@ Notes, stated precisely:
 
 Repository note: HBM measurement tools are new files (tools/measure-hbm-bandwidth.cu); no
 engine code was touched for this check.
+
+## RETRACTION: the 19 %/16 % "bandwidth headroom" figures were wrong by the expert count
+
+The previous entry divided each stage's bytes by ONE expert's matrices, but a decode layer
+reads DS4_N_EXPERT_USED = 8 of them. Recomputing with 7168 x 2048 IQ2_XXS matrices
+(3.78 MB each):
+
+  8 experts, gate+up 60.6 MB in 175 us -> 346 GB/s
+  8 experts, down    30.3 MB in 109 us -> 278 GB/s
+  measured read-only ceiling on this machine: 223 GB/s
+
+Both implied rates EXCEED the measured ceiling, which is impossible. So at least one of the
+two inputs is not what it appears: either the hipEvent stages do not span all eight experts'
+work (the gate_resident/down events may cover only part of the split path), or the effective
+per-expert byte count is lower than the nominal matrices (the reuse ledger shows ~9.5 MB per
+expert block rather than the 11.35 MB nominal, which still leaves the rates above ceiling).
+
+What therefore does NOT hold:
+- "gate/up runs at 19 % and down at 16 % of achievable bandwidth": withdrawn;
+- "5.2x / 6.4x headroom, so a kernel optimization could recover ~11 ms/token": withdrawn.
+  It was derived from that 8x error.
+
+What does hold, unchanged: the event profile's per-stage microseconds are self-consistent
+with the stage shares (11.3 ms/token of routed math vs the ~20 % moe_routed share), and the
+rocprof delta remains rejected (its quantize kernels were 25x above event timing).
+
+Consequence for the objective: there is no measured evidence of bandwidth headroom in the
+routed expert kernels. The earlier plan to raise concurrent weight loads per wave is NOT
+justified by these numbers and is not started. Before that idea can be revisited, the event
+stages must be scoped precisely (which experts and which matrices each covers) so that a
+byte-per-stage figure can be formed from measured, not nominal, bytes.
