@@ -131,3 +131,4 @@ findings/
 
 # agentkit machine-local state (built binaries, runs, noise floors)
 /.agentkit/
+/bench-ak-*.sh
