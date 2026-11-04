@@ -731,3 +731,41 @@ for an early fetch to live.
 Next step (not attempted: needs a full build/gate cycle): double-buffer the selected pending
 slot behind an opt-in flag, so layer L's compute overlaps L+1's fetch, with per-slot pointer
 tables and abort semantics preserved.
+
+## CORRECTION: the expert stall IS I/O-bound, at ~221 MB/s aggregate random-read rate
+
+The read profiler (DS4_ROCM_STREAM_READ_PROFILE=1, which is what populates the per-job
+read_start/read_end fields - they are zero otherwise, which is why staged-read-us was 0)
+finally decomposes the 352 us per layer-token:
+
+  staged 587 MB in 1368 jobs over 32 tokens; aggregate worker read time 5.28 s
+  per job 0.43 MB in 3.86 ms -> 111 MB/s per stream
+  wall decode 2.66 s -> average read concurrency 2.0x
+  aggregate staged rate 221 MB/s; total blocking wait 0.45 s = 17 % of decode wall
+  bytes per token 18.4 MB
+
+Corrected interpretation: the path is BANDWIDTH-BOUND, but against the device's random-read
+throughput for this access pattern (~221 MB/s aggregate at ~2x concurrency, 0.43 MB random
+reads), not against a copy-path ceiling. The earlier "1.54 GB/s implied, therefore not
+saturated" claim divided bytes by the blocking wait instead of by aggregate read time and is
+retracted.
+
+This reconciles every measurement in this line of work:
+- warm-vs-cold identical: the working set (~200 GB of experts) cannot be page-cached, so a
+  rerun re-reads from the device;
+- pre-attention hoist (+1.2 % over 6 pairs, banner-confirmed) and partial gate/up (-0.9 %)
+  and the single-pending-slot structure: no reordering can create bytes-per-second that the
+  device does not deliver;
+- stall share ~14-17 % of the token, matching 18.4 MB/token at 221 MB/s.
+
+Consequence: the remaining levers are fewer bytes, better locality, or larger sequential
+reads - all of which require changing what is stored or how it is laid out, i.e. outside the
+current scope (model format and the fixed 92 GB cache are both given). Concurrency is
+already 24 workers with only ~2 in flight because there is one pending slot per layer and
+decode is layer-serial.
+
+Recommendation: close this line. Nothing here is promotable, and the measured ceiling says
+further scheduling work on this path cannot pay.
+
+Payload note: bench-staged-warm.sh now runs one arm but its final FileNotFoundError (warm.log)
+is a leftover from the two-arm version; the printed metrics above are complete and valid.
