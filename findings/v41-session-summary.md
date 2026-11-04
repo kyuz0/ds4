@@ -1230,3 +1230,36 @@ Next instrument target, in order of expected size: the LM head (one launch, easy
 it streams 703 MB), then per-layer hc/norm/bf16 aggregate, then the host-side gaps. That is
 the only remaining place where a real optimization could live, and none should be attempted
 before those numbers exist.
+
+## LM head measured: at the ceiling, like every other weight-streaming kernel
+
+lm_head span (one call per token, so the decode delta is 16 = tokens, not 640 = tokens x
+layers; the scoping is correct):
+
+  lm_head  3.09 ms/token for 703.3 MB of output.weight = 228 GB/s = 102 % of the measured
+           223 GB/s read-only ceiling (within run-to-run error of the baseline)
+
+Updated, fully event-based token budget:
+
+  dense-projection leaves     36.1 ms
+  MoE routed expert math      11.3 ms
+  attn_core                    3.8 ms
+  lm_head                      3.1 ms
+  attn_select                  2.7 ms
+                             --------
+                              57.0 ms of ~83 ms
+  unattributed               ~26.0 ms (31 %)
+
+Every component that streams weights - MoE experts, q/kv/q_b/output pairs, shared expert,
+engram, LM head - is at 87-102 % of the measured ceiling. That is now a complete statement
+about weight streaming across the model: there is no headroom anywhere in it.
+
+What the remaining ~26 ms is: per-layer hc_mix / hc_weighted_sum / norm / bf16 small kernels,
+the x/mid quantize launches (~7 us each), the router matmul (1.9 ms measured), sampling, and
+any queue gaps between ordered command buffers. These are launch/latency-dominated rather than
+bandwidth-bound, so they need count-aware measurement (how many launches per layer) rather than
+bytes-vs-ceiling.
+
+Next instrument target: bracket ds41_hc_mix, ds41_norm and ds41_bf16 with the same spans to
+aggregate the per-layer small-kernel time; that should account for most of the 26 ms and will
+show whether the remainder is kernel time or host gaps.

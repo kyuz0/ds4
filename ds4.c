@@ -40947,7 +40947,9 @@ static bool ds41_output_projection(ds41_gpu_graph *g, ds4_gpu_tensor *out,
     }
     /* Head rows are independent; keep their original reduction and do not
      * add the BF16 rounding used by the attention row-slice helper. */
-    return ds41_matmul_batch(out, m, &head, in, rows, false);
+    (void)ds41_leaf_begin("lm_head");
+    const bool ok = ds41_matmul_batch(out, m, &head, in, rows, false);
+    return ds41_leaf_end("lm_head", ok);
 }
 
 static const ds4_vision_span *ds41_image_at(const ds41_gpu_graph *g, uint32_t pos) {
