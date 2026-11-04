@@ -769,3 +769,34 @@ further scheduling work on this path cannot pay.
 
 Payload note: bench-staged-warm.sh now runs one arm but its final FileNotFoundError (warm.log)
 is a leftover from the two-arm version; the printed metrics above are complete and valid.
+
+## FINAL, decode-scoped: the wait is 57 large fetches, not a per-layer uniform cost
+
+Bucketing every finish call by read-job count (observable, unlike my earlier guessed
+selector width) settles the question with numbers that reconcile exactly:
+
+  jobs0   : 1223 calls, wait 0 us, own-read 0 us        <- most layer-tokens stage nothing
+  jobs1-3 : 0 calls
+  jobs4+  : 57 calls, wait 8044 us, own-read 87928 us, read>wait 100 %, 91 % hidden
+  total wait from those 57 calls = 0.46 s = the entire split_finish_missing (0.46 s)
+  per token: 14.3 ms of an 83 ms token (17 %), i.e. 1.78 large fetches/token, 10.3 MB each
+
+Corrections to earlier statements in this file:
+- "352-380 us per layer-token" is a MEAN over calls that mostly stage nothing. The cost is
+  concentrated: 57 fetches of ~10.3 MB each, collapsing to ~8 ms of exposed wait apiece.
+- retracted (again, now with the right data): the "221 MB/s device random-read bound". The
+  aggregate 5.0 s of worker read time spans 57 large requests whose reads are already 91 %
+  overlapped with other work; it is not a blocking-path rate.
+- the earlier 4 % read>wait figure and the 4049 us mean own-read were the same 57 calls
+  divided by the wrong denominator.
+
+What this supports: the fetch path already hides 91 % of its read time, and the residual is
+the tail of ~10 MB bursts (1.78 per token). Shrinking it needs fewer bytes or better
+locality on those bursts - model layout and the fixed 92 GB cache are given constraints, so
+no in-scope code change follows, and none was made. Retuning the fetch schedule cannot help:
+four independent attempts (partial gate/up, two hoist variants, banner-verified pre-attention
+hoist) all landed within +-1.2 % for exactly this reason.
+
+Instrumentation left in place (all diagnostic, gated by DS4_ROCM_STREAM_CACHE_STATS /
+DS4_ROCM_STREAM_READ_PROFILE): staged-bytes, staged-jobs, staged-read-us and the per-job-count
+bucket histogram of wait/own-read/read>wait.

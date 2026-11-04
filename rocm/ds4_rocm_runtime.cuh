@@ -281,6 +281,7 @@ struct cuda_stream_v41_reuse_stats {
      * value cannot be lost to a per-translation-unit copy of a header static. */
     uint64_t staged_bytes, staged_jobs;
     uint64_t staged_read_us;   /* sum of worker read durations (job read_end - read_start) */
+    uint64_t wait_calls[3], wait_total_us[3], waited_read_us[3], wait_lt_read[3];
 };
 
 struct cuda_stream_cache_stats {
@@ -519,14 +520,22 @@ static void cuda_stream_cache_stats_print(const char *label) {
                 "logical-bytes=%llu missing-bytes=%llu d2d-submitted-bytes=%llu "
                 "read-jobs=%llu read-returned-bytes=%llu direct-returned-bytes=%llu "
                 "copy-wait-us=%llu failures=%llu staged-bytes=%llu staged-jobs=%llu "
-                "staged-read-us=%llu\n",
+                "staged-read-us=%llu"
+                " jobs0[%llu,%llu,%llu,%llu] jobs1-3[%llu,%llu,%llu,%llu]"
+                " jobs4+[%llu,%llu,%llu,%llu]\n",
                 label ? label : "", (unsigned long long)r.prepares,
                 (unsigned long long)r.hits, (unsigned long long)r.logical_bytes,
                 (unsigned long long)r.missing_bytes, (unsigned long long)r.d2d_bytes,
                 (unsigned long long)r.read_jobs, (unsigned long long)r.read_bytes,
                 (unsigned long long)r.direct_bytes, (unsigned long long)r.copy_wait_us,
                 (unsigned long long)r.failures, (unsigned long long)r.staged_bytes,
-                (unsigned long long)r.staged_jobs, (unsigned long long)r.staged_read_us);
+                (unsigned long long)r.staged_jobs, (unsigned long long)r.staged_read_us,
+                (unsigned long long)r.wait_calls[0], (unsigned long long)r.wait_total_us[0],
+                (unsigned long long)r.waited_read_us[0], (unsigned long long)r.wait_lt_read[0],
+                (unsigned long long)r.wait_calls[1], (unsigned long long)r.wait_total_us[1],
+                (unsigned long long)r.waited_read_us[1], (unsigned long long)r.wait_lt_read[1],
+                (unsigned long long)r.wait_calls[2], (unsigned long long)r.wait_total_us[2],
+                (unsigned long long)r.waited_read_us[2], (unsigned long long)r.wait_lt_read[2]);
     }
     if (!cuda_stream_cache_layer_stats_on()) return;
     for (uint32_t layer = 0;
@@ -5390,6 +5399,7 @@ static int cuda_stream_selected_finish_pending_gateup(void) {
 static int cuda_stream_selected_finish_pending_missing(uint32_t compact_mask) {
     if (!g_stream_selected_pending.active) return 1;
     const uint32_t read_job_count = g_stream_selected_pending.read_job_count;
+    const double wait_t0 = cuda_wall_sec();
     if (!cuda_stream_read_jobs_wait(g_stream_selected_pending.read_jobs,
                                     read_job_count) ||
         !cuda_stream_selected_upload_read_jobs(g_stream_selected_pending.read_jobs,
@@ -5400,6 +5410,23 @@ static int cuda_stream_selected_finish_pending_missing(uint32_t compact_mask) {
                sizeof(g_stream_selected_pending));
         cuda_stream_resident_cache_release();
         return 0;
+    }
+    {
+        /* Bucket per call by read-job count (0, 1-3, 4+): decode calls carry ~1 job
+         * while prefill carries many, so the buckets separate them without guessing
+         * at a selector width. */
+        const uint32_t bucket = read_job_count == 0 ? 0u : read_job_count <= 3 ? 1u : 2u;
+        const double waited = (cuda_wall_sec() - wait_t0) * 1e6;
+        uint64_t own = 0;
+        for (uint32_t i = 0; i < read_job_count; i++) {
+            const cuda_stream_read_job *jb = &g_stream_selected_pending.read_jobs[i];
+            if (jb->read_end > jb->read_start)
+                own += (uint64_t)((jb->read_end - jb->read_start) * 1e6);
+        }
+        g_stream_v41_reuse_stats.wait_calls[bucket] += 1;
+        g_stream_v41_reuse_stats.wait_total_us[bucket] += (uint64_t)waited;
+        g_stream_v41_reuse_stats.waited_read_us[bucket] += own;
+        if (own > (uint64_t)waited) g_stream_v41_reuse_stats.wait_lt_read[bucket] += 1;
     }
     for (uint32_t i = 0; i < read_job_count; i++) {
         g_stream_v41_reuse_stats.staged_bytes +=
