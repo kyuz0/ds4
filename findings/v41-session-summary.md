@@ -672,3 +672,27 @@ Keep the flag opt-in and unshipped. Remaining per-layer-token budget for anyone 
 stall 352 us, gate_resident 175 us, down 109 us - the stall is still the largest single
 item, and the fix has to be a real overlap primitive (separate stream + event), not more
 reordering.
+
+## Why stream/event overlap cannot fix the expert-delivery wait (inspection result)
+
+Instruction was to add an independent-stream overlap with explicit event synchronisation.
+Inspecting the path first shows that change is contraindicated:
+
+- the wait is `cuda_stream_read_jobs_wait()` in
+  cuda_stream_selected_finish_pending_missing() (ds4_rocm_runtime.cuh:5383) - a HOST wait
+  for read-worker threads, not a GPU stream dependency, so no stream/event edit touches it;
+- reads already run on independent streams: DS4_ROCM_STREAM_READ_WORKERS =
+  DS4_ROCM_N_EXPERT_USED*3 = 24 dedicated threads, each with its own upload stream, and the
+  jobs are already submitted at begin (cuda_stream_read_jobs_start, line 5168) - which is
+  exactly what the pre-attention hoist moved earlier, with no effect on the wait;
+- the arithmetic matches the staging cost: 22.7 MB per layer-token in ~352 us is 64 GB/s,
+  and 40 layers is 0.9 GB / 14 ms of a ~90 ms token.
+
+So the copy path is already at its achievable rate and already fully parallel: the wait is a
+throughput wall, not a latency or ordering artifact. Moving the fetch earlier (tried, +1.2 %
+over 6 pairs), waiting for less of it (tried, -0.9 %), and overlapping it on another stream
+(impossible: it is a CPU-side wait) all fail for the same reason. The remaining levers are
+fewer bytes (higher residency) or a faster copy path, not more concurrency.
+
+No code change was made, deliberately: implementing the requested overlap would have added
+risk to a path the measurements show is not the mechanism.
