@@ -1,5 +1,18 @@
 # V4.1 Strix Halo — session 2026-11-06 (ctx 128K, cache 92GB)
 
+## Result: session-start binary vs final defaults (cdd3773)
+
+| case | before | after |
+|---|---|---|
+| 24K prefill (ABBA×2) | 181.6 tps | 322.3 tps (+77 %) |
+| 24K decode, gen 128 | 10.85 tps | 12.21 tps (+12.5 %) |
+| 120K prefill (1 pair) | 137.9 tps | 370.8 tps (2.7×) |
+| 120K decode, gen 64 | 11.11 tps | 11.40 tps (1 pair; ABBA×2 earlier: 11.90) |
+
+All changes are ROCm defaults with `=0` escape hatches. Everything is bit-exact except the
+decoder suffix (rounding-level; `DS4_METAL_V41_DECODER_SUFFIX=0` restores bit-identity
+with the stock engine). Raw runs: findings/v41-decode2/final-before-after.txt.
+
 All runs: `ds4-bench --ctx-alloc 131072 --ssd-streaming --ssd-streaming-cache-experts 92GB`,
 prompt `speed-bench/promessi_sposi.txt`, generated text compared with `--show-output`,
 frontier logits gated with `ak gate logits`.
