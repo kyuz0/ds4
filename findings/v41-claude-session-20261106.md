@@ -193,3 +193,17 @@ cycle; generated text identical to plain decode in every arm.
 Verify cycle (6 rows) ~290 ms: gate/up ~52, down ~48 (per-(row,expert), rounding-level fix possible),
 SSD-miss stalls ~52 (staged reads + H2D copies, ~23 experts/layer touched), dense 6-row GEMVs ~24,
 attention ~17. Target for ~20 tok/s on code: ~160 ms per cycle.
+
+### 10b. The SSD is the DSpark bottleneck (and ~12 % of plain decode)
+
+Random O_DIRECT reads at random offsets of the model file (tools/ssd-random-read.c), KIOXIA
+EXCERIA BASIC (DRAM-less): 512 KB-3 MB requests, 4-32 threads -> 1.03-1.61 GB/s, never more
+(4.9 GB/s only for sequential reads). A missed expert (~9.3 MB) therefore costs ~6 ms whatever
+the software does. Decode-only accounting (DSpark, code, 128 tokens): 537 misses, main-thread
+read wait 4.0 s = ~40 % of decode. Plain decode: ~1.6 misses/token ~ 10 ms of ~82 ms.
+Neither read chunking for verify misses nor removing the read cap changed this.
+
+DSpark draft width (DS4_DSPARK_FIXED_WIDTH, adaptive off), code 8K gen128:
+2: 12.20 tps (441 misses), 3: 13.43 (422), 4: 12.89 (531), 5: ~12.5 (537). Plain: 11.84.
+Best: width 3, +13 % on code with this drive. A DRAM-equipped NVMe that sustains
+5+ GB/s on large random reads would cut miss cost ~3-4x for both plain decode and DSpark.
