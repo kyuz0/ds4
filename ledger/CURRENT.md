@@ -23,3 +23,4 @@
 
 ## Rejected / retracted (do not reuse)
 - H003 rejected: Spinning on the selected-id readback event instead of a blocking wait would remove a host wake-up gap seen after the sha — 2026-11-06 rejected: Neutral: 24K gen128 ABBA3 blocking 12.01 vs spin 11.99 tps; 120K gen64 ABBA2 11.90 vs 11.99 with one negative pair. The 110 us trace gap was profiler-inflated. Kept opt-in (DS4_ROCM_ASYNC_READ_SPIN=1), default off.
+- H004 rejected: Seeding the post-prefill expert cache from whole-prompt routing frequencies (plus last-chunk recency) instead of the las — 2026-11-06 rejected: 24K gen128: misses 284 (last chunk, 4096-row suffix tail) vs 278 (whole prompt): ~2 percent, not worth the code. Reverted.
