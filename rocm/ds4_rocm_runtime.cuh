@@ -7146,7 +7146,19 @@ extern "C" int ds4_gpu_tensor_read_async_begin(const ds4_gpu_tensor *tensor,
 }
 extern "C" int ds4_gpu_tensor_read_async_end(void *data, uint64_t bytes) {
     if (!data || bytes != g_async_read_bytes || !g_async_read_event) return 0;
-    if (!cuda_ok(cudaEventSynchronize(g_async_read_event), "async read wait")) return 0;
+    /* Opt-in (DS4_ROCM_ASYNC_READ_SPIN=1): spin on the event instead of the
+     * blocking wait. Measured neutral (24K ABBA x3 12.01 vs 11.99 tps; 120K ABBA x2
+     * 11.90 vs 11.99, one pair negative), so the CPU is not kept busy by default. */
+    static int spin = -1;
+    if (spin < 0) {
+        const char *v = getenv("DS4_ROCM_ASYNC_READ_SPIN");
+        spin = (v && v[0] == '1') ? 1 : 0;
+    }
+    if (spin) {
+        cudaError_t q;
+        while ((q = hipEventQuery(g_async_read_event)) == hipErrorNotReady) __builtin_ia32_pause();
+        if (!cuda_ok(q, "async read poll")) return 0;
+    } else if (!cuda_ok(cudaEventSynchronize(g_async_read_event), "async read wait")) return 0;
     memcpy(data, g_async_read_host, (size_t)bytes);
     g_async_read_bytes = 0;
     return 1;

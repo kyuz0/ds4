@@ -21,4 +21,4 @@
 - none
 
 ## Rejected / retracted (do not reuse)
-- none
+- H003 rejected: Spinning on the selected-id readback event instead of a blocking wait would remove a host wake-up gap seen after the sha — 2026-11-06 rejected: Neutral: 24K gen128 ABBA3 blocking 12.01 vs spin 11.99 tps; 120K gen64 ABBA2 11.90 vs 11.99 with one negative pair. The 110 us trace gap was profiler-inflated. Kept opt-in (DS4_ROCM_ASYNC_READ_SPIN=1), default off.
