@@ -498,10 +498,19 @@ __global__ static void v41_indexer_reduce_heads_kernel(float *out,const float *d
  for(unsigned h=0;h<heads;h++)v=v41_add(v,v41_mul(fmaxf(v41_mul(dots[((size_t)h*rows+row)*width+k],1.f/64),0.f),w[row*32+h0+h]));
  out[i]=v;
 }
+#include "ds4_rocm_v41_ix_wmma.cuh"
 /* Keep the query tile wide for GEMM; partition heads to bound scratch instead
  * of shrinking N to eight columns at long context. All operands remain F32. */
 static int v41_indexer_head_gemm(float *out, const float *q, const float *weights,
         const float *keys, uint32_t width, uint32_t rows, uint32_t start, uint32_t ratio) {
+    if (v41_indexer_wmma_enabled()) {
+        if (!v41_indexer_wmma_launch(out, q, weights, keys, NULL, width, rows, start, ratio)) return 0;
+        return cuda_ok(cudaGetLastError(), "V4.1 fused WMMA indexer");
+    }
+    static int check = -1;
+    if (check < 0) { const char *v = getenv("DS4_ROCM_V41_INDEX_WMMA"); check = v && v[0] == '2'; }
+    static unsigned check_calls;
+    const bool do_check = check && (check_calls++ % 97u) == 0u;
     const uint64_t per_head = (uint64_t)rows * width * sizeof(float);
     const uint32_t heads = (uint32_t)min(UINT64_C(32), (UINT64_C(64) << 20) / per_head);
     const uint64_t q_bytes = (uint64_t)rows * 32u * 128u * sizeof(float);
@@ -520,6 +529,19 @@ static int v41_indexer_head_gemm(float *out, const float *q, const float *weight
         v41_indexer_reduce_heads_kernel<<<dim3((width + 255u) / 256u, rows), 256u>>>(
             out, dots, weights, width, rows, h0, count, start, ratio);
         if (!cuda_ok(cudaGetLastError(), "V4.1 indexer head reduction")) return 0;
+    }
+    if (do_check) {
+        float *alt = NULL; unsigned long long *cnt = NULL, h[7];
+        if (cudaMalloc(&alt, (size_t)rows * width * 4u) == cudaSuccess &&
+            cudaMalloc(&cnt, sizeof h) == cudaSuccess && cudaMemset(cnt, 0, sizeof h) == cudaSuccess) {
+            (void)v41_indexer_wmma_launch(alt, q, weights, keys, NULL, width, rows, start, ratio);
+            v41_indexer_wmma_check_kernel<<<dim3((width + 255u) / 256u, rows), 256u>>>(
+                cnt, out, alt, q, weights, keys, width, rows, start, ratio);
+            if (cudaMemcpy(h, cnt, sizeof h, cudaMemcpyDeviceToHost) == cudaSuccess)
+                fprintf(stderr, "ds4: ixcheck width=%u start=%u ratio=%u visible=%llu gemm!=wmma=%llu gemm!=ref=%llu wmma!=ref=%llu inexact_dot=%llu offgrid_key_blocks=%llu offgrid_q_blocks=%llu\n",
+                        width, start, ratio, h[0], h[1], h[2], h[3], h[4], h[5], h[6]);
+        }
+        cudaFree(alt); cudaFree(cnt);
     }
     return 1;
 }
@@ -607,6 +629,12 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores, const 
         !cuda_tensor_has_elems2(q, rows, 32u * 128u, 4u) ||
         !cuda_tensor_has_elems2(keys, source_rows, 128u, 4u) ||
         !cuda_tensor_has_elems2(weights, rows, 32u, 4u)) return 0;
+    if (ds4_rocm_is_gfx1151() && !g_quality_mode && rows >= 16u && v41_indexer_wmma_enabled()) {
+        v41_ix_dispatch_note(V41_IX_DISP_WIDE_GEMM, source_rows, rows, start, ratio);
+        if (!v41_indexer_wmma_launch((float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+            (const float *)keys->ptr, NULL, source_rows, rows, start, ratio)) return 0;
+        return cuda_ok(cudaGetLastError(), "V4.1 fused WMMA indexer");
+    }
     if (ds4_rocm_is_gfx1151()) {
         /* Small query tiles favor wave scoring. GEMM uses a bounded head tile
          * only for the wide, nearly fully visible batches qualified here. */
@@ -2582,6 +2610,12 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_batch_fp4(ds4_gpu_tensor *scores,
         !cuda_tensor_has_elems2(keys, source_rows, 128u, 4u) ||
         !cuda_tensor_has_elems2(weights, rows, 32u, 4u) ||
         packed->bytes < (uint64_t)source_rows * DS4_INDEX_FP4_KEY_BYTES) return 0;
+    if (!g_quality_mode && rows >= 16u && v41_indexer_wmma_enabled() && ds4_rocm_is_gfx1151()) {
+        v41_ix_dispatch_note(V41_IX_DISP_WIDE_GEMM, source_rows, rows, start, ratio);
+        if (!v41_indexer_wmma_launch((float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+            (const float *)keys->ptr, (const unsigned char *)packed->ptr, source_rows, rows, start, ratio)) return 0;
+        return cuda_ok(cudaGetLastError(), "V4.1 fused WMMA indexer (packed keys)");
+    }
     if (!ds4_rocm_is_gfx1151()) return ds4_gpu_dsv41_indexer_scores_batch(
         scores, q, weights, keys, source_rows, rows, start, ratio);
     const uint32_t head_cap = v41_indexer_wide_head_enabled() ? 131072u : 65536u;

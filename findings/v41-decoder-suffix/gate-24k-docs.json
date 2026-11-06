@@ -1,0 +1,30 @@
+{
+ "ok": true,
+ "gate": "bit_exact",
+ "verdict": "fail",
+ "dir_a": "/tmp/claude-1000/-home-dani-code-v4-1-ds4/61379bf4-55c3-4458-bd03-0bc74443268f/scratchpad/q/docs-off/logits",
+ "dir_b": "/tmp/claude-1000/-home-dani-code-v4-1-ds4/61379bf4-55c3-4458-bd03-0bc74443268f/scratchpad/q/docs-on/logits",
+ "files_compared": 1,
+ "kinds": [
+  "frontier"
+ ],
+ "missing_in_one_side": [],
+ "failed": [
+  "frontier_024576.logits.json"
+ ],
+ "worst_max_abs": 0.3956775699999997,
+ "rows": [
+  {
+   "file": "frontier_024576.logits.json",
+   "exact": false,
+   "n_diff": 129280,
+   "max_abs": 0.3956775699999997,
+   "nonfinite_mismatch": 0,
+   "argmax_equal": true,
+   "topk_order_equal": false,
+   "topk_set_equal": true
+  }
+ ],
+ "rows_omitted": 0,
+ "coverage_note": "only prefill-frontier logits compared: this does NOT verify decode-only code paths (single-row kernels)"
+}

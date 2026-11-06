@@ -62,6 +62,7 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
+    const char *dump_session_payload_dir;
     ds4_dist_options dist;
     ds4_tp_options tp;
     bool warm_weights;
@@ -336,6 +337,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-session-payload-dir")) {
+            c.dump_session_payload_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--expert-profile")) {
             c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -564,6 +567,51 @@ static int write_frontier_logits_json(
     }
     free(logits);
     return 0;
+}
+
+/* Persist the exact DS4 state after a frontier for differential checks.  The
+ * payload is staged in /tmp, then renamed into the caller's directory. */
+static int write_session_payload_file(const bench_config *cfg,
+                                      ds4_session *session,
+                                      int frontier,
+                                      const char *tag,
+                                      char *err, size_t errlen) {
+    if (!cfg->dump_session_payload_dir) return 0;
+    const char *dir = cfg->dump_session_payload_dir;
+    if (strlen(dir) > (size_t)PATH_MAX - 64) {
+        snprintf(err, errlen, "session payload directory is too long");
+        return 1;
+    }
+    char path[PATH_MAX];
+    const int n = snprintf(path, sizeof(path), "%s/session_%06d_%s.payload",
+                           dir, frontier, tag);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        snprintf(err, errlen, "session payload path is too long");
+        return 1;
+    }
+    ds4_session_payload_file staged = {0};
+    if (ds4_session_stage_payload(session, &staged, err, errlen) != 0) return 1;
+    /* /tmp and the checkout can live on different filesystems: copy, do not
+     * rename the staged file across a device boundary. */
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        const int saved = errno;
+        ds4_session_payload_file_free(&staged);
+        snprintf(err, errlen, "failed to open session payload file: %s",
+                 strerror(saved));
+        return 1;
+    }
+    int rc = ds4_session_write_staged_payload(&staged, fp, err, errlen);
+    if (rc == 0 && fflush(fp) != 0) {
+        snprintf(err, errlen, "failed to flush session payload file");
+        rc = 1;
+    }
+    if (fclose(fp) != 0 && rc == 0) {
+        snprintf(err, errlen, "failed to close session payload file");
+        rc = 1;
+    }
+    ds4_session_payload_file_free(&staged);
+    return rc;
 }
 
 static int parse_ctx_frontiers(const char *s, int **out, int *len) {
@@ -927,6 +975,12 @@ int main(int argc, char **argv) {
         if (getenv("DS4_METAL_CB_TIMES"))
             fprintf(stderr, "ds4-bench: prefill window mono %.1f .. %.1f ms\n",
                     prefill_t0 * 1e3, prefill_t1 * 1e3);
+        if (write_session_payload_file(&cfg, session, frontier, "prefill",
+                                       err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4-bench: dump prefill payload at %d failed: %s\n", frontier, err);
+            rc = 1;
+            break;
+        }
         const int prefill_tokens = frontier - previous;
         fprintf(stderr,
                 "ds4-bench: prefill frontier=%d tokens=%d ms=%.3f tps=%.2f\n",
@@ -1092,6 +1146,12 @@ int main(int argc, char **argv) {
         }
         free(gen_token_buf);
         if (rc != 0) break;
+        if (write_session_payload_file(&cfg, session, frontier, "gen",
+                                       err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4-bench: dump generation payload at %d failed: %s\n", frontier, err);
+            rc = 1;
+            break;
+        }
 
         if (!need_restore_after_generation) {
             /* Nothing later depends on the frontier state. */
@@ -1107,6 +1167,13 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+        }
+        if (need_restore_after_generation &&
+            write_session_payload_file(&cfg, session, frontier, "restored",
+                                       err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4-bench: dump restored payload at %d failed: %s\n", frontier, err);
+            rc = 1;
+            break;
         }
 
         const double gen_sec = gen_t1 - gen_t0;

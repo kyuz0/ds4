@@ -7072,6 +7072,45 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
+/* Small asynchronous readback: copy into a pinned buffer on the null stream
+ * and record an event, so later null-stream work keeps the GPU busy while the
+ * host waits for just this copy. One outstanding read at a time. */
+static void *g_async_read_host;
+static cudaEvent_t g_async_read_event;
+static uint64_t g_async_read_bytes;
+extern "C" int ds4_gpu_tensor_read_async_begin(const ds4_gpu_tensor *tensor,
+                                               uint64_t offset, uint64_t bytes) {
+    if (!tensor || offset > tensor->bytes || bytes > tensor->bytes - offset ||
+        bytes == 0u || bytes > 4096u) return 0;
+    if (!g_async_read_host &&
+        !cuda_ok(cudaMallocHost(&g_async_read_host, 4096), "async read host")) return 0;
+    if (!g_async_read_event &&
+        !cuda_ok(cudaEventCreateWithFlags(&g_async_read_event, cudaEventDisableTiming),
+                 "async read event")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(g_async_read_host, (const char *)tensor->ptr + offset,
+                                 (size_t)bytes, cudaMemcpyDeviceToHost, 0),
+                 "async read enqueue") ||
+        !cuda_ok(cudaEventRecord(g_async_read_event, 0), "async read record")) return 0;
+    g_async_read_bytes = bytes;
+    return 1;
+}
+extern "C" int ds4_gpu_tensor_read_async_end(void *data, uint64_t bytes) {
+    if (!data || bytes != g_async_read_bytes || !g_async_read_event) return 0;
+    if (!cuda_ok(cudaEventSynchronize(g_async_read_event), "async read wait")) return 0;
+    memcpy(data, g_async_read_host, (size_t)bytes);
+    g_async_read_bytes = 0;
+    return 1;
+}
+
+extern "C" int ds4_gpu_host_malloc(void **out, uint64_t bytes) {
+    if (!out || bytes == 0u) return 0;
+    return cuda_ok(cudaMallocHost(out, (size_t)bytes), "host allocation");
+}
+
+extern "C" void ds4_gpu_host_free(void *p) {
+    if (p) (void)cudaFreeHost(p);
+}
+
 /* Opt-in tally: how much of the copy traffic comes through this API versus
  * rocclr-internal copies. DS4_ROCM_COPY_TALLY=1 prints one line at exit. */
 static uint64_t g_copy_tally_calls;

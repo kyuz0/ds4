@@ -18666,6 +18666,17 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
     return metal_graph_ensure_batch_ffn_out_on(g, g->active_tier);
 }
 
+/* ROCm: the decoder suffix (layers 20-39 recompute only their sliding-window
+ * tail, at least DS4_ROCM_V41_SUFFIX_MIN_ROWS=4096) is the default. It changes
+ * results only at rounding level: long-prefix perplexity on prose/code/docs moved
+ * -0.58/+0.03/+0.19 % (2026-11-06, findings/v41-claude-session-20261106.md).
+ * DS4_METAL_V41_DECODER_SUFFIX=0 disables. */
+#ifdef DS4_ROCM_BUILD
+#define DS41_DECODER_SUFFIX_DEFAULT true
+#else
+#define DS41_DECODER_SUFFIX_DEFAULT false
+#endif
+
 static bool metal_graph_tp_env_flag(const char *name, bool dflt) {
     const char *env = getenv(name);
     if (!env || !env[0]) return dflt;
@@ -41209,13 +41220,34 @@ static bool ds41_attention_pick_run(ds41_gpu_graph *g, uint32_t il, uint32_t n_c
 #endif
 }
 
-/* Opt-in: score the decode path from the packed 68-byte index keys instead of the
- * 512-byte F32 cache. Read once; the packed cache is written by both publishers. */
+/* Score the decode path from the packed 68-byte index keys instead of the
+ * 512-byte F32 cache (bit-identical). Default on for ROCm; DS4_ROCM_V41_INDEX_FP4=0
+ * disables it. Read once; the packed cache is written by both publishers. */
 static bool ds41_index_fp4_keys(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("DS4_ROCM_V41_INDEX_FP4");
+#ifdef DS4_ROCM_BUILD
+        cached = (v && *v == '0') ? 0 : 1;
+#else
         cached = (v && *v && *v != '0') ? 1 : 0;
+#endif
+    }
+    return cached == 1;
+}
+
+/* The fused WMMA prefill scorer (ROCm default) reads the packed keys;
+ * DS4_ROCM_V41_INDEX_WMMA=0 disables it, =3 keeps it on the F32 keys. */
+static bool ds41_index_wmma_packed(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROCM_V41_INDEX_WMMA");
+#ifdef DS4_ROCM_BUILD
+        cached = (!v || !*v || v[0] == '1') ? 1 : 0;
+#else
+        (void)v;
+        cached = 0;
+#endif
     }
     return cached == 1;
 }
@@ -41395,16 +41427,37 @@ static bool ds41_stream_table(const ds4_model *m, const ds4_layer_weights *l,
     return true;
 }
 
-static bool ds41_stream_selected_begin(ds41_gpu_graph *g, const ds4_model *m,
-                                        const ds4_layer_weights *l, uint32_t il) {
+/* Queue the routing-independent shared expert before waiting for the selected
+ * ids, so the GPU computes it while the host reads the ids back and resolves the
+ * expert cache. Same kernels and buffers, different issue order (bit-identical).
+ * Default on; DS4_ROCM_V41_SHARED_FIRST=0 disables it. */
+static bool ds41_shared_first(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROCM_V41_SHARED_FIRST");
+        cached = (v && v[0] == '0') ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+static bool ds41_stream_selected_begin_ids(ds41_gpu_graph *g, const ds4_model *m,
+                                           const ds4_layer_weights *l, uint32_t il,
+                                           bool async_pending) {
     ds4_gpu_stream_expert_table table;
     int32_t selected[6];
-    if (!ds41_stream_table(m, l, il, &table) ||
-        !ds4_gpu_tensor_read(g->selected, 0, selected, sizeof(selected))) return false;
+    if (!ds41_stream_table(m, l, il, &table)) return false;
+    if (async_pending ? !ds4_gpu_tensor_read_async_end(selected, sizeof(selected))
+                      : !ds4_gpu_tensor_read(g->selected, 0, selected, sizeof(selected)))
+        return false;
     for (uint32_t i = 0; i < 6; i++)
         if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) return false;
     return ds4_gpu_routed_moe_set_selected_override(selected, 6) &&
         ds4_gpu_stream_expert_cache_begin_selected_load(&table, selected, 6);
+}
+
+static bool ds41_stream_selected_begin(ds41_gpu_graph *g, const ds4_model *m,
+                                        const ds4_layer_weights *l, uint32_t il) {
+    return ds41_stream_selected_begin_ids(g, m, l, il, false);
 }
 #endif
 
@@ -41435,7 +41488,11 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (profile) ok = ds41_decode_stage_profile_mark("moe_route", il, start, ok);
     if (!ok) return false;
 #ifdef DS4_ROCM_BUILD
-    if (g->streaming && !prefetched) {
+    const bool shared_first = g->streaming && !prefetched && g->tp_world == 1u &&
+        !profile && ds41_shared_first();
+    if (shared_first && !ds4_gpu_tensor_read_async_begin(g->selected, 0,
+                                                         6u * sizeof(int32_t))) return false;
+    if (g->streaming && !prefetched && !shared_first) {
         start = now_sec();
         ok = ds41_stream_selected_begin(g, m, l, il);
         if (profile) ok = ds41_decode_stage_profile_mark(
@@ -41500,6 +41557,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     }
     if (profile) shared_ok = ds41_decode_stage_profile_mark("moe_shared", il, start, shared_ok);
     if (!shared_ok) return false;
+#ifdef DS4_ROCM_BUILD
+    if (shared_first && !ds41_stream_selected_begin_ids(g, m, l, il, true)) return false;
+#endif
     start = now_sec();
     bool routed_ok;
 #ifdef DS4_ROCM_BUILD
@@ -41572,6 +41632,20 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
               ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                       m, w, g->norm, 1);
+#ifdef DS4_ROCM_BUILD
+    if (ds41_leaf_profile_on()) {
+        const double sync_t0 = now_sec();
+        if (!ds4_gpu_end_commands()) ok = false;
+        (void)ds4_gpu_v41_leaf_host_note("host_final_sync",
+                                         (now_sec() - sync_t0) * 1000.0);
+        const double read_t0 = now_sec();
+        const bool read_ok = ok && ds4_gpu_tensor_read(g->logits, 0, logits,
+                                     (uint64_t)DS4_N_VOCAB * sizeof(float));
+        (void)ds4_gpu_v41_leaf_host_note("host_logits_read",
+                                         (now_sec() - read_t0) * 1000.0);
+        return read_ok;
+    }
+#endif
     if (!ds4_gpu_end_commands()) ok = false;
     return ok && ds4_gpu_tensor_read(g->logits, 0, logits,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
@@ -41844,7 +41918,7 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
         bool ok = q && weights && (packed ?
             ds4_gpu_dsv41_indexer_scores_packed(g->index_scores, q, weights,
                 g->index_cache[owner], g->index_packed, n_comp, rows, start + off, ratio, count, off) :
-            (ds41_index_fp4_keys()
+            ((ds41_index_fp4_keys() || ds41_index_wmma_packed())
                 ? ds4_gpu_dsv41_indexer_scores_batch_fp4(g->index_scores, q, weights,
                       g->index_cache_fp4[owner], g->index_cache[owner], n_comp, rows, start + off, ratio)
                 : ds4_gpu_dsv41_indexer_scores_batch(g->index_scores,
@@ -42748,6 +42822,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         (g->tp_world == 1u && !g->streaming && !g->quality && !g->imatrix &&
          !g->image_count && !g_expert_profile.active &&
          !getenv("DS4_ROCM_DISABLE_V41_RESIDENT_QUEUE")) ||
+        /* With SSD streaming, every expert-cache lookup, eviction and upload
+         * happens after the blocking selected-id readback, which already orders
+         * all earlier null-stream work. The per-layer drain is then redundant;
+         * keep only the Engram and final-token drains. Default on;
+         * DS4_ROCM_V41_STREAM_QUEUE=0 restores per-layer drains. */
+        (g->tp_world == 1u && g->streaming && !g->quality && !g->imatrix &&
+         !g->image_count && !g_expert_profile.active && !g->draft &&
+         !(getenv("DS4_ROCM_V41_STREAM_QUEUE") &&
+           getenv("DS4_ROCM_V41_STREAM_QUEUE")[0] == '0')) ||
 #endif
         (g->tp_world == 2 && !g->imatrix &&
          !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"));
@@ -42779,6 +42862,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
+        /* Keep the Engram-overwrite and final-token drains always. Per-layer drains
+         * only when this layer's ordered command buffer can have streamed work in
+         * it; a fully resident layer enqueues and completes without a read pool. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
 #ifdef DS4_ROCM_BUILD
         if (drain && ds41_leaf_profile_on()) {
@@ -43843,7 +43929,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
      * correction cannot be exact. Keep the unqualified path opt-in and use the
      * full decoder body by default. */
     const bool decoder_suffix = wide && total_count >= 8192u &&
-        metal_graph_tp_env_flag("DS4_METAL_V41_DECODER_SUFFIX", false) &&
+        metal_graph_tp_env_flag("DS4_METAL_V41_DECODER_SUFFIX", DS41_DECODER_SUFFIX_DEFAULT) &&
         !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
 #ifdef DS4_ROCM_BUILD
@@ -43955,7 +44041,23 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
-            const uint32_t needed = 1u + (DS4_N_LAYER - 1u - il) * 127u;
+            uint32_t needed = 1u + (DS4_N_LAYER - 1u - il) * 127u;
+#ifdef DS4_ROCM_BUILD
+            /* Keep at least the last prefill chunk per layer: the expert-cache
+             * seed below ranks experts from these rows' routes, and a tail of a
+             * few rows leaves layers 20-39 cold for decode (+74 % misses; 2048 rows: +15 %,
+             * 4096 rows: -12 % vs the full decoder at 24K). */
+            {
+                static int min_rows = -1;
+                if (min_rows < 0) {
+                    const char *v = getenv("DS4_ROCM_V41_SUFFIX_MIN_ROWS");
+                    min_rows = v && *v ? atoi(v) : 4096;
+                    if (min_rows < 0) min_rows = 0;
+                }
+                if (needed < (uint32_t)min_rows) needed = (uint32_t)min_rows;
+                if (needed > total_count - 127u) needed = total_count - 127u;
+            }
+#endif
             first = total_count - needed;
             if (ok) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                 first - 127u, 127u, false, batch_hc, batch_attention, cancel, cancel_ud);
@@ -62902,6 +63004,7 @@ struct ds4_session {
     size_t sync_image_count;
     token_vec greedy_splitkv_segment;
     float *logits;
+    bool logits_pinned;
     float *sample_probs;
     float *mtp_logits;
     int greedy_splitkv_anchor_len;
@@ -65087,6 +65190,18 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             rc = payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
                                            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
         free(buf);
+#ifdef DS4_ROCM_BUILD
+        /* The packed FP4 index keys are derived state, not part of the
+         * payload: rebuild them from the restored F32 caches. */
+        for (uint32_t i = 0; i < 4 && !rc; i++) {
+            const uint32_t live = pos / (i < 3 ? 2u : 1u);
+            if (live && !ds4_gpu_dsv41_index_fp4_pack(g->index_cache_fp4[i],
+                                                     g->index_cache[i], live, 0u, 0u)) {
+                payload_set_err(err, errlen, "failed to rebuild V4.1 packed index keys");
+                rc = 1;
+            }
+        }
+#endif
         if (!rc) {
             ds41_graph_reset(g);
             for (uint32_t i = 0; i < 3 && i < pos; i++)
@@ -75847,6 +75962,34 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+static float *ds4_session_logits_alloc(size_t bytes, bool *pinned) {
+#ifdef DS4_ROCM_BUILD
+    const char *pin_env = getenv("DS4_V41_LOGITS_PIN");
+    if (pin_env && pin_env[0] == '1') {
+        void *p = NULL;
+        if (ds4_gpu_host_malloc(&p, (uint64_t)bytes)) {
+            *pinned = true;
+            return (float *)p;
+        }
+    }
+#endif
+    *pinned = false;
+    return xmalloc(bytes);
+}
+
+static void ds4_session_logits_free(ds4_session *s) {
+    if (!s || !s->logits) return;
+#ifdef DS4_ROCM_BUILD
+    if (s->logits_pinned) {
+        ds4_gpu_host_free(s->logits);
+        s->logits = NULL;
+        return;
+    }
+#endif
+    free(s->logits);
+    s->logits = NULL;
+}
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -75948,7 +76091,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             }
         }
         s->prefill_cap = s->ds41_graph.prefill_cap;
-        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        bool logits_pinned = false;
+        s->logits = ds4_session_logits_alloc((size_t)DS4_N_VOCAB * sizeof(float),
+                                             &logits_pinned);
+        s->logits_pinned = logits_pinned;
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         e->ds41_session_bytes += s->ds41_graph.allocation_bytes;
         if (!ds4_session_tp_register(s)) {
@@ -76159,7 +76305,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 glm_graph_free(&s->glm_graph);
                 free(s->glm_mtp_hc);
                 free(s->glm_mtp_logits0);
-                free(s->logits);
+                ds4_session_logits_free(s);
                 free(s->sample_probs);
                 free(s);
                 return 1;
@@ -76325,7 +76471,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                     "ds4: failed to create distributed coordinator session: %s\n",
                     err[0] ? err : "unknown error");
             metal_graph_free(&s->graph);
-            free(s->logits);
+            ds4_session_logits_free(s);
             free(s->sample_probs);
             free(s->mtp_logits);
             free(s->spec_row_logits);
@@ -76403,7 +76549,7 @@ void ds4_session_free(ds4_session *s) {
     token_vec_free(&s->checkpoint);
     token_vec_free(&s->greedy_splitkv_segment);
     free(s->checkpoint_images);
-    free(s->logits);
+    ds4_session_logits_free(s);
     free(s->sample_probs);
 #ifndef DS4_NO_GPU
     free(s->glm_mtp_hc);
@@ -78521,7 +78667,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 ds41_prefill_count(g, remaining);
             const bool defer_decoder = !g->encoder_resident && count >= 16384u &&
                 remaining - count >= 8192u &&
-                metal_graph_tp_env_flag("DS4_METAL_V41_DECODER_SUFFIX", false) &&
+                metal_graph_tp_env_flag("DS4_METAL_V41_DECODER_SUFFIX", DS41_DECODER_SUFFIX_DEFAULT) &&
                 !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX") &&
                 !getenv("DS4_METAL_DISABLE_V41_DEFER_DECODER");
             /* Never add an encoder sweep just to defer the decoder. A short
@@ -79539,11 +79685,39 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+#ifdef DS4_ROCM_BUILD
+    if (ds41_leaf_profile_on()) {
+        const double t0 = now_sec();
+        const int r = sample_argmax(s->logits, DS4_N_VOCAB);
+        (void)ds4_gpu_v41_leaf_host_note("host_argmax", (now_sec() - t0) * 1000.0);
+        return r;
+    }
+#endif
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+#ifdef DS4_ROCM_BUILD
+    if (ds41_leaf_profile_on()) {
+        const double t0 = now_sec();
+        int r;
+        if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
+            r = argmax_f32_excluding_unrolled8(
+                    s->logits, DS4_N_VOCAB, excluded_id);
+        } else {
+            r = -1;
+            float best_logit = DS4_NEG_INF;
+            for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+                if ((int)i == excluded_id) continue;
+                const float v = s->logits[i];
+                if (r < 0 || v > best_logit) { r = (int)i; best_logit = v; }
+            }
+        }
+        (void)ds4_gpu_v41_leaf_host_note("host_argmax", (now_sec() - t0) * 1000.0);
+        return r;
+    }
+#endif
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
                 s->logits, DS4_N_VOCAB, excluded_id);
@@ -79593,6 +79767,16 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+#ifdef DS4_ROCM_BUILD
+    if (ds41_leaf_profile_on()) {
+        const double t0 = now_sec();
+        const int r = sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature,
+                                         top_k, top_p, min_p, rng,
+                                         s->sample_probs);
+        (void)ds4_gpu_v41_leaf_host_note("host_sample", (now_sec() - t0) * 1000.0);
+        return r;
+    }
+#endif
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }

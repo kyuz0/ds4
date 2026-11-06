@@ -45,6 +45,13 @@ typedef struct {
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
+#ifdef DS4_ROCM_BUILD
+int ds4_gpu_host_malloc(void **out, uint64_t bytes);
+int ds4_gpu_tensor_read_async_begin(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
+int ds4_gpu_tensor_read_async_end(void *data, uint64_t bytes);
+void ds4_gpu_host_free(void *p);
+#endif
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
