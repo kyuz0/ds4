@@ -1253,6 +1253,18 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(),
                                  "routed_moe streaming batch missing gate/up launch");
                 }
+            } else if (n_tokens <= 8u && stream_batch_unique != 0u &&
+                       !getenv("DS4_ROCM_DISABLE_MOE_UNIQUE_BATCH")) {
+                /* Small batches (DSpark verify): read each unique expert once. */
+                moe_gate_up_mid_unique_ptrs_kernel<8u><<<dim3((expert_mid_dim + 127u) / 128u,
+                                                             stream_batch_unique, 1), 256>>>(
+                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                        gate_slot_ptrs, up_slot_ptrs, xq,
+                        (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
+                        gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        (uint32_t)pair_count, clamp);
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe streaming batch unique gate/up launch");
             } else {
                 moe_gate_up_mid_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,

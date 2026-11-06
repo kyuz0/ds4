@@ -42800,10 +42800,21 @@ static bool ds41_draft_slots(ds41_gpu_graph *g, uint32_t pos,
     return true;
 }
 
+/* Opt-in (DS4_ROCM_V41_DSPARK_SSD=1): allow V4.1 DSpark drafting with SSD expert
+ * streaming. The verify rows go through the streamed expert cache. */
+static bool ds41_dspark_ssd_allowed(void) {
+#ifdef DS4_ROCM_BUILD
+    const char *v = getenv("DS4_ROCM_V41_DSPARK_SSD");
+    return v && v[0] == '1';
+#else
+    return false;
+#endif
+}
+
 static bool ds41_draft_init(ds41_gpu_graph *g,
                             const ds4_dspark_weights *dw,
                             const ds4_model *dm) {
-    if (g->streaming || !dw->n_stages || !dw->block_size ||
+    if ((g->streaming && !ds41_dspark_ssd_allowed()) || !dw->n_stages || !dw->block_size ||
         dw->block_size > DS4_DSPARK_MAX_BLOCK_SIZE ||
         !dw->target_layer_count || dw->missing_tensors ||
         dw->invalid_tensors || dw->metadata_errors || !dw->n_expert ||
@@ -44699,7 +44710,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             profile_t0 = now_sec();
         }
 #endif
-        if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner, false);
+        /* DSpark verify under SSD streaming: stage the rows' selected experts on
+         * the loader thread while the shared expert runs (opt-in path). */
+        if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner,
+                                    g->streaming && g->draft && ds41_dspark_ssd_allowed() &&
+                                    !getenv("DS4_ROCM_V41_DSPARK_SSD_SYNC_VERIFY"));
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
@@ -73671,7 +73686,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const bool resident_dspark = opt->dspark && opt->mtp_path &&
-            opt->mtp_path[0] && !opt->ssd_streaming &&
+            opt->mtp_path[0] && (!opt->ssd_streaming || ds41_dspark_ssd_allowed()) &&
             !opt->cuda_tensor_parallel &&
             (!gpu_cfg || gpu_cfg->n_gpus <= 1);
 #ifdef DS4_ROCM_BUILD
@@ -74225,7 +74240,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        if (e->ssd_streaming) {
+        if (e->ssd_streaming && !(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+                                  opt->dspark && ds41_dspark_ssd_allowed())) {
             fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp-model yet\n");
             ds4_engine_close(e);
             *out = NULL;

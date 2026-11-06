@@ -169,3 +169,27 @@ noise-level). A long-running server reuses cached experts during prefill and rea
 
 Rejected: spin-waiting the decode readback (`DS4_ROCM_ASYNC_READ_SPIN=1`, neutral at 24K
 and 120K).
+
+## 10. DSpark + SSD streaming (opt-in, in progress)
+
+Drafter: `kernelpool/DeepSeek-V4.1-Flash-MXFP4-GGUF` @22a073e, `DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf`,
+SHA-256 7a2217ca…d4b5 (matches docs/STRIX_HALO.md), in /home/dani/models/deepseek-v4.1/.
+Needs an 86 GB expert cache (92 GB exceeds the planner with the 7.4 GiB drafter).
+
+Enable: `DS4_ROCM_V41_DSPARK_SSD=1 DS4_ROCM_V41_DSPARK_SSD_SYNC_VERIFY=1 ds4-bench ... --mtp-model DRAFTER --dspark`
+(opens the three SSD gates: engine open, --mtp-model check, ds41_draft_init).
+
+Code prompt (ds4.c), 8K, 128 greedy tokens: acceptance 66 %, ~2.9-3.0 draft tokens accepted per
+cycle; generated text identical to plain decode in every arm.
+
+| arm | decode tps |
+|---|---|
+| plain decode | 11.84 |
+| DSpark scalar verify | 7.05 (verifies rows one by one) |
+| DSpark batched verify, async selective stage | 3.39 (stage path re-reads experts) |
+| batched verify, synchronous selected prepare | 11.45 |
+| + unique-expert gate/up kernel (decode each IQ2 block once, integer dot per row) | **12.70** |
+
+Verify cycle (6 rows) ~290 ms: gate/up ~52, down ~48 (per-(row,expert), rounding-level fix possible),
+SSD-miss stalls ~52 (staged reads + H2D copies, ~23 experts/layer touched), dense 6-row GEMVs ~24,
+attention ~17. Target for ~20 tok/s on code: ~160 ms per cycle.
