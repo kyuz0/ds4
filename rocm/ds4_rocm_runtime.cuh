@@ -2624,7 +2624,9 @@ static int cuda_stream_read_jobs_start(cuda_stream_read_job *jobs, uint32_t coun
         return 0;
     }
     cuda_stream_read_profile_note_jobs(jobs, count);
-    g_stream_read_active_limit = count > DS4_ROCM_N_EXPERT_USED * 3u ?
+    /* Only full-layer prefill loads (hundreds of jobs) are capped; decode misses
+     * (<= 18 jobs) and DSpark verify misses (a few dozen) keep the whole pool. */
+    g_stream_read_active_limit = count > 64u ?
         cuda_stream_layer_read_workers() : UINT32_MAX;
     g_stream_read_active_jobs = jobs;
     g_stream_read_active_count = count;

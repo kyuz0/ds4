@@ -1174,7 +1174,8 @@ __global__ static void moe_gate_up_mid_unique_ptrs_kernel(
         const char * const *gate_slots, const char * const *up_slots,
         const cuda_block_q8_K *xq, const int32_t *selected, const float *weights,
         uint64_t gate_row_bytes, uint32_t xq_blocks, uint32_t expert_mid_dim,
-        uint32_t n_expert, uint32_t n_pairs, float clamp) {
+        uint32_t n_expert, uint32_t n_pairs, float clamp,
+        const uint8_t *pair_missing = NULL, uint32_t want_missing = 0u) {
     __shared__ uint32_t pairs[MAXP];
     __shared__ uint32_t npairs;
     __shared__ uint64_t s_grid[256];
@@ -1187,7 +1188,8 @@ __global__ static void moe_gate_up_mid_unique_ptrs_kernel(
         for (uint32_t p = 0; p < n_pairs && n < MAXP; p++) {
             int32_t si = selected[p];
             if (si < 0) si = 0;
-            if ((uint32_t)si == u) pairs[n++] = p;
+            if ((uint32_t)si == u &&
+                (!pair_missing || (uint32_t)(pair_missing[p] != 0u) == want_missing)) pairs[n++] = p;
         }
         npairs = n;
     }

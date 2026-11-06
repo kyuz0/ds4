@@ -42315,6 +42315,7 @@ static bool ds41_stream_stage_selected_join(const ds4_model *m,
                                              ds41_stream_layer_load *stage);
 #endif
 
+static bool ds41_dspark_ssd_allowed(void);
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner, bool stage_selected) {
@@ -42325,6 +42326,18 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     bool ok = ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
         ds41_route_batch(g, m, l, count);
 #ifdef DS4_ROCM_BUILD
+    /* Opt-in DSpark verify under SSD streaming: start the rows' selected-expert
+     * loads right after routing (waiting only on the router), so missing-expert
+     * reads overlap the shared expert and the resident-expert compute (the
+     * routed launch then takes the resident/missing split path). */
+    if (ok && !stage_selected && g->streaming && g->draft && count > 1u && count <= 8u &&
+        ds41_dspark_ssd_allowed() && getenv("DS4_ROCM_V41_DSPARK_SSD_PREFETCH")) {
+        int32_t ids[8u * 6u];
+        ds4_gpu_stream_expert_table table;
+        if (DS4_N_EXPERT_USED == 6u && ds41_stream_table(m, l, il, &table) &&
+            ds4_gpu_tensor_read(b->selected, 0, ids, (uint64_t)count * 6u * sizeof(int32_t)))
+            (void)ds4_gpu_stream_expert_cache_prepare_selected_batch(&table, ids, count, 6u);
+    }
     ds41_stream_layer_load selected_stage = {0};
     bool selected_stage_started = false;
     if (ok && stage_selected) {

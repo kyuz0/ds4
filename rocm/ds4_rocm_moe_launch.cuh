@@ -1206,7 +1206,19 @@ static int routed_moe_launch(
         if (ok && (batch_stream_selected || batch_stream_split_selected)) {
             dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
             if (batch_stream_split_selected) {
-                if (stream_batch_resident_count != 0u) {
+                const bool unique_split = n_tokens <= 8u && stream_batch_unique != 0u &&
+                    !getenv("DS4_ROCM_DISABLE_MOE_UNIQUE_BATCH");
+                const dim3 ugrid((expert_mid_dim + 127u) / 128u, stream_batch_unique, 1);
+                if (stream_batch_resident_count != 0u && unique_split) {
+                    moe_gate_up_mid_unique_ptrs_kernel<8u><<<ugrid, 256>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            resident_gate_slot_ptrs, resident_up_slot_ptrs, xq,
+                            (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
+                            gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            (uint32_t)pair_count, clamp, stream_batch_pair_missing, 0u);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe streaming batch resident unique gate/up launch");
+                } else if (stream_batch_resident_count != 0u) {
                     moe_gate_up_mid_qwarp32_ptrs_split_kernel<<<qgrid, 256>>>(
                             (float *)gate->ptr,
                             (float *)up->ptr,
@@ -1232,7 +1244,16 @@ static int routed_moe_launch(
                 } else {
                     ok = cuda_stream_batch_selected_finish_pending_missing();
                 }
-                if (ok && stream_batch_missing_count != 0u) {
+                if (ok && stream_batch_missing_count != 0u && unique_split) {
+                    moe_gate_up_mid_unique_ptrs_kernel<8u><<<ugrid, 256>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            missing_gate_slot_ptrs, missing_up_slot_ptrs, xq,
+                            (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
+                            gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            (uint32_t)pair_count, clamp, stream_batch_pair_missing, 1u);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe streaming batch missing unique gate/up launch");
+                } else if (ok && stream_batch_missing_count != 0u) {
                     moe_gate_up_mid_qwarp32_ptrs_split_kernel<<<qgrid, 256>>>(
                             (float *)gate->ptr,
                             (float *)up->ptr,
