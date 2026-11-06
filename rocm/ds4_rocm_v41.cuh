@@ -152,6 +152,67 @@ extern "C" int ds4_gpu_dsv41_norm_bf16(ds4_gpu_tensor *out, ds4_gpu_tensor *x,
     return cuda_ok(cudaGetLastError(), "V4.1 fused norm/bf16");
 }
 
+/* One launch for: hc split/Sinkhorn (thread 0, written to split_out), the HC
+ * weighted sum x[d] = sum_h residual[h][d] * w[h], bf16(x) in place, and
+ * rms_norm(x) * nw -> bf16. Per element and per reduction the arithmetic and
+ * order equal hc_split_sinkhorn_kernel + hc_weighted_sum_kernel +
+ * v41_norm_bf16_kernel<true> (256 norm partials over i = t + 256k, same tree). */
+__global__ __launch_bounds__(1024) static void v41_hc_tail_kernel(
+        float *split_out, const float *mix, const float *hscale, const float *hbase,
+        uint32_t sinkhorn_iters, float hc_eps, const float *w, const float *residual,
+        float *x, float *norm_out, const float *nw, float eps) {
+    constexpr uint32_t N = 5120u;
+    __shared__ float xs[N];
+    __shared__ float partial[256];
+    const uint32_t tid = threadIdx.x;
+    if (tid == 0u) hc4_split_one(split_out, mix, hscale, hbase, sinkhorn_iters, hc_eps);
+    for (uint32_t d = tid; d < N; d += 1024u) {
+        float acc = 0.0f;
+        for (uint32_t h = 0; h < 4u; h++) acc += residual[(uint64_t)h * N + d] * w[h];
+        const float v = v41_bf16(acc);
+        x[d] = v;
+        xs[d] = v;
+    }
+    __syncthreads();
+    if (tid < 256u) {
+        float sum = 0.0f;
+        for (uint32_t i = tid; i < N; i += 256u) {
+            const float v = xs[i];
+            sum += v * v;
+        }
+        partial[tid] = sum;
+    }
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)N + eps);
+    for (uint32_t i = tid; i < N; i += 1024u) norm_out[i] = v41_bf16(xs[i] * scale * nw[i]);
+}
+
+extern "C" int ds4_gpu_dsv41_hc_tail(ds4_gpu_tensor *split_out, const ds4_gpu_tensor *mix,
+        const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset,
+        uint32_t sinkhorn_iters, float hc_eps, const ds4_gpu_tensor *w,
+        const ds4_gpu_tensor *residual, ds4_gpu_tensor *x, ds4_gpu_tensor *norm_out,
+        uint64_t norm_weight_offset, float eps) {
+    if (!split_out || !mix || !w || !residual || !x || !norm_out || !model_map ||
+        !cuda_tensor_has_bytes(mix, 24u * 4u) || !cuda_tensor_has_bytes(split_out, 24u * 4u) ||
+        !cuda_tensor_has_bytes(w, 4u * 4u) || !cuda_tensor_has_f32(residual, 4u * 5120u) ||
+        !cuda_tensor_has_f32(x, 5120u) || !cuda_tensor_has_f32(norm_out, 5120u) ||
+        !cuda_model_range_fits(model_size, scale_offset, 3u * 4u) ||
+        !cuda_model_range_fits(model_size, base_offset, 24u * 4u) ||
+        !cuda_model_range_fits(model_size, norm_weight_offset, 5120u * 4u)) return 0;
+    const float *hs = (const float *)cuda_model_range_ptr(model_map, scale_offset, 12u, "hc_scale");
+    const float *hb = (const float *)cuda_model_range_ptr(model_map, base_offset, 96u, "hc_base");
+    const float *nw = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset, 5120u * 4u, "rms_weight");
+    if (!hs || !hb || !nw) return 0;
+    v41_hc_tail_kernel<<<1, 1024>>>((float *)split_out->ptr, (const float *)mix->ptr, hs, hb,
+        sinkhorn_iters, hc_eps, (const float *)w->ptr, (const float *)residual->ptr,
+        (float *)x->ptr, (float *)norm_out->ptr, nw, eps);
+    return cuda_ok(cudaGetLastError(), "V4.1 fused HC tail");
+}
+
 struct v41_rope_args {
     uint32_t width, heads, start, stride, inverse;
     float frequencies[32];

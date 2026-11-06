@@ -49,6 +49,11 @@ void ds4_gpu_cleanup(void);
 int ds4_gpu_host_malloc(void **out, uint64_t bytes);
 int ds4_gpu_tensor_read_async_begin(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
 int ds4_gpu_tensor_read_async_end(void *data, uint64_t bytes);
+int ds4_gpu_dsv41_hc_tail(ds4_gpu_tensor *split_out, const ds4_gpu_tensor *mix,
+        const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset,
+        uint32_t sinkhorn_iters, float hc_eps, const ds4_gpu_tensor *w,
+        const ds4_gpu_tensor *residual, ds4_gpu_tensor *x, ds4_gpu_tensor *norm_out,
+        uint64_t norm_weight_offset, float eps);
 int ds4_gpu_dsv41_bf16_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                             uint32_t start, bool compressed, bool inverse);
 int ds4_gpu_dsv41_add_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
