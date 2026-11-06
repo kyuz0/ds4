@@ -2639,9 +2639,37 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_one_fp4(ds4_gpu_tensor *scores,
         !cuda_tensor_has_f32(weights, 32u) ||
         packed_keys->bytes < (uint64_t)source_rows * DS4_INDEX_FP4_KEY_BYTES) return 0;
     v41_ix_dispatch_note(V41_IX_DISP_SCALAR_ONE, source_rows, 1u, source_rows - 1u, 1u);
+    static int dcheck = -1;
+    if (dcheck < 0) dcheck = getenv("DS4_ROCM_V41_INDEX_DECODE_CHECK") != NULL;
+    static int decode_wmma = -1;
+    if (decode_wmma < 0) {
+        const char *v = getenv("DS4_ROCM_V41_INDEX_DECODE_WMMA");
+        decode_wmma = (v && v[0] == '0') ? 0 : 1;
+    }
+    if (decode_wmma && v41_indexer_wmma_enabled() && ds4_rocm_is_gfx1151() && !dcheck) {
+        if (!v41_indexer_decode_wmma_launch((float *)scores->ptr, (const float *)q->ptr,
+                (const float *)weights->ptr, (const unsigned char *)packed_keys->ptr, source_rows)) return 0;
+        return cuda_ok(cudaGetLastError(), "V4.1 WMMA decode indexer");
+    }
     v41_indexer_scalar_warp8_fp4_kernel<<<(source_rows + 7u) / 8u, 256>>>(
         (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
         (const unsigned char *)packed_keys->ptr, source_rows, source_rows - 1u, 1u);
+    if (dcheck) {
+        float *alt = NULL;
+        if (cudaMalloc(&alt, (size_t)source_rows * 4u) == cudaSuccess &&
+            v41_indexer_decode_wmma_launch(alt, (const float *)q->ptr, (const float *)weights->ptr,
+                (const unsigned char *)packed_keys->ptr, source_rows)) {
+            float *ha = (float *)malloc((size_t)source_rows * 4u), *hb = (float *)malloc((size_t)source_rows * 4u);
+            if (ha && hb && cudaMemcpy(ha, scores->ptr, (size_t)source_rows * 4u, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                cudaMemcpy(hb, alt, (size_t)source_rows * 4u, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                unsigned bad = 0;
+                for (uint32_t i = 0; i < source_rows; i++) bad += memcmp(&ha[i], &hb[i], 4) != 0;
+                fprintf(stderr, "ds4: ixdecode check width=%u mismatches=%u\n", source_rows, bad);
+            }
+            free(ha); free(hb);
+        }
+        cudaFree(alt);
+    }
     return cuda_ok(cudaGetLastError(), "V4.1 scalar warp indexer (fp4 keys)");
 }
 

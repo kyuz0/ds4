@@ -130,6 +130,8 @@ After: 82.0 ms, 17.1 ms idle, 2170 kernels/token.
 
 | `DS4_ROCM_V41_NORM_FUSE` | one-launch [bf16(x)]→norm→bf16(out); hc_expand + bf16 store (+ 16-byte `pre` copy); q_a/kv rounding folded into the norms; grouped output_a GEMV rounds in its epilogue. ~490 fewer launches/token | ABBA×3 11.90 → 12.05 tps (+1.3 %) |
 
+| `DS4_ROCM_V41_INDEX_DECODE_WMMA` | decode indexer scorer on int8 WMMA (32 heads as M, packed keys, exact combine, reference head order); was 5.4 ms/token at 120K. Check mode `DS4_ROCM_V41_INDEX_DECODE_CHECK=1`: 0 mismatches | 120K gen64 ABBA×2 11.25 → 11.90 tps (+5.8 %) |
+
 Not worth it / rejected: 96 GB cache (misses 827 → 765 per 512 tokens, decode unchanged);
 pipelining `v41_hc_ordered_prefetch_kernel` (no gain, FMA-chain/occupancy bound);
 n-gram speculative decode (expert-union bytes and misses make it ~break-even under SSD

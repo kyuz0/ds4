@@ -225,6 +225,101 @@ static int v41_indexer_wmma_launch(float *out, const float *q, const float *w,
     return 1;
 }
 
+/* Decode (one query row): the 32 heads are the WMMA M dimension (two 16-row
+ * tiles), 128 packed keys per block. Exact block dots + exact combine as above;
+ * each key's 32 head terms are then reduced in head order 0..31 with the
+ * reference non-contracted mul/add. All keys are visible (start = width - 1). */
+__global__ __launch_bounds__(256) static void v41_indexer_decode_wmma_kernel(float *out,
+        const int8_t *qn, const int *qe, const float *w, const unsigned char *packed,
+        unsigned width) {
+#if defined(__gfx1151__)
+    const unsigned tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
+    const unsigned c = blockIdx.x * 128u + wave * 16u + (lane & 15u), khalf = (lane >> 4) * 8u;
+    const bool cv = c < width;
+    __shared__ int eqs[32 * 4];
+    __shared__ float whs[32];
+    if (tid < 128u) eqs[tid] = qe[tid];
+    if (tid < 32u) whs[tid] = w[tid];
+    __syncthreads();
+    v41x_i4 bk[8];
+    int ek[4];
+    const unsigned char *kp = packed + (uint64_t)(cv ? c : 0u) * 68u;
+#pragma unroll
+    for (unsigned b = 0; b < 4u; ++b) {
+        ek[b] = (int)kp[b] - 127;
+#pragma unroll
+        for (unsigned kk = 0; kk < 2u; ++kk) {
+            const unsigned d0 = b * 32u + kk * 16u + khalf;
+            const uint32_t nib = cv ? *reinterpret_cast<const uint32_t *>(kp + 4u + d0 / 2u) : 0u;
+            v41x_i2 o;
+#pragma unroll
+            for (unsigned i = 0; i < 2u; ++i) {
+                uint32_t word = 0;
+#pragma unroll
+                for (unsigned j = 0; j < 4u; ++j) {
+                    const uint32_t code = (nib >> (4u * (4u * i + j))) & 15u;
+                    const int mag = (int)((0xC8643210u >> (4u * (code & 7u))) & 15u);
+                    word |= (uint32_t)(uint8_t)(int8_t)((code & 8u) ? -mag : mag) << (8u * j);
+                }
+                o[i] = (int)word;
+            }
+            bk[2u * b + kk] = v41x_distribute8(o);
+        }
+    }
+    float weighted[2][8];
+#pragma unroll
+    for (unsigned rt = 0; rt < 2u; ++rt) {
+        const int8_t *qrow = qn + (uint64_t)(rt * 16u + (lane & 15u)) * 128u;
+        v41x_i8 d[4];
+#pragma unroll
+        for (unsigned b = 0; b < 4u; ++b) {
+            d[b] = (v41x_i8){};
+#pragma unroll
+            for (unsigned kk = 0; kk < 2u; ++kk) {
+                const unsigned k = 2u * b + kk;
+                const v41x_i2 own = *reinterpret_cast<const v41x_i2 *>(qrow + k * 16u + khalf);
+                d[b] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, v41x_distribute8(own),
+                                                                   true, bk[k], d[b], false);
+            }
+        }
+#pragma unroll
+        for (unsigned i = 0; i < 8u; ++i) {
+            const unsigned h = rt * 16u + 2u * i + (lane >> 4);
+            const int *er = eqs + h * 4u;
+            const float dot = v41x_exact_sum4(d[0][i], d[1][i], d[2][i], d[3][i],
+                er[0] + ek[0] - 2, er[1] + ek[1] - 2, er[2] + ek[2] - 2, er[3] + ek[3] - 2);
+            float wv;
+            asm volatile("v_mul_f32 %0, %1, %2" : "=v"(wv)
+                : "v"(fmaxf(v41_mul(dot, 1.f / 64.f), 0.f)), "v"(whs[h]));
+            weighted[rt][i] = wv;
+        }
+    }
+    /* Lane l < 16 holds even heads of key c, lane l + 16 the odd heads. */
+    float total = 0.0f;
+#pragma unroll
+    for (unsigned rt = 0; rt < 2u; ++rt)
+#pragma unroll
+    for (unsigned i = 0; i < 8u; ++i) {
+        const float odd = __shfl_xor(weighted[rt][i], 16, 32);
+        total = v41_add(total, weighted[rt][i]);   /* head rt*16 + 2i (lanes < 16) */
+        total = v41_add(total, odd);               /* head rt*16 + 2i + 1 */
+    }
+    if (lane < 16u && cv) out[c] = total;
+#endif
+}
+
+static int v41_indexer_decode_wmma_launch(float *out, const float *q, const float *w,
+        const unsigned char *packed, unsigned width) {
+    const uint64_t qn_bytes = 32u * 128u, qe_bytes = 32u * 4u * 4u;
+    char *scratch = (char *)cuda_tmp_alloc(qn_bytes + qe_bytes, "V4.1 WMMA decode indexer queries");
+    if (!scratch) return 0;
+    int8_t *qn = (int8_t *)scratch;
+    int *qe = (int *)(scratch + qn_bytes);
+    v41_indexer_wmma_qprep_kernel<<<128u, 32u>>>(qn, qe, q, 1u);
+    v41_indexer_decode_wmma_kernel<<<(width + 127u) / 128u, 256u>>>(out, qn, qe, w, packed, width);
+    return 1;
+}
+
 static bool v41_indexer_wmma_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
