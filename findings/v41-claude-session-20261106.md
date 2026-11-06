@@ -139,3 +139,20 @@ streaming).
 
 Remaining decode budget (24K, ~81 ms/token): ~53 ms bandwidth-bound GEMVs at 210–220 GB/s,
 ~10 ms small kernels, ~5 ms launch gaps, ~4 ms expert misses (1.6/token).
+
+## 9. Cold prefill is SSD-bound: cap layer-load read concurrency
+
+`DS4_ROCM_STREAM_READ_PROFILE=1`: a cold 24K prefill reads 145 GiB (every layer's 384
+experts; the cache is empty in a fresh process, so layer reuse has 0 hits) and the main
+thread waits 37 s of 79 s. The NVMe (KIOXIA EXCERIA BASIC, DRAM-less) does 4.9 GB/s with
+8 MB sequential reads but the 16-worker pool got ~2 GB/s.
+
+Workers sweep, cold 8K prefill (tps): 1: 214, 2: 228, 3: 229, 4: 231, 8: 220, 16: 202, 18: 197.
+Four workers globally cost decode 2.6 % (misses lose parallelism), so
+`DS4_ROCM_STREAM_LAYER_READ_WORKERS` (default 4) caps only large batches (prefill layer
+loads, > 18 jobs); decode miss batches keep all 16 workers.
+8K gen 256 ABBA×3: prefill 205.9 → 227.5 tps (+10.5 %), decode 12.43 → 12.35 tps (−0.6 %,
+noise-level). A long-running server reuses cached experts during prefill and reads less.
+
+Rejected: spin-waiting the decode readback (`DS4_ROCM_ASYNC_READ_SPIN=1`, neutral at 24K
+and 120K).

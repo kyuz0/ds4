@@ -2341,6 +2341,22 @@ static int cuda_stream_read_job_upload(
     return 1;
 }
 
+/* Workers allowed on the active batch. Large batches (prefill layer loads) are
+ * capped (DS4_ROCM_STREAM_LAYER_READ_WORKERS, default 4): a few large sequential
+ * streams read faster on this NVMe (cold 8K prefill 202 -> 231 tps vs 16), while
+ * decode miss batches (<= 18 jobs) keep the whole pool (4 workers cost -2.6 %
+ * decode). */
+static uint32_t g_stream_read_active_limit = UINT32_MAX;
+static uint32_t cuda_stream_layer_read_workers(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROCM_STREAM_LAYER_READ_WORKERS");
+        cached = v && *v ? atoi(v) : 4;
+        if (cached < 1) cached = 1;
+    }
+    return (uint32_t)cached;
+}
+
 static void *cuda_stream_read_worker(void *arg) {
     const uint32_t worker_id = arg ? *(const uint32_t *)arg : 0u;
     (void)cudaSetDevice(0);
@@ -2348,7 +2364,8 @@ static void *cuda_stream_read_worker(void *arg) {
         pthread_mutex_lock(&g_stream_read_mutex);
         while (!g_stream_read_pool_stop &&
                (!g_stream_read_active_jobs ||
-                g_stream_read_active_next >= g_stream_read_active_count)) {
+                g_stream_read_active_next >= g_stream_read_active_count ||
+                worker_id >= g_stream_read_active_limit)) {
             pthread_cond_wait(&g_stream_read_work_cond, &g_stream_read_mutex);
         }
         if (g_stream_read_pool_stop) {
@@ -2607,6 +2624,8 @@ static int cuda_stream_read_jobs_start(cuda_stream_read_job *jobs, uint32_t coun
         return 0;
     }
     cuda_stream_read_profile_note_jobs(jobs, count);
+    g_stream_read_active_limit = count > DS4_ROCM_N_EXPERT_USED * 3u ?
+        cuda_stream_layer_read_workers() : UINT32_MAX;
     g_stream_read_active_jobs = jobs;
     g_stream_read_active_count = count;
     g_stream_read_active_next = 0;
