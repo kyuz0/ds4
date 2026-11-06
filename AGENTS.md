@@ -42,11 +42,21 @@ Rules learned the hard way in this tree:
 - **New paths are opt-in** (env flag, default off) until `ak ledger check-promote` says
   `may_promote: true`. Promotion means: `implemented → gated → measured → confirmed`, the
   last one in a different session (after a reboot or on another day).
-- **Pick the right gate.** Bit-identical frontier logits are the gate for anything that
-  must not change arithmetic. **Frontier logits are captured at the end of prefill, so they
-  do not verify decode-only paths** (single-row kernels, `_rows`, blocks4, dp4a). Changes
-  there need decode-step logits; `ds4-bench` cannot dump those yet, so mark that gate pending
-  and don't promote such changes.
+- **Pick the right gate.** Two classes of change, two gates:
+  - *Refactors that must not change arithmetic* (load paths, fusion of identical ops,
+    scheduling, I/O): bit-identical frontier logits plus identical greedy text. This stays
+    the default; it is cheap and catches silent bugs (e.g. an FP16-WMMA scorer that passed
+    at 32K and diverged at 64K). **Frontier logits are captured at the end of prefill, so
+    they do not verify decode-only paths**; for those also require identical greedy text
+    over >= 128 tokens and, where available, an in-kernel check mode against the old kernel.
+  - *Changes that intentionally alter rounding or quantization* (reduction order,
+    FMA contraction, requantized tensors, the decoder suffix): bit-exactness does not
+    apply. Gate them like upstream (`QA_BEFORE_RELEASES.md` §3 and §17): the official
+    V4.1 continuation scorer (`gguf-tools` quality-score with the
+    `quality-testing/deepseek-v4.1-flash-2026091*` manifests, including `-general` for
+    quantization) must stay in band versus the current default, plus long-prefix
+    perplexity on prose/code/docs. Record the scores in the ledger. Larger-than-noise
+    regressions are rejections, not trade-offs, unless the user accepts them.
 - **Files compiled into other backends** (`cuda/`, `ds4_cuda.cu`, `metal/`): guard ROCm-only
   changes with `GGML_USE_HIP` / `DS4_ROCM_BUILD`.
 - **Before writing code, record a hypothesis** with its mechanism and expected size
