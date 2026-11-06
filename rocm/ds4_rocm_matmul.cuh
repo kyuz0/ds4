@@ -101,7 +101,13 @@ extern "C" void ds4_gpu_dsv41_q8_set_round(int on) { g_q8_round_request = on ? 1
 
 static bool ds4_q8_bf16_fused(void) {
     static int cached = -1;
-    if (cached < 0) cached = getenv("DS4_ROCM_Q8_FUSE_BF16") != NULL ? 1 : 0;
+    /* Default on (2026-11-06): rounding inside the Q8 WMMA epilogue is the same
+     * v41 bf16 rounding; 32K frontier logits bit-identical, prefill +1-3 %.
+     * DS4_ROCM_Q8_FUSE_BF16=0 restores the separate pass. */
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROCM_Q8_FUSE_BF16");
+        cached = (v && v[0] == '0') ? 0 : 1;
+    }
     return cached != 0;
 }
 

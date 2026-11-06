@@ -472,6 +472,27 @@ __global__ static void v41_carry_mask_kernel(uint32_t *packed, float *plain, uin
     if (pack) packed[p] = bits;
 }
 
+/* Same bits as v41_carry_mask_kernel, one lane per float: coalesced reads and
+ * writes; pack uses a wave32 ballot, unpack broadcasts the word to its 32 lanes. */
+__global__ static void v41_carry_mask_lane_kernel(uint32_t *packed, float *plain, uint32_t width,
+                                                uint32_t words, bool pack) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t word = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
+    if (word >= words) return;
+    const uint64_t p = (uint64_t)blockIdx.y * words + word;
+    const uint32_t col = word * 32u + lane;
+    const bool valid = col < width;
+    const uint64_t f = (uint64_t)blockIdx.y * width + col;
+    if (pack) {
+        const bool zero = valid && plain[f] == 0.0f;
+        const uint32_t bits = (uint32_t)__ballot(zero);
+        if (lane == 0u) packed[p] = bits;
+    } else {
+        const uint32_t bits = packed[p];
+        if (valid) plain[f] = bits & (1u << lane) ? 0.0f : -INFINITY;
+    }
+}
+
 extern "C" int ds4_gpu_dsv41_carry_copy(ds4_gpu_tensor *packed, uint32_t row_offset,
                                         ds4_gpu_tensor *plain, uint32_t width, uint32_t rows,
                                         uint32_t format, bool pack) {
@@ -485,6 +506,9 @@ extern "C" int ds4_gpu_dsv41_carry_copy(ds4_gpu_tensor *packed, uint32_t row_off
     if (format == DS4_V41_CARRY_BF16)
         v41_carry_bf16_kernel<<<dim3((unsigned)(((uint64_t)width + 255u) / 256u), rows), 256>>>(
             (uint16_t *)p, (float *)plain->ptr, width, words, pack);
+    else if (!getenv("DS4_ROCM_V41_CARRY_MASK_SCALAR"))
+        v41_carry_mask_lane_kernel<<<dim3((unsigned)(((uint64_t)words + 7u) / 8u), rows), 256>>>(
+            p, (float *)plain->ptr, width, words, pack);
     else v41_carry_mask_kernel<<<dim3((unsigned)(((uint64_t)words + 255u) / 256u), rows), 256>>>(
         p, (float *)plain->ptr, width, words, pack);
     return cuda_ok(cudaGetLastError(), "V4.1 compact prefill carry");
