@@ -41436,8 +41436,17 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                 g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
                 g->selected_kv, 0, attended, NULL, 0,
                 heads, DS4_N_HEAD_DIM) &&
-             ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) &&
-             ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true);
+#ifdef DS4_ROCM_BUILD
+             (ds41_norm_fuse_on() ?
+              ds4_gpu_dsv41_bf16_rope(g->heads, DS4_N_HEAD_DIM, heads, pos,
+                                      ds4_layer_compress_ratio(il) != 0, true) != 0 :
+#endif
+             (ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) &&
+              ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true))
+#ifdef DS4_ROCM_BUILD
+             )
+#endif
+             ;
         ok = ds41_leaf_end("attn_core", ok);
         if (profile) ok = ds41_decode_stage_profile_mark("attn_decode", il, start, ok);
     }
@@ -41660,6 +41669,10 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
+#ifdef DS4_ROCM_BUILD
+    if (!shared_owner && ds41_norm_fuse_on())
+        return ds4_gpu_dsv41_add_bf16(g->block, routed, g->shared, DS4_N_EMBD) != 0;
+#endif
     return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
         ds41_bf16(g->block, DS4_N_EMBD);
 }

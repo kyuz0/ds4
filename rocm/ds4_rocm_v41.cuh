@@ -214,6 +214,47 @@ extern "C" int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint
     return cuda_ok(cudaGetLastError(), "V4.1 unit-magnitude RoPE");
 }
 
+/* bf16(whole head) + RoPE in one launch: the non-rotated dims are rounded in
+ * place and the rotated pair is rounded before rotation, exactly as the separate
+ * v41_bf16_kernel pass followed by v41_rope_kernel. */
+__global__ static void v41_bf16_rope_kernel(float *x, v41_rope_args args) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row = blockIdx.x / args.heads;
+    const uint64_t base = (uint64_t)blockIdx.x * args.width;
+    for (uint32_t j = lane; j < args.width - 64u; j += 32u) x[base + j] = v41_bf16(x[base + j]);
+    const float theta = v41_mul((float)(args.start + row * args.stride), args.frequencies[lane]);
+    const float c = __ocml_cos_f32(theta), s = args.inverse ? -__ocml_sin_f32(theta) : __ocml_sin_f32(theta);
+    const uint64_t i = base + args.width - 64u + 2u * lane;
+    const float re = v41_bf16(x[i]), im = v41_bf16(x[i + 1u]);
+    x[i] = v41_bf16(v41_sub(v41_mul(re, c), v41_mul(im, s)));
+    x[i + 1u] = v41_bf16(v41_add(v41_mul(re, s), v41_mul(im, c)));
+}
+
+extern "C" int ds4_gpu_dsv41_bf16_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                                       uint32_t start, bool compressed, bool inverse) {
+    uint64_t elems = 0;
+    if (width < 64u || !heads || start >= 1048576u ||
+        !cuda_u64_mul3_checked(width, heads, 1u, &elems) || !cuda_tensor_has_f32(x, elems)) return 0;
+    if (pthread_once(&v41_rope_once, v41_init_rope_frequencies)) return 0;
+    v41_rope_args args = {width, heads, start, 1u, inverse, {0}};
+    memcpy(args.frequencies, v41_rope_frequencies[compressed ? 1 : 0], sizeof(args.frequencies));
+    v41_bf16_rope_kernel<<<heads, 32>>>((float *)x->ptr, args);
+    return cuda_ok(cudaGetLastError(), "V4.1 bf16 + RoPE");
+}
+
+__global__ static void v41_add_bf16_kernel(float *out, const float *a, const float *b, uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = v41_bf16(a[i] + b[i]);   /* add_kernel then v41_bf16_kernel */
+}
+
+extern "C" int ds4_gpu_dsv41_add_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
+                                      const ds4_gpu_tensor *b, uint32_t n) {
+    if (!n || !cuda_tensor_has_f32(out, n) || !cuda_tensor_has_f32(a, n) || !cuda_tensor_has_f32(b, n)) return 0;
+    v41_add_bf16_kernel<<<(n + 255u) / 256u, 256u>>>((float *)out->ptr, (const float *)a->ptr,
+                                                    (const float *)b->ptr, n);
+    return cuda_ok(cudaGetLastError(), "V4.1 add + bf16");
+}
+
 extern "C" int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                                   uint32_t rows, uint32_t start, bool compressed, bool inverse) {
     return ds4_gpu_dsv41_rope_stride(x, width, heads, rows, start, 1, compressed, inverse);
