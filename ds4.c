@@ -41027,11 +41027,55 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
 #endif
 }
 
+#ifdef DS4_ROCM_BUILD
+/* One launch for the norm and its bf16 output rounding (bit-identical);
+ * DS4_ROCM_V41_NORM_FUSE=0 restores the separate passes. */
+static bool ds41_norm_fuse_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROCM_V41_NORM_FUSE");
+        cached = (v && v[0] == '0') ? 0 : 1;
+    }
+    return cached == 1;
+}
+#endif
+
 static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                       const ds4_model *m, const ds4_tensor *weight) {
+#ifdef DS4_ROCM_BUILD
+    if (ds41_norm_fuse_on())
+        return ds4_gpu_dsv41_norm_bf16(out, (ds4_gpu_tensor *)in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS, 0) != 0;
+#endif
     return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
         ds41_bf16(out, (uint32_t)weight->dim[0]);
+}
+
+/* bf16(x) in place, then ds41_norm(out, x). */
+static bool ds41_bf16_norm(ds4_gpu_tensor *out, ds4_gpu_tensor *x,
+                           const ds4_model *m, const ds4_tensor *weight) {
+#ifdef DS4_ROCM_BUILD
+    if (ds41_norm_fuse_on())
+        return ds4_gpu_dsv41_norm_bf16(out, x, m->map, m->size, weight->abs_offset,
+            (uint32_t)weight->dim[0], DS4_RMS_EPS, 1) != 0;
+#endif
+    return ds41_bf16(x, (uint32_t)weight->dim[0]) && ds41_norm(out, x, m, weight);
+}
+
+/* hc_expand_split then bf16(out) (and copy4 <- split[0..3] when given). */
+static bool ds41_hc_expand_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+                                const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+                                ds4_gpu_tensor *copy4) {
+#ifdef DS4_ROCM_BUILD
+    if (ds41_norm_fuse_on())
+        return ds4_gpu_hc_expand_split_bf16_tensor((ds4_gpu_tensor *)out, block, residual,
+            split, DS4_N_EMBD, DS4_N_HC, copy4) != 0;
+#endif
+    return ds4_gpu_hc_expand_split_tensor(out, block, residual, (ds4_gpu_tensor *)split,
+                                          DS4_N_EMBD, DS4_N_HC) &&
+        ds41_bf16(out, DS4_N_EMBD * DS4_N_HC) &&
+        (!copy4 || ds4_gpu_tensor_copy(copy4, 0, split, 0, DS4_N_HC * sizeof(float)));
 }
 
 static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
@@ -41310,10 +41354,18 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
             l->attn_q_a->abs_offset, (uint32_t)l->attn_q_a->dim[1],
             l->attn_kv->abs_offset, (uint32_t)l->attn_kv->dim[1],
             5120u, g->norm)) {
-        fused_qakv = ds41_bf16(g->qr, (uint32_t)l->attn_q_a->dim[1]) &&
+        fused_qakv =
+#ifdef DS4_ROCM_BUILD
+            (ds41_norm_fuse_on() &&
+             (uint32_t)l->attn_q_a_norm->dim[0] == (uint32_t)l->attn_q_a->dim[1] &&
+             (uint32_t)l->attn_kv_a_norm->dim[0] == (uint32_t)l->attn_kv->dim[1]) ?
+            (ds41_bf16_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
+             ds41_bf16_norm(g->kv, g->kv, m, l->attn_kv_a_norm)) :
+#endif
+                    (ds41_bf16(g->qr, (uint32_t)l->attn_q_a->dim[1]) &&
                      ds41_bf16(g->kv, (uint32_t)l->attn_kv->dim[1]) &&
                      ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
-                     ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
+                     ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm));
         if (!fused_qakv) return false;
     }
     bool ok = fused_qakv ? true :
@@ -41630,7 +41682,7 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
     if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
     bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-              ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
+              ds41_bf16_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                       m, w, g->norm, 1);
 #ifdef DS4_ROCM_BUILD
@@ -41665,18 +41717,17 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
     return ds41_leaf_end("hc_norm_pre_attn",
         ds41_hc_mix(g, m, l, false) &&
         ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm));
+        ds41_bf16_norm(g->norm, g->x, m, l->attn_norm));
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
     (void)ds41_leaf_begin("hc_norm_post_attn");
     return ds41_leaf_end("hc_norm_post_attn",
-        ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
+        ds41_hc_expand_bf16(g->after_attn, g->block, g->residual, g->attn_split, NULL) &&
         ds41_hc_mix(g, m, l, true) &&
         ds4_gpu_hc_weighted_sum_split_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->ffn_norm));
+        ds41_bf16_norm(g->norm, g->x, m, l->ffn_norm));
 }
 
 static bool ds41_decode_stage_profile_on(void) {
@@ -42054,6 +42105,11 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
+#ifdef DS4_ROCM_BUILD
+    if (ds41_norm_fuse_on() && g->tp_world == 1u)
+        return ds4_gpu_hc_expand_split_bf16_tensor(g->residual, g->block, g->after_attn,
+            g->ffn_split, DS4_N_EMBD, DS4_N_HC, g->pre) != 0;
+#endif
     return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));

@@ -163,14 +163,26 @@ __global__ static void hc_expand_add_half_kernel(
     out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
 }
 
+/* Same bits as v41_bf16 (round to nearest even, Inf/NaN preserved). */
+__device__ static inline float hc_bf16_rne(float x) {
+    uint32_t bits = __float_as_uint(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return __uint_as_float(bits & 0xffff0000u);
+}
+
+/* ROUND folds the following bf16 pass into the store; copy4 (optional) receives
+ * split[0..3] (the separate 16-byte copy that used to follow). */
+template <bool ROUND = false>
 __global__ static void hc_expand4_kernel(
         float *out_hc,
         const float *block_out,
         const float *residual_hc,
         const float *split,
         uint32_t n_embd,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        float *copy4 = NULL) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (copy4 && gid < 4u) copy4[gid] = split[gid];
     const uint64_t n = (uint64_t)n_tokens * n_embd;
     if (gid >= n) return;
     const uint32_t d = gid % n_embd;
@@ -192,7 +204,7 @@ __global__ static void hc_expand4_kernel(
         acc += comb[1u * 4u + dst] * r1;
         acc += comb[2u * 4u + dst] * r2;
         acc += comb[3u * 4u + dst] * r3;
-        out_hc[hc_base + (uint64_t)dst * n_embd] = acc;
+        out_hc[hc_base + (uint64_t)dst * n_embd] = ROUND ? hc_bf16_rne(acc) : acc;
     }
 }
 

@@ -128,6 +128,8 @@ After: 82.0 ms, 17.1 ms idle, 2170 kernels/token.
 | `DS4_ROCM_V41_PTRS_ZERO_COPY` | expert pointer table in coherent mapped host memory: no 3×H2D + event per layer (was a ~53 µs copy stall, 2.1 ms/token) | (same A/B) |
 | `DS4_ROCM_NORM_BATCHED` | RMS norm loads batched 8 ahead, same accumulation order (unit test bit-identical; n=20480 16.6 → 4.7 µs) | ABBA×3 11.68 → 11.85 tps (+1.5 %) |
 
+| `DS4_ROCM_V41_NORM_FUSE` | one-launch [bf16(x)]→norm→bf16(out); hc_expand + bf16 store (+ 16-byte `pre` copy); q_a/kv rounding folded into the norms; grouped output_a GEMV rounds in its epilogue. ~490 fewer launches/token | ABBA×3 11.90 → 12.05 tps (+1.3 %) |
+
 Not worth it / rejected: 96 GB cache (misses 827 → 765 per 512 tokens, decode unchanged);
 pipelining `v41_hc_ordered_prefetch_kernel` (no gain, FMA-chain/occupancy bound);
 n-gram speculative decode (expert-union bytes and misses make it ~break-even under SSD

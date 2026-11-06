@@ -103,6 +103,55 @@ extern "C" int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_
     return cuda_ok(cudaGetLastError(), "V4.1 activation quantization");
 }
 
+/* One launch for [bf16(x) in place] -> rms_norm(x) * w -> bf16(out): the same
+ * per-thread element order and reduction as rms_norm_batched_kernel, with the
+ * v41_bf16 roundings of the separate v41_bf16_kernel passes applied in place. */
+template <bool ROUND_IN>
+__global__ __launch_bounds__(256) static void v41_norm_bf16_kernel(float *out, float *x,
+        const float *w, uint32_t n, float eps) {
+    float sum = 0.0f;
+    uint32_t i = threadIdx.x;
+    for (; i + 7u * 256u < n; i += 8u * 256u) {
+        float v[8];
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; ++k) {
+            v[k] = x[i + k * 256u];
+            if (ROUND_IN) { v[k] = v41_bf16(v[k]); x[i + k * 256u] = v[k]; }
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; ++k) sum += v[k] * v[k];
+    }
+    for (; i < n; i += 256u) {
+        float v = x[i];
+        if (ROUND_IN) { v = v41_bf16(v); x[i] = v; }
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (i = threadIdx.x; i < n; i += 256u) out[i] = v41_bf16(x[i] * scale * w[i]);
+}
+
+extern "C" int ds4_gpu_dsv41_norm_bf16(ds4_gpu_tensor *out, ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n, float eps, int round_in) {
+    uint64_t weight_bytes = 0;
+    if (!model_map || !n || !cuda_u64_mul_checked(n, sizeof(float), &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_tensor_has_f32(out, n) || !cuda_tensor_has_f32(x, n)) return 0;
+    const float *w = (const float *)cuda_model_range_ptr(model_map, weight_offset,
+                                                         weight_bytes, "rms_weight");
+    if (!w) return 0;
+    if (round_in) v41_norm_bf16_kernel<true><<<1, 256>>>((float *)out->ptr, (float *)x->ptr, w, n, eps);
+    else v41_norm_bf16_kernel<false><<<1, 256>>>((float *)out->ptr, (float *)x->ptr, w, n, eps);
+    return cuda_ok(cudaGetLastError(), "V4.1 fused norm/bf16");
+}
+
 struct v41_rope_args {
     uint32_t width, heads, start, stride, inverse;
     float frequencies[32];
@@ -1909,6 +1958,7 @@ __global__ static void v41_grouped_q8_f32_wmma_rowtile_kernel(
 }
 
 /* Scalar grouped projection with packed four-weight loads and F32 activations. */
+template <bool ROUND = false>
 __global__ static void v41_grouped_q8_f32_blocks4_kernel(
         float *out, const unsigned char *w, const float *x, int K, int M, int G) {
     int lane = threadIdx.x & 31, row = blockIdx.x * 8 + threadIdx.x / 32;
@@ -1926,7 +1976,7 @@ __global__ static void v41_grouped_q8_f32_blocks4_kernel(
         acc += d * v;
     }
     acc = warp_sum_f32(acc);
-    if (!lane) out[row] = acc;
+    if (!lane) out[row] = ROUND ? v41_bf16(acc) : acc;   /* ROUND = the following bf16 pass */
 }
 
 static bool v41_attn_low_m256_enabled(void) {
@@ -1970,7 +2020,15 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
                 UINT64_C(256) * 34u)) return 0;
         return 1;
     }
+    bool low_rounded = false;
     if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
+        static int fuse = -1;
+        if (fuse < 0) { const char *v = getenv("DS4_ROCM_V41_NORM_FUSE"); fuse = !(v && v[0] == '0'); }
+        if (fuse) {
+            v41_grouped_q8_f32_blocks4_kernel<true><<<1024u, 256u>>>(
+                (float *)low->ptr, a, (const float *)heads->ptr, 4096, 1024, 8);
+            low_rounded = true;
+        } else
         v41_grouped_q8_f32_blocks4_kernel<<<1024u, 256u>>>(
             (float *)low->ptr, a, (const float *)heads->ptr, 4096, 1024, 8);
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
@@ -1998,7 +2056,7 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
             (const float *)heads->ptr, 4096u, 1024u, 8u, n_tokens, 128u);
     }
     if (!cuda_ok(cudaGetLastError(), "V4.1 attention low projection") ||
-        !ds4_gpu_dsv41_quantize(low, 8192u, n_tokens, DS4_V41_BF16)) return 0;
+        (!low_rounded && !ds4_gpu_dsv41_quantize(low, 8192u, n_tokens, DS4_V41_BF16))) return 0;
     if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
         /* The shared input is the same BF16-rounded output-A row above. */
         v41_q8b4_prefetch_publish();
