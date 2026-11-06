@@ -1445,6 +1445,7 @@ static void v41_q8b4_prefetch_publish(void) {
     if (on) fprintf(stderr, "ds4: V4.1 Q8 blocks4 unrolled loop active\n");
 }
 
+template <bool ROUND = false>
 __global__ static void v41_q8_f32_blocks4_kernel(float *out,
         const unsigned char *weights, const float *input,
         uint32_t width, uint32_t outputs, uint64_t row_bytes) {
@@ -1485,7 +1486,8 @@ __global__ static void v41_q8_f32_blocks4_kernel(float *out,
         }
     }
     acc = warp_sum_f32(acc);
-    if (lane == 0u) out[row] = acc;
+    /* ROUND applies the same v41_bf16 as the separate v41_bf16_kernel pass. */
+    if (lane == 0u) out[row] = ROUND ? v41_bf16(acc) : acc;
 }
 
 /* V4.1 shared-expert gate/up pair. Each warp owns one mid row and retains
@@ -1686,7 +1688,18 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
     if (rows == 1u && ds4_rocm_is_gfx1151()) {
         v41_q8b4_prefetch_publish();
         v41_q8b4_log_shape("rows1", width, outputs, (uint64_t)(width / 32u) * 34u, rows);
-    v41_q8_f32_blocks4_kernel<<<(outputs + 7u) / 8u, 256u>>>(
+        static int decode_round = -1;
+        if (decode_round < 0) {
+            const char *v = getenv("DS4_ROCM_V41_Q8_DECODE_ROUND");
+            decode_round = (v && v[0] == '0') ? 0 : 1;
+        }
+        if (decode_round && g_q8_round_request != 0) {
+            v41_q8_f32_blocks4_kernel<true><<<(outputs + 7u) / 8u, 256u>>>(
+                (float *)out->ptr, weights, (const float *)in->ptr,
+                width, outputs, (uint64_t)(width / 32u) * 34u);
+            rounded_in_kernel = 1;
+        } else
+        v41_q8_f32_blocks4_kernel<<<(outputs + 7u) / 8u, 256u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             width, outputs, (uint64_t)(width / 32u) * 34u);
     } else if (rows <= 6u && ds4_rocm_is_gfx1151()) {

@@ -351,3 +351,98 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
     errno = saved;
     return ok;
 }
+
+#ifndef __APPLE__
+/* Persistent decode reader pool. Each decode token needs 2 x 24 random 264-byte
+ * rows; reading them serially costs one SSD latency each on the critical path. */
+enum { ENGRAM_ASYNC_THREADS = 16, ENGRAM_ASYNC_MAX_ITEMS = 128 };
+
+typedef struct {
+    const ds4_engram_table *table;
+    uint32_t row;
+    float *out;
+} engram_async_item;
+
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t work, done;
+    engram_async_item items[ENGRAM_ASYNC_MAX_ITEMS];
+    size_t n_items, next, remaining;
+    uint64_t generation;
+    int error, started, active;
+} g_engram_async = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
+                    PTHREAD_COND_INITIALIZER};
+
+static void *engram_async_worker(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_engram_async.mu);
+    for (;;) {
+        while (g_engram_async.next >= g_engram_async.n_items)
+            pthread_cond_wait(&g_engram_async.work, &g_engram_async.mu);
+        const engram_async_item item = g_engram_async.items[g_engram_async.next++];
+        pthread_mutex_unlock(&g_engram_async.mu);
+        errno = 0;
+        const bool ok = ds4_engram_read(item.table, &item.row, 1, item.out);
+        const int err = ok ? 0 : (errno ? errno : EIO);
+        pthread_mutex_lock(&g_engram_async.mu);
+        if (err && !g_engram_async.error) g_engram_async.error = err;
+        if (--g_engram_async.remaining == 0) pthread_cond_signal(&g_engram_async.done);
+    }
+    return NULL;
+}
+
+bool ds4_engram_read_async_begin(const ds4_engram_job *jobs, size_t n_jobs) {
+    size_t n = 0;
+    for (size_t j = 0; j < n_jobs; j++) n += jobs[j].count;
+    if (!jobs || n > ENGRAM_ASYNC_MAX_ITEMS || g_engram_async.active) {
+        errno = EINVAL;
+        return false;
+    }
+    pthread_mutex_lock(&g_engram_async.mu);
+    if (!g_engram_async.started) {
+        for (int i = 0; i < ENGRAM_ASYNC_THREADS; i++) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, engram_async_worker, NULL) == 0) {
+                pthread_detach(t);
+                g_engram_async.started++;
+            }
+        }
+    }
+    if (!g_engram_async.started) {
+        pthread_mutex_unlock(&g_engram_async.mu);
+        /* No workers: read synchronously. */
+        for (size_t j = 0; j < n_jobs; j++)
+            if (!ds4_engram_read(jobs[j].table, jobs[j].rows, jobs[j].count, jobs[j].out))
+                return false;
+        return true;
+    }
+    size_t k = 0;
+    for (size_t j = 0; j < n_jobs; j++)
+        for (size_t i = 0; i < jobs[j].count; i++)
+            g_engram_async.items[k++] = (engram_async_item){
+                jobs[j].table, jobs[j].rows[i], jobs[j].out + i * DS4_ENGRAM_DIM};
+    g_engram_async.n_items = k;
+    g_engram_async.next = 0;
+    g_engram_async.remaining = k;
+    g_engram_async.error = 0;
+    g_engram_async.active = k != 0;
+    pthread_cond_broadcast(&g_engram_async.work);
+    pthread_mutex_unlock(&g_engram_async.mu);
+    return true;
+}
+
+bool ds4_engram_read_async_wait(void) {
+    pthread_mutex_lock(&g_engram_async.mu);
+    while (g_engram_async.active && g_engram_async.remaining)
+        pthread_cond_wait(&g_engram_async.done, &g_engram_async.mu);
+    const int err = g_engram_async.error;
+    g_engram_async.active = 0;
+    g_engram_async.n_items = g_engram_async.next = 0;
+    pthread_mutex_unlock(&g_engram_async.mu);
+    if (err) {
+        errno = err;
+        return false;
+    }
+    return true;
+}
+#endif

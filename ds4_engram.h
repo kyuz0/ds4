@@ -61,4 +61,17 @@ bool ds4_engram_read(const ds4_engram_table *table, const uint32_t *rows,
 bool ds4_engram_read_batch(const ds4_engram_table *table, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out);
 
+/* Asynchronous decode-row reads: all rows of all jobs are read concurrently by a
+ * persistent reader pool. Outputs equal ds4_engram_read. One outstanding request;
+ * the caller must call ds4_engram_read_async_wait before touching any output or
+ * row-id array, and before starting another request. */
+typedef struct {
+    const ds4_engram_table *table;
+    const uint32_t *rows;
+    size_t count;
+    float *out;
+} ds4_engram_job;
+bool ds4_engram_read_async_begin(const ds4_engram_job *jobs, size_t n_jobs);
+bool ds4_engram_read_async_wait(void);
+
 #endif

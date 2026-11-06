@@ -419,6 +419,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
                                  uint64_t offset, uint64_t bytes,
                                  const char **payload);
 static int cuda_stream_selected_reuse_wait(const char *what);
+static void *g_stream_ptrs_zc_host;   /* zero-copy decode pointer table */
 static int cuda_stream_selected_upload_wait_host(const char *what);
 static void cuda_stream_selected_stage_release(void);
 static int cuda_stream_batch_selected_reuse_wait(const char *what);
@@ -893,9 +894,17 @@ static void cuda_stream_selected_cache_release(void) {
     if (g_stream_selected_cache.up) (void)cudaFree(g_stream_selected_cache.up);
     if (g_stream_selected_cache.down) (void)cudaFree(g_stream_selected_cache.down);
     if (g_stream_selected_cache.slot_ids) (void)cudaFree(g_stream_selected_cache.slot_ids);
+    if (g_stream_ptrs_zc_host) {
+        (void)hipHostFree(g_stream_ptrs_zc_host);
+        g_stream_ptrs_zc_host = NULL;
+        g_stream_selected_cache.gate_ptrs_stage = NULL;
+        g_stream_selected_cache.up_ptrs_stage = NULL;
+        g_stream_selected_cache.down_ptrs_stage = NULL;
+    } else {
     if (g_stream_selected_cache.gate_ptrs) (void)cudaFree(g_stream_selected_cache.gate_ptrs);
     if (g_stream_selected_cache.up_ptrs) (void)cudaFree(g_stream_selected_cache.up_ptrs);
     if (g_stream_selected_cache.down_ptrs) (void)cudaFree(g_stream_selected_cache.down_ptrs);
+    }
     if (g_stream_selected_reuse_event) {
         (void)cudaEventDestroy(g_stream_selected_reuse_event);
         g_stream_selected_reuse_event = NULL;
@@ -1151,7 +1160,28 @@ static int cuda_stream_batch_selected_mark_inflight(void) {
     return 1;
 }
 
+/* Zero-copy decode pointer table (default; DS4_ROCM_V41_PTRS_ZERO_COPY=0 disables):
+ * the three 6-entry expert pointer tables live in coherent device-mapped host
+ * memory, so the host's staging writes are what the MoE kernels read. This drops
+ * three small H2D copies plus a cross-stream event per layer (~60 us of GPU time
+ * each on gfx1151). Reuse is already fenced by cuda_stream_selected_reuse_wait. */
+static int cuda_stream_ptrs_zero_copy(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROCM_V41_PTRS_ZERO_COPY");
+        cached = (v && v[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
 static void cuda_stream_selected_stage_release(void) {
+    if (g_stream_ptrs_zc_host) {
+        /* Aliases of the zero-copy table; freed with the device pointers. */
+        g_stream_selected_cache.gate_ptrs_stage = NULL;
+        g_stream_selected_cache.up_ptrs_stage = NULL;
+        g_stream_selected_cache.down_ptrs_stage = NULL;
+        return;
+    }
     if (g_stream_selected_cache.gate_ptrs_stage) {
         (void)cudaFreeHost((void *)g_stream_selected_cache.gate_ptrs_stage);
     }
@@ -1231,6 +1261,25 @@ static int cuda_stream_selected_ensure_buffers(uint64_t gate_bytes, uint64_t dow
         g_stream_selected_cache.slot_tensor.bytes =
             DS4_ROCM_N_EXPERT_USED * sizeof(int32_t);
         g_stream_selected_cache.slot_tensor.owner = 0;
+    }
+    if (!g_stream_selected_cache.gate_ptrs && cuda_stream_ptrs_zero_copy() &&
+        !g_stream_selected_cache.gate_ptrs_stage) {
+        const size_t one = DS4_ROCM_N_EXPERT_USED * sizeof(char *);
+        void *host = NULL, *dev = NULL;
+        if (hipHostMalloc(&host, 3u * one, hipHostMallocMapped | hipHostMallocCoherent) == hipSuccess &&
+            hipHostGetDevicePointer(&dev, host, 0) == hipSuccess) {
+            memset(host, 0, 3u * one);
+            g_stream_ptrs_zc_host = host;
+            g_stream_selected_cache.gate_ptrs = (const char **)dev;
+            g_stream_selected_cache.up_ptrs = (const char **)((char *)dev + one);
+            g_stream_selected_cache.down_ptrs = (const char **)((char *)dev + 2u * one);
+            g_stream_selected_cache.gate_ptrs_stage = (const char **)host;
+            g_stream_selected_cache.up_ptrs_stage = (const char **)((char *)host + one);
+            g_stream_selected_cache.down_ptrs_stage = (const char **)((char *)host + 2u * one);
+        } else {
+            if (host) (void)hipHostFree(host);
+            (void)hipGetLastError();
+        }
     }
     if (!g_stream_selected_cache.gate_ptrs) {
         err = cudaMalloc((void **)&g_stream_selected_cache.gate_ptrs,
@@ -3921,6 +3970,7 @@ static int cuda_stream_selected_prepare_ptrs(
     memcpy((void *)g_stream_selected_cache.down_ptrs_stage,
            down_ptrs,
            ptr_bytes);
+    if (g_stream_ptrs_zc_host) return 1;   /* kernels read the staged table directly */
     cudaError_t err = cudaMemcpyAsync(g_stream_selected_cache.gate_ptrs,
                                       g_stream_selected_cache.gate_ptrs_stage,
                                       ptr_bytes,

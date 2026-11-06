@@ -44,6 +44,58 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     }
 }
 
+/* Latency-hiding RMS norm (one 256-thread block per row). Each thread keeps the
+ * original element order (i, i+256, i+512, ...) and accumulates in that order;
+ * only the loads are batched ahead. Bit-identical to rms_norm_{plain,weight}_kernel. */
+template <bool W>
+__global__ __launch_bounds__(256) static void rms_norm_batched_kernel(float *out,
+        const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    uint32_t i = threadIdx.x;
+    for (; i + 7u * 256u < n; i += 8u * 256u) {
+        float v[8];
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; ++k) v[k] = xr[i + k * 256u];
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; ++k) sum += v[k] * v[k];
+    }
+    for (; i < n; i += 256u) {
+        const float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    i = threadIdx.x;
+    for (; i + 7u * 256u < n; i += 8u * 256u) {
+        float v[8];
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; ++k) v[k] = xr[i + k * 256u];
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; ++k)
+            orow[i + k * 256u] = W ? v[k] * scale * w[i + k * 256u] : v[k] * scale;
+    }
+    for (; i < n; i += 256u) orow[i] = W ? xr[i] * scale * w[i] : xr[i] * scale;
+}
+
+static int rms_norm_batched_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROCM_NORM_BATCHED");
+        cached = (v && v[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         float *q_out,
         const float *q,
@@ -412,14 +464,16 @@ __device__ static DS4_ROCM_UNUSED void rope_tail_one_dev(float *x, uint32_t head
 extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
     if (!cuda_tensor_has_f32(out, n) || !cuda_tensor_has_f32(x, n)) return 0;
     if (n == 0u) return 1;
-    rms_norm_plain_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
+    if (rms_norm_batched_on()) rms_norm_batched_kernel<false><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, NULL, n, 1, eps);
+    else rms_norm_plain_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
     if (!cuda_tensor_has_elems2(out, n, rows, sizeof(float)) ||
         !cuda_tensor_has_elems2(x, n, rows, sizeof(float))) return 0;
     if (n == 0u || rows == 0u) return 1;
-    rms_norm_plain_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
+    if (rms_norm_batched_on()) rms_norm_batched_kernel<false><<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, NULL, n, rows, eps);
+    else rms_norm_plain_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
@@ -431,7 +485,8 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
+    if (rms_norm_batched_on()) rms_norm_batched_kernel<true><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
+    else rms_norm_weight_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
@@ -444,7 +499,8 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    if (rms_norm_batched_on()) rms_norm_batched_kernel<true><<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    else rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 

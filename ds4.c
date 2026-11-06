@@ -40843,13 +40843,15 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
 #ifdef DS4_ROCM_BUILD
         if (weight->type == DS4_TENSOR_Q8_0) ds4_gpu_dsv41_q8_set_round(round ? 1 : 0);
 #endif
-        const bool ok = weight->type == DS4_TENSOR_F16 ?
+        const int rc = weight->type == DS4_TENSOR_F16 ?
             ds4_gpu_dsv41_projection_rows(out, m->map, m->size, weight->abs_offset,
                 (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], 1u, in) :
             ds4_gpu_dsv41_q8_projection_rows(out, m->map, m->size, weight->abs_offset,
                 (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], 1u, in);
         if (leaf_profile) (void)ds4_gpu_v41_leaf_end(leaf_label, weight->bytes);
-        return ok && (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
+        /* rc == 2: the Q8 projection already rounded its output to bf16. */
+        if (rc == 2 && weight->type == DS4_TENSOR_Q8_0) return true;
+        return rc && (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
     }
 #endif
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
@@ -41449,10 +41451,9 @@ static bool ds41_stream_selected_begin_ids(ds41_gpu_graph *g, const ds4_model *m
     if (async_pending ? !ds4_gpu_tensor_read_async_end(selected, sizeof(selected))
                       : !ds4_gpu_tensor_read(g->selected, 0, selected, sizeof(selected)))
         return false;
-    for (uint32_t i = 0; i < 6; i++)
-        if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) return false;
-    return ds4_gpu_routed_moe_set_selected_override(selected, 6) &&
+    const bool r = ds4_gpu_routed_moe_set_selected_override(selected, 6) &&
         ds4_gpu_stream_expert_cache_begin_selected_load(&table, selected, 6);
+    return r;
 }
 
 static bool ds41_stream_selected_begin(ds41_gpu_graph *g, const ds4_model *m,
@@ -42799,17 +42800,37 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
-    for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
+    bool engram_pending = false;
 #ifdef __APPLE__
+    for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
         if (!ds4_engram_read_batch(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i]))
             return false;
-#else
-        if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
-#endif
     }
+#else
+    /* The 2 x 24 disk rows are first consumed at Engram layer 1: read them
+     * concurrently in the background instead of serially before the token. */
+    static int engram_async = -1;
+    if (engram_async < 0) {
+        const char *v = getenv("DS4_ROCM_V41_ENGRAM_ASYNC");
+        engram_async = (v && v[0] == '0') ? 0 : 1;
+    }
+    for (uint32_t i = 0; !engram_async && !ds41_image_at(g, g->pos) && i < 2; i++)
+        if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
+    if (engram_async && !ds41_image_at(g, g->pos)) {
+        const ds4_engram_job jobs[2] = {
+            {&g->table[0], ids[0], DS4_ENGRAM_COLS, g->rows[0]},
+            {&g->table[1], ids[1], DS4_ENGRAM_COLS, g->rows[1]},
+        };
+        if (!ds4_engram_read_async_begin(jobs, 2)) return false;
+        engram_pending = true;
+    }
+#endif
     const float initial_pre[] = {1, 0, 0, 0};
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
-        !ds4_gpu_begin_commands()) return false;
+        !ds4_gpu_begin_commands()) {
+        if (engram_pending) (void)ds4_engram_read_async_wait();
+        return false;
+    }
     bool ok = ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
     /* Unfused quality kernels bind whole expert tensors. Keep just the current
      * layer mapped, using the same admitted reserve as layer-major prefill. */
@@ -42850,7 +42871,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds41_draft_capture(g, il, g->residual, g->pos, 1);
         if (ok && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
-            ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+            if (engram_pending) {
+                ok = ds4_engram_read_async_wait();
+                engram_pending = false;
+                if (!ok) fprintf(stderr, "ds4: V4.1 Engram row read failed: %s\n", strerror(errno));
+            }
+            if (ok) ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42888,6 +42914,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
     }
+    /* A failed layer can exit before Engram layer 1: never leave readers
+     * writing into g->rows after returning. */
+    if (engram_pending && !ds4_engram_read_async_wait()) ok = false;
 #ifdef DS4_ROCM_BUILD
     /* ROCm commands_active() is always false. A failed resident layer can
      * leave ordered work queued; drain it before invalidating the graph. */

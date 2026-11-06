@@ -115,3 +115,23 @@ Decoder suffix, now also ROCm default (`DS4_METAL_V41_DECODER_SUFFIX=0` disables
 - Long-prefix perplexity (16384-token prefix, 512 scored tokens; new `ds4
   --perplexity-prefix N`), off → on: prose 4.0458 → 4.0224, code 1.1247 → 1.1250,
   docs 2.7488 → 2.7542. Mixed sign, rounding level.
+
+## 8. Decode round 2 (all ROCm default, bit-exact)
+
+Trace (8K, 48 tokens) before: 92.9 ms/token profiled, 27.8 ms GPU idle, 2370 kernels/token.
+After: 82.0 ms, 17.1 ms idle, 2170 kernels/token.
+
+| change (env, =0 disables) | what | measured |
+|---|---|---|
+| `DS4_ROCM_V41_ENGRAM_ASYNC` | 2×24 Engram disk rows per token read concurrently (16-thread pool), awaited at layer 1 instead of serially before the token | with the two below: 24K gen128 ABBA×3 11.39 → 11.74 tps (+3.1 %) |
+| `DS4_ROCM_V41_Q8_DECODE_ROUND` | decode Q8 GEMV rounds to bf16 in its epilogue (same `v41_bf16`), ~80 fewer launches/token | (same A/B) |
+| `DS4_ROCM_V41_PTRS_ZERO_COPY` | expert pointer table in coherent mapped host memory: no 3×H2D + event per layer (was a ~53 µs copy stall, 2.1 ms/token) | (same A/B) |
+| `DS4_ROCM_NORM_BATCHED` | RMS norm loads batched 8 ahead, same accumulation order (unit test bit-identical; n=20480 16.6 → 4.7 µs) | ABBA×3 11.68 → 11.85 tps (+1.5 %) |
+
+Not worth it / rejected: 96 GB cache (misses 827 → 765 per 512 tokens, decode unchanged);
+pipelining `v41_hc_ordered_prefetch_kernel` (no gain, FMA-chain/occupancy bound);
+n-gram speculative decode (expert-union bytes and misses make it ~break-even under SSD
+streaming).
+
+Remaining decode budget (24K, ~81 ms/token): ~53 ms bandwidth-bound GEMVs at 210–220 GB/s,
+~10 ms small kernels, ~5 ms launch gaps, ~4 ms expert misses (1.6/token).
