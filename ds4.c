@@ -40916,6 +40916,10 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
     return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
 }
 
+static void ds41_trace_vec(const char *path, uint32_t il, uint32_t pos,
+                           const ds4_gpu_tensor *t, uint64_t offset, uint64_t n);
+#define ds41_trace_residual(path, il, pos, t, off) \
+    ds41_trace_vec(path, il, pos, t, off, (uint64_t)DS4_N_HC * DS4_N_EMBD)
 static bool ds41_matmul_rows_batch(ds4_gpu_tensor *out, const ds4_model *m,
                              const ds4_tensor *weight, const ds4_gpu_tensor *in,
                              uint32_t first, uint32_t count, uint32_t rows) {
@@ -41440,6 +41444,10 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
              ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                                  g->kv, 0, 512u * 4u);
         if (profile) ok = ds41_decode_stage_profile_mark("attn_rope_window", il, start, ok);
+        if (ok) {
+            ds41_trace_vec(projected ? "batchQ" : "stepQ", il, pos, g->q, 0, (uint64_t)heads * DS4_N_HEAD_DIM);
+            ds41_trace_vec(projected ? "batchKV" : "stepKV", il, pos, g->kv, 0, DS4_N_HEAD_DIM);
+        }
     }
     if (ok) {
         start = now_sec();
@@ -41477,6 +41485,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         ok = ds41_leaf_end("attn_core", ok);
         if (profile) ok = ds41_decode_stage_profile_mark("attn_decode", il, start, ok);
     }
+    if (ok) ds41_trace_vec(projected ? "batchH" : "stepH", il, pos, g->heads, 0, (uint64_t)heads * DS4_N_HEAD_DIM);
     if (ok && !projected) {
         start = now_sec();
         ok = ds41_attention_output(g, m, l);
@@ -41486,6 +41495,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         start = now_sec();
         ok = ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
              ds41_bf16(g->block, DS4_N_EMBD);
+        if (ok) ds41_trace_vec("stepB", il, pos, g->block, 0, DS4_N_EMBD);
         if (profile) ok = ds41_decode_stage_profile_mark("attn_sum_partial", il, start, ok);
     }
     return ok;
@@ -41711,6 +41721,13 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     bool ok = ds41_moe_partial(g, m, l, il, token);
     if (profile) ok = ds41_decode_stage_profile_mark("moe_partial", il, start, ok);
     if (ok) {
+        ds41_trace_vec("stepSel", il, g->pos, g->selected, 0, DS4_N_EXPERT_USED);
+        ds41_trace_vec("stepW", il, g->pos, g->route_weights, 0, DS4_N_EXPERT_USED);
+        ds41_trace_vec("stepSh", il, g->pos, g->shared, 0, DS4_N_EMBD);
+        ds41_trace_vec("stepRt", il, g->pos, g->routed, 0, DS4_N_EMBD);
+        ds41_trace_vec("stepN", il, g->pos, g->norm, 0, DS4_N_EMBD);
+    }
+    if (ok) {
         start = now_sec();
         ok = ds41_moe_finish(g, il);
         if (profile) ok = ds41_decode_stage_profile_mark("moe_finish", il, start, ok);
@@ -41753,9 +41770,11 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
             !ds4_gpu_dsv41_engram_add(g->residual, g->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return ds41_leaf_end("hc_norm_pre_attn", false);
+        ds41_trace_residual("stepR1", il, g->pos, g->residual, 0);
     }
-    return ds41_leaf_end("hc_norm_pre_attn",
-        ds41_hc_mix_norm(g, m, l, false, g->pre, l->attn_norm));
+    const bool mixed_ok = ds41_hc_mix_norm(g, m, l, false, g->pre, l->attn_norm);
+    if (mixed_ok) ds41_trace_vec("stepAN", il, g->pos, g->norm, 0, DS4_N_EMBD);
+    return ds41_leaf_end("hc_norm_pre_attn", mixed_ok);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
@@ -41874,6 +41893,8 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                 g->engram_q_norm[i], g->engram_k_norm[i], g->image_count ? g->image_text_mask : NULL,
                 DS4_N_EMBD, count, DS4_RMS_EPS))
             return false;
+        for (uint32_t r = 0; r < count; r++)
+            ds41_trace_residual("batchR1", il, g->pos + r, b->residual, (uint64_t)r * DS4_N_HC * DS4_N_EMBD * 4u);
     }
     if (!ds41_hc_mix_batch(
 #ifdef DS4_ROCM_BUILD
@@ -41884,8 +41905,11 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
     const bool mixed = il ?
         ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
         ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre, DS4_N_EMBD, DS4_N_HC);
-    return mixed && ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+    const bool done = mixed && ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
         ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
+    for (uint32_t r = 0; done && r < count; r++)
+        ds41_trace_vec("batchAN", il, g->pos + r, b->norm, (uint64_t)r * DS4_N_EMBD * 4u, DS4_N_EMBD);
+    return done;
 }
 
 static bool ds41_after_attention_batch(
@@ -42179,6 +42203,7 @@ static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
     const bool profile = ds41_decode_stage_profile_on();
     bool ok = ds41_graph_before_moe(g, m, l, il);
+    if (ok) ds41_trace_residual("stepA", il, g->pos, g->after_attn, 0);
 #ifdef DS4_ROCM_BUILD
     const int prefetch_route = getenv("DS4_ROCM_V41_PREFETCH_ROUTE") &&
         getenv("DS4_ROCM_V41_PREFETCH_ROUTE")[0] != '0' && g->streaming && g->pos > 0u;
@@ -42426,7 +42451,12 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             il, count, &mid_f16, true);
 #endif
     }
-    if (ok && (!shared_owner || g->tp_rank != (il & 1u)))
+    /* Only the TP rank that owns this layer's shared expert folds it into the
+     * routed partial (the peer partial is summed next). Single-GPU callers add
+     * routed + shared themselves. 41bb7cf inverted this condition, so on one
+     * GPU every batched row (layer prefill, short batches, DSpark verify)
+     * counted the shared expert twice. */
+    if (ok && shared_owner && g->tp_rank == (il & 1u))
         ok = ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD);
     if (ok) ok = ds41_sum_partial_batch(g, b->routed, il, count);
     return ok;
@@ -42993,6 +43023,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 if (!ok) fprintf(stderr, "ds4: V4.1 Engram row read failed: %s\n", strerror(errno));
             }
             if (ok) ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+            if (ok) ds41_trace_vec("stepE", il, g->pos, g->engram_rows, 0, sizeof(g->rows[i]) / 4u);
         }
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -43027,6 +43058,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
                                                g->selected, false, il, 1);
         if (!ok) fprintf(stderr, "ds4: V4.1 layer %u failed at position %u\n", il, g->pos);
+        if (ok) ds41_trace_residual("step", il, g->pos, g->residual, 0);
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
     }
@@ -43202,13 +43234,19 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
  * A/B shows both a wall-time gain and acceptable frontier logits. */
 static uint32_t ds41_rocm_short_prefill_count(const ds41_gpu_graph *g,
                                                uint32_t remaining) {
+    /* Default mode 2 (official scorer, cont.-prefill 100: 0.6531 vs per-token
+     * 0.6471, in band; short appends ~+40 %). 0 = token-by-token, 1 = 8-row. */
     const char *env = getenv("DS4_ROCM_V41_SHORT_PREFILL");
-    if (!env || !env[0] || env[0] == '0') return 0;
+    if (!env || !env[0]) env = "2";
+    if (env[0] == '0') return 0;
     if (!g || !g->valid || remaining < 2u || remaining >= 256u ||
         g->tp_world != 1u || !g->streaming || g->quality || g->imatrix ||
         g->image_count || g->draft || g->prefill_cap < 2u ||
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL")) return 0;
-    return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
+    /* Mode 2: chunks of <= 6 rows on the gfx1151 tiny-batch (DSpark verify)
+     * kernels, which only engage at <= 6 rows. */
+    const uint32_t cap = env[0] == '2' ? 6u : DS4_TP_BATCH_MAX_ROWS;
+    return remaining < cap ? remaining : cap;
 }
 #endif
 
@@ -44000,6 +44038,30 @@ static bool ds41_diag_dump_rows(const char *stage, uint32_t il, const char *name
     return ok;
 }
 
+/* Diagnostic: DS4_V41_TRACE_POS=P and DS4_V41_TRACE_DIR=D write the HC residual
+ * of the token at absolute position P after every layer, from the single-row
+ * step ("step") and the batched row step ("batch"), to D/<path>_L<il>.f32. */
+static void ds41_trace_vec(const char *path, uint32_t il, uint32_t pos,
+                           const ds4_gpu_tensor *t, uint64_t offset, uint64_t n) {
+    static long want = -2;
+    static const char *dir;
+    if (want == -2) {
+        const char *p = getenv("DS4_V41_TRACE_POS");
+        dir = getenv("DS4_V41_TRACE_DIR");
+        want = p && dir ? atol(p) : -1;
+    }
+    if (want < 0 || (long)pos != want || !t) return;
+    float *buf = malloc(n * sizeof(float));
+    if (!buf) return;
+    if (ds4_gpu_synchronize() && ds4_gpu_tensor_read(t, offset, buf, n * sizeof(float))) {
+        char file[512];
+        snprintf(file, sizeof(file), "%s/%s_L%02u.f32", dir, path, il);
+        FILE *fp = fopen(file, "wb");
+        if (fp) { fwrite(buf, sizeof(float), n, fp); fclose(fp); }
+    }
+    free(buf);
+}
+
 static bool ds41_diag_dump_stage(const char *stage, ds41_gpu_graph *g,
                                  ds41_prefill_row *b, uint32_t il,
                                  uint32_t start, uint32_t count) {
@@ -44686,6 +44748,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
                     engram && (uint32_t)i < prefill_rows ? engram[i][table] : s->rows[table],
                     sizeof(s->rows[table]));
+                if (ok) ds41_trace_vec("batchE", il, positions[i], g->rows_view[i].engram_rows, 0, sizeof(s->rows[table]) / 4u);
             }
         }
         if (ok && g->draft)
@@ -44748,12 +44811,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         }
 #endif
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
-        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
+        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16);
+        for (uint32_t i = 0; ok && i < rows; i++)
+            ds41_trace_vec("batchB", il, positions[i], active.block, (uint64_t)i * DS4_N_EMBD * 4u, DS4_N_EMBD);
+        if (ok) ok =
             ds41_after_attention_batch(
 #ifdef DS4_ROCM_BUILD
             g,
 #endif
             &active, model, l, rows);
+        for (uint32_t i = 0; ok && i < rows; i++)
+            ds41_trace_residual("batchA", il, positions[i], active.after_attn,
+                (uint64_t)i * DS4_N_HC * DS4_N_EMBD * sizeof(float));
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
@@ -44767,6 +44836,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner,
                                     g->streaming && g->draft && ds41_dspark_ssd_allowed() &&
                                     !getenv("DS4_ROCM_V41_DSPARK_SSD_SYNC_VERIFY"));
+        for (uint32_t i = 0; ok && i < rows; i++) {
+            char nm[5][24];
+            const char *base[5] = {"batchSel", "batchW", "batchSh", "batchRt", "batchN"};
+            for (int q = 0; q < 5; q++) snprintf(nm[q], sizeof nm[q], i ? "%s%u" : "%s", base[q], i);
+            ds41_trace_vec(nm[0], il, positions[0], g->batch.selected, (uint64_t)i * DS4_N_EXPERT_USED * 4u, DS4_N_EXPERT_USED);
+            ds41_trace_vec(nm[1], il, positions[0], g->batch.route_weights, (uint64_t)i * DS4_N_EXPERT_USED * 4u, DS4_N_EXPERT_USED);
+            ds41_trace_vec(nm[2], il, positions[0], g->batch.shared, (uint64_t)i * DS4_N_EMBD * 4u, DS4_N_EMBD);
+            ds41_trace_vec(nm[3], il, positions[0], g->batch.routed, (uint64_t)i * DS4_N_EMBD * 4u, DS4_N_EMBD);
+            ds41_trace_vec(nm[4], il, positions[0], g->batch.norm, (uint64_t)i * DS4_N_EMBD * 4u, DS4_N_EMBD);
+        }
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
@@ -44792,6 +44871,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #endif
         /* The second Engram upload reuses the first one's input storage. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
+        for (uint32_t i = 0; ok && i < rows; i++)
+            ds41_trace_residual("batch", il, positions[i], active.residual,
+                (uint64_t)i * DS4_N_HC * DS4_N_EMBD * sizeof(float));
     }
     const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float) /
                                   (g->tp_logits_half ? 2u : 1u);
@@ -45019,9 +45101,17 @@ static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
         g->pos > g->ctx || count > g->ctx - g->pos) return false;
     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
     for (uint32_t i = 0; i < count; i++) graphs[i] = g;
+#ifdef DS4_ROCM_BUILD
+    const char *mode = getenv("DS4_ROCM_V41_SHORT_PREFILL");
+    const bool tiny = (!mode || !mode[0] || mode[0] == '2') && count <= 6u;
+    if (tiny) ds4_gpu_set_dspark_verify_mode(true);
+#endif
     bool ok = ds4_gpu_begin_commands() && ds41_graph_step_batch(graphs, tokens,
         (int)count, count, m, w);
     if (ok) ok = ds4_gpu_end_commands() != 0;
+#ifdef DS4_ROCM_BUILD
+    if (tiny) ds4_gpu_set_dspark_verify_mode(false);
+#endif
     else (void)ds4_gpu_synchronize();
     if (!ok) g->valid = false;
     return ok;

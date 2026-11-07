@@ -268,3 +268,50 @@ Width 3, SSD verify prefetch, 86GB cache (drafter memory) vs plain 92GB: decode 
 11.06 tok/s (-6 %), total prefill 357.8 vs 331.9 s (+8 %), greedy text identical,
 accept rate 64.6 % (1.65 drafts accepted per cycle). Agent turns are short decodes right
 after new content, so the smaller cache and verify overhead outweigh the accepted drafts.
+
+## 12. Batched rows counted the shared expert twice (bug from 41bb7cf, fixed)
+
+Symptom: every batched path (layer-major prefill sweep, short batches, DSpark verify)
+disagreed with token-by-token decode by far more than rounding, and scored worse on the
+official scorer (continued-prefill 100: per-token tail 0.6395 vs sweep tail 0.7502).
+
+Method: `DS4_V41_TRACE_POS=P DS4_V41_TRACE_DIR=D` dumps, for the token at position P,
+per-layer vectors from the single-row step and the batched row step (residual, after-attn,
+MoE input/selection/weights/shared/routed, Engram rows, q/kv/heads, attention block).
+8192-token prefix (identical in both runs), then a 6-token append token-by-token vs one batch.
+- Layer 0: attention half identical (0.0); MoE half rel. 0.28. Same experts and weights,
+  shared expert equal; "routed" differed by rel 2.69.
+- CPU reference of the layer-0 routed experts from the GGUF weights (IQ2_XXS gate/up,
+  Q2_K down, clamp 10): the single-row output matches (rel 1.8e-2); the batched one is
+  exactly REF + SHARED (least squares 1.000 / 1.000, residual 1.5e-3).
+- Cause: `ds41_moe_batch` must fold the shared expert into the routed partial only on the
+  TP rank that owns it. 41bb7cf rewrote `(!shared_owner || rank != owner || add)` as
+  `if (!shared_owner || rank != owner) add` (inverted), and single-GPU callers add
+  routed + shared again. Every batched row on one GPU counted the shared expert twice in
+  all 40 layers. Single-row decode (ds41_moe) was correct, so generation looked fine.
+- After the fix, layer outputs match to rounding (L0 2.6e-3, attention heads 2.7e-3 at L1);
+  the remaining growth tracks MoE selection flips at near-tie gates (top-6 weights
+  0.19-0.24), not further defects.
+
+Official scorer, 20260911-long manifest, 92GB SSD streaming (`api_target_mae` = error vs the
+API reference log-probs stored in the manifest's continuations/):
+
+| arm | avg NLL | api_target_mae |
+|---|---|---|
+| default prefill, before fix | 0.6956 | 0.493 |
+| default prefill, after fix | **0.6486** (-6.8 %, 5/9 wins) | **0.441** |
+| cont.-prefill 100, token-by-token tail, after fix | 0.6471 | 0.448 |
+| cont.-prefill 100, 6-row short prefill (mode 2), after fix | 0.6531 (+0.9 % vs per-token, 4/9) | 0.445 |
+
+Batched and token-by-token paths now agree; short prefill mode 2 is in band and became the
+ROCm default (`DS4_ROCM_V41_SHORT_PREFILL=0` restores token-by-token, `1` = 8-row generic).
+
+Agent replay after the fix: total prefill 331.9 -> 326.5 s (short appends 222: 26.7 -> 19.4 s,
+332: 10.2 -> 8.0 s, 92: 6.9 -> 5.4 s), decode 11.06 -> 8.86 tok/s. The decode change is a
+workload change, not a regression: the replay continues raw slices of a recorded session,
+and before the fix the model mostly echoed the tool output it was reading ("$1.class",
+"| 1 | 2 | 3 ..."), which reuses few experts; after the fix it writes agent reasoning and
+tool calls ("Need inspect src. Also read docs/development/CONTEXT.md ..."), with ~1.5x the
+decode misses. With token-by-token tails the fixed build decodes the same (8.94 tok/s), and
+the single-row decode code is unchanged by the fix. Decode baselines on this replay must
+be re-taken after this commit.
