@@ -755,6 +755,10 @@ int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
      * so long agent sessions were never checkpointed.  The stored length is
      * the live length; lookups match by text prefix, not alignment. */
     if (live_tokens / step <= kc->continued_last_store_tokens / step) return 0;
+    /* A boundary crossed shortly after a post-prefill store (e.g. 20187 then
+     * 20480 during decode) would only duplicate that checkpoint. */
+    if (kc->continued_last_store_tokens > 0 &&
+        live_tokens - kc->continued_last_store_tokens < step / 4) return 0;
     return live_tokens;
 }
 

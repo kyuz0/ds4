@@ -21596,6 +21596,9 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.continued_last_store_tokens = 12095;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 15092) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 23718) == 23718);
+    kc.continued_last_store_tokens = 20187;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 30720);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
