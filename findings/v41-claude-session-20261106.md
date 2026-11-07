@@ -243,3 +243,28 @@ Same replay, two ABBA rounds, greedy text identical in every arm (cache policy o
 Both are now default on ROCm (`DS4_ROCM_V41_APPEND_SEED_PCT`, default 75;
 `DS4_ROCM_V41_GROW_CACHE_AFTER_PREFILL=0` disables the growth). Combined vs the old
 defaults: agent prefill -9 %, decode +3.5 %, decode SSD misses -17 %.
+
+### 11c. Protecting the decode working set during prefill: rejected (H010)
+
+Opt-in experiment (patch kept out of tree): while a prompt is being prefilled, LRU eviction
+first skipped experts that decode used within its last N tokens. Agent replay, 92GB, 128K:
+
+| N decode tokens protected | decode tok/s | decode misses | total prefill |
+|---|---|---|---|
+| 0 (current default) | 11.06 | 8624 | 331.9 s |
+| 256 | 10.70 | 9435 | 342.1 s |
+| 1024 | 9.58 | 14691 | 350.4 s |
+
+Decode right after an append needs the experts the *new* content activated (as H007 showed
+for the post-prefill seed); keeping the previous decode set evicts exactly those. The slow
+first ~50-150 decode tokens after a tool result are new-content misses, not lost old ones.
+
+Also from the live session: the disk KV cache never checkpointed long chats (exact-multiple
+rule vs one-pass V4.1 appends), fixed in 5b79d52 / 9fba89a; resumes now load from disk.
+
+### 11d. DSpark on the agent replay: no gain (stays opt-in)
+
+Width 3, SSD verify prefetch, 86GB cache (drafter memory) vs plain 92GB: decode 10.43 vs
+11.06 tok/s (-6 %), total prefill 357.8 vs 331.9 s (+8 %), greedy text identical,
+accept rate 64.6 % (1.65 drafts accepted per cycle). Agent turns are short decodes right
+after new content, so the smaller cache and verify overhead outweigh the accepted drafts.
