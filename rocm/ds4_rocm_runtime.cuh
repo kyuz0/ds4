@@ -7630,6 +7630,10 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
+    /* Diagnostic: DS4_ROCM_FORCE_QUALITY_KERNELS=1 selects the F32 quality kernels
+     * without the engine-level quality mode (which SSD streaming rejects). */
+    if (getenv("DS4_ROCM_FORCE_QUALITY_KERNELS") && getenv("DS4_ROCM_FORCE_QUALITY_KERNELS")[0] == '1')
+        quality = true;
     const int new_quality_mode = quality ? 1 : 0;
     if (g_quality_mode != new_quality_mode) {
         g_rocm_cfg.initialized = 0;

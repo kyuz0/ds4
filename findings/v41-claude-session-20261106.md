@@ -207,3 +207,39 @@ DSpark draft width (DS4_DSPARK_FIXED_WIDTH, adaptive off), code 8K gen128:
 2: 12.20 tps (441 misses), 3: 13.43 (422), 4: 12.89 (531), 5: ~12.5 (537). Plain: 11.84.
 Best: width 3, +13 % on code with this drive. A DRAM-equipped NVMe that sustains
 5+ GB/s on large random reads would cut miss cost ~3-4x for both plain decode and DSpark.
+
+## 11. Agentic coding (Pi replay, 2026-11-07)
+
+Replay: the rendered prompt of a real 15-turn Pi session (~40K tokens), sliced at the
+real request boundaries (`--ctx-frontiers 1878,...,40304`, 120 generated tokens each,
+92GB cache, 128K ctx).
+
+- Tool-calling failures seen in Pi were a client config problem (`models.json` without
+  `thinkingFormat: deepseek` / reasoning-content compat). The engine output was bit-identical to
+  the session-start binary at 512-2048 tokens.
+- Appends and prefill tails under 256 tokens run token-by-token (~80-140 ms/token): a
+  222-token append took 30.7 s. Sending them through the layer sweep instead
+  (`DS4_ROCM_V41_PREFILL_MIN=32`) cut that to ~10 s but failed the official scorer
+  (NLL +17 %, 0/9 wins). Rejected (H009).
+- **Token-by-token and sweep prefill are different computations, before this session too.**
+  At 600 tokens (prose) the two paths give different frontier logits and different greedy
+  text; the current build is bit-identical to the session-start build on *each* path
+  (`ak gate logits` pass/pass), so this is pre-existing engine behaviour, not a
+  regression. The official scorer prefers the token-by-token tail (0.6395 vs 0.7502).
+  F32 quality kernels move the sweep logits only slightly (max |d| 1.44 vs 14), so it is
+  not rounding. A CPU arbiter is unavailable (V4.1 needs Metal/CUDA/ROCm). Open question
+  for upstream.
+
+### 11b. Expert-cache policy for agent sessions (new defaults)
+
+Same replay, two ABBA rounds, greedy text identical in every arm (cache policy only):
+
+| arm | total prefill | decode tok/s | decode misses |
+|---|---|---|---|
+| append seed 100 % (old default) | 372.9 / 376.1 s | 10.66 / 10.73 | 10414 |
+| append seed 75 % | 346.7 / 347.1 / 349.1 s | 10.58 / 10.58 / 10.61 | 10197 |
+| 75 % + grow cache after prefill | 336.9 / 340.1 s | 11.01 / 11.03 | 8632 / 8683 |
+
+Both are now default on ROCm (`DS4_ROCM_V41_APPEND_SEED_PCT`, default 75;
+`DS4_ROCM_V41_GROW_CACHE_AFTER_PREFILL=0` disables the growth). Combined vs the old
+defaults: agent prefill -9 %, decode +3.5 %, decode SSD misses -17 %.

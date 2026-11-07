@@ -43067,10 +43067,26 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent
  * routes take precedence over the rest of the prompt's popular experts. */
 static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
-                             const ds4_layer_weights *l, uint32_t il, uint32_t count) {
+                             const ds4_layer_weights *l, uint32_t il, uint32_t count,
+                             bool append) {
 #if (defined(__APPLE__) || defined(DS4_ROCM_BUILD)) && !defined(DS4_NO_GPU)
     if (!g->streaming || getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_CACHE_SEED")) return true;
     uint32_t target = ds4_gpu_stream_expert_cache_configured_count() / DS4_N_LAYER;
+#ifdef DS4_ROCM_BUILD
+    /* Seed only part of a layer's cache share on appends (g->pos > count: a warm
+     * session), so experts recently used by decode are not all displaced by the
+     * appended text's experts. DS4_ROCM_V41_APPEND_SEED_PCT, default 75. */
+    {
+        static int pct = -1;
+        if (pct < 0) {
+            const char *v = getenv("DS4_ROCM_V41_APPEND_SEED_PCT");
+            pct = v && *v ? atoi(v) : 75;   /* agent replay: appends -8 % time, decode flat */
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+        }
+        if (pct < 100 && append) target = target * (uint32_t)pct / 100u;
+    }
+#endif
     if (target > DS4_N_EXPERT) target = DS4_N_EXPERT;
     if (!target) return true;
 #ifdef DS4_ROCM_BUILD
@@ -43117,7 +43133,7 @@ static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
     return ended && ok;
 #endif
 #else
-    (void)g; (void)m; (void)l; (void)il; (void)count;
+    (void)g; (void)m; (void)l; (void)il; (void)count; (void)append;
     return true;
 #endif
 }
@@ -44462,7 +44478,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
 #endif
             if (ok && !encoder_only && off + count == total_count)
-                ok = ds41_prefill_seed(g, m, &w->layer[il], il, count);
+                ok = ds41_prefill_seed(g, m, &w->layer[il], il, count, initial_start > 0u);
             if (engram_prefetched && ds41_engram_layer(il) && off + count == total_count &&
                 !ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
             if (profile)
@@ -73541,6 +73557,11 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
     return ds4_engine_open_internal(out, opt, gpu_cfg);
 }
 
+#ifdef DS4_NO_GPU
+/* The GPU-side definition is compiled out of the CPU-only build. */
+static bool ds41_dspark_ssd_allowed(void) { return false; }
+#endif
+
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
@@ -80954,15 +80975,15 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 /* Reclaim the prefill expert reserve as dynamic decode cache once prefill has
  * finished. The streaming slab grows lazily and is free-memory guarded, so this
  * can only use memory that is genuinely available; nothing is pre-allocated.
- * Opt-in: DS4_ROCM_V41_GROW_CACHE_AFTER_PREFILL=1. The earlier +5-10% was
- * DVFS drift between arms; a clock-soaked A/B shows +0.6% with overlapping
- * ranges and ~4% slower 4K appends, so this stays off until re-measured. */
+ * Default on; DS4_ROCM_V41_GROW_CACHE_AFTER_PREFILL=0 disables. Agent-session
+ * replay (15 appends, ~40K tokens, ABBA): decode 10.6 -> 11.0 tok/s, decode
+ * misses -15 %, total prefill -3 %, identical greedy text. */
 static void ds41_stream_grow_cache_after_prefill(ds4_session *s) {
     static bool grown;
     ds4_engine *e = s ? s->engine : NULL;
     if (grown || !e || !e->ssd_streaming) return;
     const char *env = getenv("DS4_ROCM_V41_GROW_CACHE_AFTER_PREFILL");
-    if (env == NULL || (env[0] == '0' && env[1] == '\0')) return;  /* opt-in */
+    if (env != NULL && env[0] == '0' && env[1] == '\0') return;  /* default on */
     grown = true;
     if (e->ssd_streaming_cache_bytes == 0 || e->ssd_streaming_prefill_headroom_bytes == 0) return;
     const uint64_t budget = ds4_add_sat_u64(e->ssd_streaming_cache_bytes,
