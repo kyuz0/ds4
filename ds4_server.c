@@ -21588,6 +21588,14 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.continued_last_store_tokens = 20480;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+
+    /* One-pass appends jump over boundaries; crossing one must still store. */
+    kc.opt = kv_cache_default_options();
+    kc.continued_last_store_tokens = 0;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 12095) == 12095);
+    kc.continued_last_store_tokens = 12095;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 15092) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 23718) == 23718);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
