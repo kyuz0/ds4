@@ -11406,6 +11406,9 @@ static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
+    /* Mid-prefill progress callbacks (one per short-prefill chunk) cannot be
+     * staged; skip them quietly and let the post-prefill call store. */
+    if (!ds4_session_checkpoint_valid(slot->session)) return;
     const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
     if (target == 0) return;
     if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
