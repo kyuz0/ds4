@@ -43233,6 +43233,13 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
     if (g->carry_cap && remaining >= 4096u &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) {
         const uint32_t count = remaining < g->carry_cap ? remaining : g->carry_cap;
+#ifdef DS4_ROCM_BUILD
+        /* Whole remainder in this sweep when it fits: avoids a second full
+         * SSD layer pass for the last partial 2048-row chunk.
+         * DS4_ROCM_V41_WIDE_ROUND=1 restores the 2048-multiple split. */
+        if (count == remaining && g->streaming && g->tp_world == 1u &&
+            !getenv("DS4_ROCM_V41_WIDE_ROUND")) return count;
+#endif
         return count - count % 2048u;
     }
     const uint32_t tail_cap = g->prefill_cap < 2048u ? g->prefill_cap : 2048u;

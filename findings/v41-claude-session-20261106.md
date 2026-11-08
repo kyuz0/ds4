@@ -335,3 +335,16 @@ partitions (`DS4_ROCM_V41_DISABLE_MEDIUM_SWEEP=1` restores the split).
 frontier logits), 2134 22.1 -> 15.1 s (86-token remainder now in the sweep instead of 6-row
 batches: KL 6e-4, same top-1; both tail paths passed the official scorer, section 12).
 Agent replay: total prefill 326.5 -> 306.3 s (-6.2 %), decode 8.86 -> 8.95 tok/s.
+
+### 13b. Appends of 8K+ tokens: whole remainder in the same sweep
+
+The wide branch rounded a large append down to a multiple of 2048 and ran the remainder as a
+second full sweep (9684 = 8192 + 1492, 8626 = 8192 + 434, a 27880-token resume = 26624 + 1256,
+every 16388-token scorer prompt = 16384 + 4). Now the whole append runs in one sweep when it fits
+in carry_cap (`DS4_ROCM_V41_WIDE_ROUND=1` restores the split). The decoder suffix then covers a
+different row set, so this is gated by the scorer: long manifest NLL 0.6486 -> 0.6385
+(-1.6 %, 6/9 wins), api_target_mae 0.441 -> 0.432. 9684 tokens: fresh 51.1 -> 40.4 s, append
+45.9 -> 36.8 s. Agent replay total prefill 306.3 -> 291.7 s (decode 8.95 -> 8.74 tok/s on
+slightly different generated text, misses 11467 -> 11639).
+
+Cumulative agent replay since the bug fix: prefill 326.5 -> 291.7 s (-10.7 %).
