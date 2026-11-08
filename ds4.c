@@ -43260,12 +43260,20 @@ static uint32_t ds41_rocm_short_prefill_count(const ds41_gpu_graph *g,
     if (env[0] == '0') return 0;
     if (!g || !g->valid || remaining < 2u || remaining >= 256u ||
         g->tp_world != 1u || !g->streaming || g->quality || g->imatrix ||
-        g->image_count || g->draft || g->prefill_cap < 2u ||
+        g->draft || g->prefill_cap < 2u ||
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL")) return 0;
     /* Mode 2: chunks of <= 6 rows on the gfx1151 tiny-batch (DSpark verify)
      * kernels, which only engage at <= 6 rows. */
     const uint32_t cap = env[0] == '2' ? 6u : DS4_TP_BATCH_MAX_ROWS;
-    return remaining < cap ? remaining : cap;
+    const uint32_t count = remaining < cap ? remaining : cap;
+    /* Sessions with images: batch text-only rows (e.g. a tool result after a
+     * screenshot); image rows keep the token-by-token path, which embeds them. */
+    if (g->image_count) {
+        if (getenv("DS4_ROCM_V41_SHORT_PREFILL_NO_IMAGE_SESSIONS")) return 0;
+        for (uint32_t i = 0; i < count; i++)
+            if (ds41_image_at(g, g->pos + i)) return 0;
+    }
+    return count;
 }
 #endif
 
@@ -44760,6 +44768,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     if (dspark_profile) profile_engram_host += now_sec() - engram_t0;
 #endif
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
+    /* The batched Engram add masks image rows with image_text_mask. The layer
+     * sweep fills it per chunk; these rows must fill it too, or a session with
+     * images reads a stale mask (layer-1 rel. error 0.3-0.4 vs token-by-token). */
+    bool any_images = false;
+    for (int i = 0; i < count; i++) any_images = any_images || graphs[i]->image_count;
+    if (ok && any_images) {
+        uint8_t text_mask[DS4_TP_BATCH_MAX_ROWS];
+        for (int i = 0; i < count; i++)
+            text_mask[i] = ds41_image_at(graphs[i], positions[i]) ? 0u : 1u;
+        ok = ds4_gpu_tensor_write(g->image_text_mask, 0, text_mask, (uint64_t)count) != 0;
+    }
 #ifdef DS4_ROCM_BUILD
     if (dspark_profile && ok) {
         ok = ds4_gpu_synchronize();
