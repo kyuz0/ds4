@@ -78474,6 +78474,16 @@ bool ds4_session_vision_fingerprint_prefix_matches(
     return true;
 }
 
+size_t ds4_session_image_token_ranges(const ds4_session *s, uint32_t *starts,
+                                      uint32_t *counts, size_t cap) {
+    if (!s || !s->checkpoint_valid) return 0;
+    for (size_t i = 0; i < s->checkpoint_image_count && i < cap; i++) {
+        if (starts) starts[i] = s->checkpoint_images[i].token_start;
+        if (counts) counts[i] = s->checkpoint_images[i].token_count;
+    }
+    return s->checkpoint_image_count;
+}
+
 bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count) {
     if (!s || !s->checkpoint_valid || (image_count && !images) ||

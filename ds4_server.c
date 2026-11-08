@@ -10023,6 +10023,7 @@ struct server_slot {
     char *live_text;
     size_t live_text_len;
     int live_text_pos;              /* checkpoint.len at render time; 0 = stale */
+    size_t live_text_images;        /* >0: each image span rendered as one '\036' */
 
     job *assigned;
     job *running;
@@ -11520,6 +11521,43 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
 
 
 
+/* Does the request's rendered prompt start with the live checkpoint's text?
+ * Text-only checkpoints compare bytes directly. Checkpoints with images were
+ * rendered with one '\036' per image (slot_refresh_live_text); here each of the
+ * request's image markers stands for one '\036'. On success *suffix_off is the
+ * request-text offset where new text begins. Image identity is verified later
+ * by build_live_prompt_suffix (fingerprints and spans). */
+static bool live_text_prefix_offset(const request *req, const char *ptext, size_t plen,
+                                    const server_slot *slot, size_t *suffix_off) {
+    if (!slot->live_text_images) {
+        if (slot->live_text_len > plen ||
+            !byte_prefix_match(ptext, plen, slot->live_text, slot->live_text_len))
+            return false;
+        *suffix_off = slot->live_text_len;
+        return true;
+    }
+    if (!req->image_markers || req->image_count < slot->live_text_images) return false;
+    size_t i = 0, j = 0, img = 0;
+    const char *marker = strstr(ptext, req->image_markers[0]);
+    while (j < slot->live_text_len) {
+        const char lc = slot->live_text[j];
+        if (marker && ptext + i == marker) {
+            if (lc != '\036') return false;
+            i += strlen(req->image_markers[img]);
+            j++;
+            img++;
+            marker = img < req->image_count ? strstr(ptext + i, req->image_markers[img]) : NULL;
+            continue;
+        }
+        if (lc == '\036' || i >= plen || ptext[i] != lc) return false;
+        i++;
+        j++;
+    }
+    if (img != slot->live_text_images) return false;
+    *suffix_off = i;
+    return true;
+}
+
 /* =========================================================================
  * Live-state reuse probe.
  *
@@ -11716,13 +11754,13 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         }
     }
 
+    size_t text_suffix_off = 0;
     if (ptext && slot->live_text && slot->live_text_pos == live_pos &&
-        slot->live_text_len <= plen &&
-        byte_prefix_match(ptext, plen, slot->live_text, slot->live_text_len))
+        live_text_prefix_offset(req, ptext, plen, slot, &text_suffix_off))
     {
         pr.kind = REUSE_MEMORY_TEXT;
         pr.reuse_tokens = live_pos;
-        pr.suffix_off = slot->live_text_len;
+        pr.suffix_off = text_suffix_off;
         return pr;
     }
 
@@ -11760,6 +11798,7 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
     slot->live_text = NULL;
     slot->live_text_len = 0;
     slot->live_text_pos = 0;
+    slot->live_text_images = 0;
     if (!s || !slot->session ||
         !ds4_session_checkpoint_valid(slot->session))
     {
@@ -11767,8 +11806,42 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
     }
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     if (!live || live->len <= 0) return;
-    slot->live_text = render_tokens_text(s->engine, live, &slot->live_text_len);
-    if (slot->live_text) slot->live_text_pos = live->len;
+    uint32_t starts[16], counts[16];
+    const size_t images = ds4_session_image_token_ranges(slot->session, starts, counts, 16);
+    if (images == 0) {
+        slot->live_text = render_tokens_text(s->engine, live, &slot->live_text_len);
+        if (slot->live_text) slot->live_text_pos = live->len;
+        return;
+    }
+    if (images > 16) return;
+    /* Image placeholder tokens render as token text, while request prompt text
+     * carries a per-request marker string. Collapse each image to one '\036'
+     * on both sides (see collapse_image_markers) so a text-identical replay
+     * whose re-tokenization differs can still continue the live session. */
+    buf b = {0};
+    int pos = 0;
+    for (size_t i = 0; i <= images; i++) {
+        const int end = i < images ? (int)starts[i] : live->len;
+        if (end < pos || end > live->len) { buf_free(&b); return; }
+        if (end > pos) {
+            ds4_tokens part = {0};
+            for (int t = pos; t < end; t++) ds4_tokens_push(&part, live->v[t]);
+            size_t len = 0;
+            char *text = render_tokens_text(s->engine, &part, &len);
+            ds4_tokens_free(&part);
+            if (!text) { buf_free(&b); return; }
+            buf_append(&b, text, len);
+            free(text);
+        }
+        if (i < images) {
+            buf_putc(&b, '\036');
+            pos = (int)(starts[i] + counts[i]);
+        }
+    }
+    slot->live_text_len = b.len;
+    slot->live_text = buf_take(&b);
+    slot->live_text_pos = live->len;
+    slot->live_text_images = images;
 }
 
 /* =========================================================================
@@ -16264,6 +16337,28 @@ static void test_slot_probe_and_routing_scores(void) {
     TEST_ASSERT(pr.reuse_tokens == 3);
     TEST_ASSERT(pr.suffix_off == 11);
     TEST_ASSERT(job_slot_score(&s, &tslot, &txt, -1, now) == 3);
+
+    /* 3b. Image checkpoint: live text carries one '\036' per image and the
+     *     request carries its own marker string; a text-identical replay
+     *     binds with the suffix offset in request-text coordinates. */
+    {
+        server_slot islot = {0};
+        islot.live_text = (char *)"ab\036cd";
+        islot.live_text_len = 5;
+        islot.live_text_images = 1;
+        request ireq = {0};
+        char markers[1][SERVER_IMAGE_MARKER_BYTES] = {"<IMG#0>"};
+        ireq.image_markers = markers;
+        ireq.image_count = 1;
+        const char *ok_text = "ab<IMG#0>cd-new";
+        size_t off = 0;
+        TEST_ASSERT(live_text_prefix_offset(&ireq, ok_text, strlen(ok_text), &islot, &off));
+        TEST_ASSERT(off == strlen("ab<IMG#0>cd"));
+        const char *bad_text = "ab<IMG#0>cX-new";
+        TEST_ASSERT(!live_text_prefix_offset(&ireq, bad_text, strlen(bad_text), &islot, &off));
+        const char *no_img = "ab\036cd-new";
+        TEST_ASSERT(!live_text_prefix_offset(&ireq, no_img, strlen(no_img), &islot, &off));
+    }
 
     /* 4. Stale rendered-text cache (checkpoint moved past it) must not bind. */
     tslot.live_text_pos = 2;

@@ -468,6 +468,10 @@ bool ds4_session_vision_fingerprint_prefix_matches(const ds4_session *s,
  * on failure, leaves spans unchanged. This does not verify the text history. */
 bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count);
+/* Token ranges of the images in a valid checkpoint, in prompt order. Writes up
+ * to cap entries and returns the checkpoint's image count (0 if invalid). */
+size_t ds4_session_image_token_ranges(const ds4_session *s, uint32_t *starts,
+                                      uint32_t *counts, size_t cap);
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
