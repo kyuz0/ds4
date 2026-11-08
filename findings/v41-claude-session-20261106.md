@@ -348,3 +348,17 @@ different row set, so this is gated by the scorer: long manifest NLL 0.6486 -> 0
 slightly different generated text, misses 11467 -> 11639).
 
 Cumulative agent replay since the bug fix: prefill 326.5 -> 291.7 s (-10.7 %).
+
+### 13c. Where a medium append's time goes now (dead ends recorded)
+
+- HC projection kernel for partial chunks (f16_ordered_token_reuse, lanes read addresses a
+  whole chunk apart): an LDS-staged variant with the same accumulation order was bit-identical
+  but not faster (717 rows 50.5 -> 48.4 tok/s). The per-layer stage profile charges the
+  layer-load wait to the first stage after it, which made HC look 9x slower per row than in
+  2048-row chunks. Not kept.
+- DS4_ROCM_STREAM_EVICT_PAST_LAYERS_FIRST=1: identical cache statistics and logits. Sweeps do
+  not evict at all (evictions=0); misses are simply the ~40 % of experts the 92GB cache cannot
+  hold, and a 700+-row sweep touches all 384 experts of every layer.
+- A sweep therefore streams ~1.5 GB per layer (~60 GB) at ~4.5 GB/s against the drive's
+  4.9 GB/s sequential ceiling: medium appends are SSD-bound. Remaining engine-side item:
+  the post-layer seed (~5 % of a 717-token append) runs serially and could overlap compute.
