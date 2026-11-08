@@ -43218,6 +43218,18 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
         !getenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP") &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) return remaining;
 #endif
+#ifdef DS4_ROCM_BUILD
+    /* Medium SSD appends in one layer sweep. The sweep still walks each layer in
+     * the same 2048-row partitions, so only the second pass over the layers and
+     * its expert reloads disappear (a 3072-token append ran as 2048 + 1024, two
+     * full expert-streaming passes). Below 8192 rows the decoder suffix is never
+     * engaged, so the arithmetic matches the split sweeps.
+     * DS4_ROCM_V41_DISABLE_MEDIUM_SWEEP=1 restores the split. */
+    if (g->streaming && g->tp_world == 1u && g->carry_cap >= remaining &&
+        remaining > 2048u && remaining < 8192u &&
+        !getenv("DS4_ROCM_V41_DISABLE_MEDIUM_SWEEP") &&
+        !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) return remaining;
+#endif
     if (g->carry_cap && remaining >= 4096u &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) {
         const uint32_t count = remaining < g->carry_cap ? remaining : g->carry_cap;

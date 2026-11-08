@@ -315,3 +315,23 @@ tool calls ("Need inspect src. Also read docs/development/CONTEXT.md ..."), with
 decode misses. With token-by-token tails the fixed build decodes the same (8.94 tok/s), and
 the single-row decode code is unchanged by the fix. Decode baselines on this replay must
 be re-taken after this commit.
+
+### 12b. DSpark re-measured after the fix: still a loss
+
+Agent replay, fixed build: DSpark width 3 (86GB) decode 7.48 vs plain 8.86 tok/s (-16 %),
+prefill 372.6 vs 326.5 s, accept rate 58.1 % (1.33 drafts/cycle). With correct prefill the
+model writes varied reasoning, which the drafter predicts worse. DSpark stays opt-in.
+
+## 13. Medium appends in one layer sweep (ROCm default)
+
+Profile of a 717-token append (DS4_METAL_GRAPH_PREFILL_PROFILE): 14.3 s = layer-load wait 8.3 s
+(58 %), compute 5.2 s (36 %), post-prefill seed 0.75 s. 717 rows touch all 384 experts per layer,
+so the uncached ~40 % must stream from the SSD each sweep. ds41_prefill_count split appends
+over 2048 tokens into several sweeps (3072 = 2048 + 1024; 5171 = 4096 + 1075), each paying a
+full layer-streaming pass. Now 2048 < n < 8192 runs as one sweep with the same 2048-row
+partitions (`DS4_ROCM_V41_DISABLE_MEDIUM_SWEEP=1` restores the split).
+
+8192-token prefix + appends: 3072 29.0 -> 18.0 s, 5171 35.8 -> 28.7 s (both bit-identical
+frontier logits), 2134 22.1 -> 15.1 s (86-token remainder now in the sweep instead of 6-row
+batches: KL 6e-4, same top-1; both tail paths passed the official scorer, section 12).
+Agent replay: total prefill 326.5 -> 306.3 s (-6.2 %), decode 8.86 -> 8.95 tok/s.
