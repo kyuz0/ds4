@@ -362,3 +362,25 @@ Cumulative agent replay since the bug fix: prefill 326.5 -> 291.7 s (-10.7 %).
 - A sweep therefore streams ~1.5 GB per layer (~60 GB) at ~4.5 GB/s against the drive's
   4.9 GB/s sequential ceiling: medium appends are SSD-bound. Remaining engine-side item:
   the post-layer seed (~5 % of a 717-token append) runs serially and could overlap compute.
+
+## 14. Correctness audit after the fix (2026-11-08)
+
+Per-layer traces (DS4_V41_TRACE_POS / DS4_V41_TRACE_DIR) now cover all three prompt paths:
+token-by-token ("step"), 6-row short batches ("batch") and the layer-major sweep ("sweep"),
+at after-attention, MoE input, shared, routed, selected experts and layer output.
+`audit.py`-style check: flag a stage whose divergence exceeds 20x its input's without a
+routing flip.
+
+| case | rows | result |
+|---|---|---|
+| sweep vs per-token, 717-token append at aligned 8192 | first (8192), last (8908) | no flags; L0 out 3e-3; growth only at routing flips (row 0 plateaus ~0.3, row 716 ~0.6) |
+| same, unaligned start 8195 (mid compression block) | first, last | no flags; first row 0.08 at L39 with zero flips (partial-block carry correct) |
+| decoder suffix on vs off, fresh 9684 | last | layers 0-19 bit-identical; 20-39 drift 6e-4 -> 0.09, zero flips |
+| 6-row short prefill vs per-token, 100 tokens at 8195 | first, last | no flags; last row reaches rel ~1 through 1-6 flips per layer |
+| control: per-token default vs per-token F32 kernels | last | same profile (0.07 at L7, ~1.3 mid, 0.92 at L39) |
+
+The control shows that a pure rounding change in the reference path itself diverges as much
+as the batched paths: top-6 gate weights are near-uniform (0.19-0.24), so rounding-level
+differences flip experts and compound. No defect found beyond the shared-expert double count.
+Not covered: CPU references for attention/indexer/compressor (V4.1 has no CPU backend), and
+the CUDA/Metal builds (same shared code, untested here).

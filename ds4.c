@@ -44487,6 +44487,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #endif
             &active, m, l, count);
                 DS41_STAGE("hc/ffn norm");
+                for (uint32_t r = 0; ok && r < count; r++) {
+                    ds41_trace_residual("sweepA", il, start + r, g->batch.after_attn, (uint64_t)r * DS4_N_HC * DS4_N_EMBD * 4u);
+                    ds41_trace_vec("sweepN", il, start + r, g->batch.norm, (uint64_t)r * DS4_N_EMBD * 4u, DS4_N_EMBD);
+                }
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                     row.pos = start + t;
 #define DS41_USE_FFN_ROW(name, width) row.name = g->rows_view[t].name;
@@ -44521,6 +44525,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 if (moe_probe) unsetenv("DS4_ROCM_V41_DIAG_MOE_ROW");
 #endif
                 DS41_STAGE("shared/routed ffn");
+                for (uint32_t r = 0; ok && r < count; r++) {
+                    ds41_trace_vec("sweepSh", il, start + r, g->batch.shared, (uint64_t)r * DS4_N_EMBD * 4u, DS4_N_EMBD);
+                    ds41_trace_vec("sweepRt", il, start + r, g->batch.routed, (uint64_t)r * DS4_N_EMBD * 4u, DS4_N_EMBD);
+                    ds41_trace_vec("sweepSel", il, start + r, g->batch.selected, (uint64_t)r * DS4_N_EXPERT_USED * 4u, DS4_N_EXPERT_USED);
+                }
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
                         ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
@@ -44537,6 +44546,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             DS41_STAGE("hc expand");
+            for (uint32_t r = 0; ok && r < count; r++) {
+                ds41_trace_residual("sweep", il, start + r, g->batch.residual, (uint64_t)r * DS4_N_HC * DS4_N_EMBD * 4u);
+            }
 #undef DS41_STAGE
             if (ok && wide && il + 1u < DS4_N_LAYER) {
                 ok = ds41_carry_copy(g, off, count, true);
@@ -44856,14 +44868,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                                     g->streaming && g->draft && ds41_dspark_ssd_allowed() &&
                                     !getenv("DS4_ROCM_V41_DSPARK_SSD_SYNC_VERIFY"));
         for (uint32_t i = 0; ok && i < rows; i++) {
-            char nm[5][24];
-            const char *base[5] = {"batchSel", "batchW", "batchSh", "batchRt", "batchN"};
-            for (int q = 0; q < 5; q++) snprintf(nm[q], sizeof nm[q], i ? "%s%u" : "%s", base[q], i);
-            ds41_trace_vec(nm[0], il, positions[0], g->batch.selected, (uint64_t)i * DS4_N_EXPERT_USED * 4u, DS4_N_EXPERT_USED);
-            ds41_trace_vec(nm[1], il, positions[0], g->batch.route_weights, (uint64_t)i * DS4_N_EXPERT_USED * 4u, DS4_N_EXPERT_USED);
-            ds41_trace_vec(nm[2], il, positions[0], g->batch.shared, (uint64_t)i * DS4_N_EMBD * 4u, DS4_N_EMBD);
-            ds41_trace_vec(nm[3], il, positions[0], g->batch.routed, (uint64_t)i * DS4_N_EMBD * 4u, DS4_N_EMBD);
-            ds41_trace_vec(nm[4], il, positions[0], g->batch.norm, (uint64_t)i * DS4_N_EMBD * 4u, DS4_N_EMBD);
+            ds41_trace_vec("batchSel", il, positions[i], g->batch.selected, (uint64_t)i * DS4_N_EXPERT_USED * 4u, DS4_N_EXPERT_USED);
+            ds41_trace_vec("batchW", il, positions[i], g->batch.route_weights, (uint64_t)i * DS4_N_EXPERT_USED * 4u, DS4_N_EXPERT_USED);
+            ds41_trace_vec("batchSh", il, positions[i], g->batch.shared, (uint64_t)i * DS4_N_EMBD * 4u, DS4_N_EMBD);
+            ds41_trace_vec("batchRt", il, positions[i], g->batch.routed, (uint64_t)i * DS4_N_EMBD * 4u, DS4_N_EMBD);
+            ds41_trace_vec("batchN", il, positions[i], g->batch.norm, (uint64_t)i * DS4_N_EMBD * 4u, DS4_N_EMBD);
         }
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
