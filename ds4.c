@@ -18669,7 +18669,7 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
 /* ROCm: the decoder suffix (layers 20-39 recompute only their sliding-window
  * tail, at least DS4_ROCM_V41_SUFFIX_MIN_ROWS=4096) is the default. It changes
  * results only at rounding level: long-prefix perplexity on prose/code/docs moved
- * -0.58/+0.03/+0.19 % (2026-11-06, findings/v41-claude-session-20261106.md).
+ * -0.58/+0.03/+0.19 % (2026-11-06).
  * DS4_METAL_V41_DECODER_SUFFIX=0 disables. */
 #ifdef DS4_ROCM_BUILD
 #define DS41_DECODER_SUFFIX_DEFAULT true

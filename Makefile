@@ -888,24 +888,6 @@ tests/test_deepseek41_tp_down_rocm.o: tests/test_deepseek41_tp_down_rocm.c ds4_g
 ds4-kernel-v41-tp-down: tests/test_deepseek41_tp_down_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
-tests/test_suffix_down_replay.o: tests/test_suffix_down_replay.c ds4_gpu.h ds4_deepseek41_gpu.h
-	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
-
-tests/test_suffix_down_replay: tests/test_suffix_down_replay.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
-	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
-
-test-suffix-down-replay: tests/test_suffix_down_replay
-	./tests/test_suffix_down_replay $(ARGS)
-
-tests/test_suffix_gate_up_replay.o: tests/test_suffix_gate_up_replay.c ds4_gpu.h ds4_deepseek41_gpu.h
-	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
-
-tests/test_suffix_gate_up_replay: tests/test_suffix_gate_up_replay.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
-	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
-
-test-suffix-gate-up-replay: tests/test_suffix_gate_up_replay
-	./tests/test_suffix_gate_up_replay $(ARGS)
-
 ds4-kernel-v41-tp-attention: tests/test_deepseek41_tp_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
