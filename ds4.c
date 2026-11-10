@@ -41827,6 +41827,22 @@ static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
 }
 
 static void ds41_sub(const char *name);
+/* ROCm: batched rows reuse the decode kernels that fold the following BF16
+ * pass into the store (hc expand + bf16, add + bf16). Same arithmetic, one
+ * pass over the rows less each. DS4_ROCM_V41_BATCH_ROUND_FUSE=0 restores the
+ * separate passes. */
+static bool ds41_batch_round_fuse(void) {
+#ifdef DS4_ROCM_BUILD
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_BATCH_ROUND_FUSE");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+#else
+    return false;
+#endif
+}
 static bool ds41_hc_mix_batch(
 #ifdef DS4_ROCM_BUILD
                               ds41_gpu_graph *g,
@@ -41925,11 +41941,21 @@ static bool ds41_after_attention_batch(
                               ds41_prefill_row *b, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t count) {
     ds41_sub(NULL);
-    bool ok = ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
-        b->attn_split, DS4_N_EMBD, DS4_N_HC);
-    ds41_sub("hc expand (attn)");
-    ok = ok && ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
-    ds41_sub("hc bf16 residual (attn)");
+    bool ok;
+#ifdef DS4_ROCM_BUILD
+    if (ds41_batch_round_fuse()) {
+        ok = ds4_gpu_hc_expand_split_bf16_tensor(b->after_attn, b->block, b->residual,
+            b->attn_split, DS4_N_EMBD, DS4_N_HC, NULL) != 0;
+        ds41_sub("hc expand+bf16 (attn)");
+    } else
+#endif
+    {
+        ok = ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
+            b->attn_split, DS4_N_EMBD, DS4_N_HC);
+        ds41_sub("hc expand (attn)");
+        ok = ok && ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+        ds41_sub("hc bf16 residual (attn)");
+    }
     ok = ok && ds41_hc_mix_batch(
 #ifdef DS4_ROCM_BUILD
             g,
@@ -44641,6 +44667,14 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     ds41_trace_vec("sweepW", il, start + r, g->batch.route_weights, (uint64_t)r * DS4_N_EXPERT_USED * 4u, DS4_N_EXPERT_USED);
                 }
                 if (ok && batch_hc) {
+#ifdef DS4_ROCM_BUILD
+                    if (ds41_batch_round_fuse())
+                        ok = ds4_gpu_dsv41_add_bf16(active.block, active.routed, active.shared,
+                                count * DS4_N_EMBD) != 0 &&
+                            ds4_gpu_hc_expand_split_bf16_tensor(active.residual, active.block,
+                                active.after_attn, active.ffn_split, DS4_N_EMBD, DS4_N_HC, NULL) != 0;
+                    else
+#endif
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
                         ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
                         ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
