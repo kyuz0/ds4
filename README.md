@@ -2,6 +2,31 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+> **About this fork.** This is a fork of
+> [kyuz0/ds4](https://github.com/kyuz0/ds4) (branch `feat/rocm-deepseek41-halo`,
+> the DeepSeek V4.1 Flash ROCm port by Donato Capitella), which is itself a fork of
+> [antirez/ds4](https://github.com/antirez/ds4). It focuses on running
+> **DeepSeek V4.1 Flash on AMD Strix Halo** (gfx1151, 128 GB) with SSD expert
+> streaming, for agentic coding: faster prefill and decode, short/medium append
+> batching, disk KV checkpoints for long chats, and a fix for the shared expert being
+> added twice in batched rows. Everything below this note is the upstream README.
+>
+> Benchmark (2026-11-09), `ds4-bench --rocm --ssd-streaming --ssd-streaming-cache-experts 92GB`,
+> model `DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf`, prompt
+> `speed-bench/promessi_sposi.txt`, 512 generated tokens. Each repo was built clean with
+> `make strix-halo`, 3 runs in rotated order, median shown (tok/s, higher is better):
+>
+> | Context | Metric | this fork (`5bf1982`) | kyuz0/ds4 (`2998e96`) | antirez/ds4 (`b3f5018`) |
+> |---|---|---|---|---|
+> | 8K | prefill | **201.7** | 169.3 | 71.5 |
+> | 8K | decode | **12.25** | 9.13 | 4.66 |
+> | 32K | prefill (8K→32K) | **331.7** | 294.4 | 96.6 |
+> | 32K | decode | **12.05** | 8.33 | 4.41 |
+>
+> Hardware: Strix Halo, 128 GB unified memory, model on a DRAM-less PCIe NVMe
+> (~1-1.6 GB/s random reads). With SSD streaming the drive is the main bottleneck, so
+> numbers on a faster drive will differ. Speed only; output quality is checked separately.
+
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building
