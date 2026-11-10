@@ -43178,6 +43178,26 @@ static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC"));
 }
 
+#ifdef DS4_ROCM_BUILD
+/* Single-GPU SSD-streaming crossover between the 6-row short-append batches
+ * and one selective layer sweep. Measured at 60K context on agent text
+ * (A/B/B/A, prefill only): 16/24 tokens favour short batches (1.0/1.3 s vs
+ * 2.7/3.5 s), 32 ties, and from 48 up the sweep wins (48: 2.8 -> 2.3 s,
+ * 128: 7.1 -> 3.9 s, 250: 18.7 -> 7.6 s). Official scorer with continued
+ * tails of 40/100/200 tokens: sweep NLL 0.6399/0.6414/0.6396 vs short batches
+ * 0.6459/0.6574/0.6464. DS4_ROCM_V41_SHORT_PREFILL_MAX=256 restores the old
+ * crossover. */
+static uint32_t ds41_rocm_short_prefill_max(void) {
+    const char *env = getenv("DS4_ROCM_V41_SHORT_PREFILL_MAX");
+    if (env && env[0]) {
+        char *endp = NULL;
+        const long v = strtol(env, &endp, 10);
+        if (endp != env && v >= 2 && v <= 256) return (uint32_t)v;
+    }
+    return 48u;
+}
+#endif
+
 static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) {
     /* TP batches use the bulk protocol; row-gate ablations stay token-major. */
     if (!ds41_tp_batch_enabled(g) || g->imatrix ||
@@ -43186,6 +43206,12 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
 #if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     minimum = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SMALL_PREFILL") ? 32u : 256u;
+#endif
+#ifdef DS4_ROCM_BUILD
+    /* Appends past the short-batch range go straight to the selective sweep.
+     * Quality and draft graphs keep the 256-token token-major range. */
+    if (g->tp_world == 1 && g->streaming && !g->quality && !g->draft)
+        minimum = ds41_rocm_short_prefill_max();
 #endif
     /* Diagnostic override for the token-major/prefill crossover. Keep the
      * production default unless a measured append-size A/B promotes it. */
@@ -43247,10 +43273,10 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
 }
 
 #ifdef DS4_ROCM_BUILD
-/* Opt-in short-append batching. The ROCm batch kernels already implement a
- * selected-expert streaming path for n_tokens > 1; use it for small appends
- * that otherwise execute one token at a time. Keep this diagnostic until an
- * A/B shows both a wall-time gain and acceptable frontier logits. */
+/* Short-append batching. The ROCm batch kernels already implement a
+ * selected-expert streaming path for n_tokens > 1; use it for appends below
+ * the sweep crossover (ds41_rocm_short_prefill_max) that would otherwise
+ * execute one token at a time. */
 static uint32_t ds41_rocm_short_prefill_count(const ds41_gpu_graph *g,
                                                uint32_t remaining) {
     /* Default mode 2 (official scorer, cont.-prefill 100: 0.6531 vs per-token
@@ -43258,7 +43284,8 @@ static uint32_t ds41_rocm_short_prefill_count(const ds41_gpu_graph *g,
     const char *env = getenv("DS4_ROCM_V41_SHORT_PREFILL");
     if (!env || !env[0]) env = "2";
     if (env[0] == '0') return 0;
-    if (!g || !g->valid || remaining < 2u || remaining >= 256u ||
+    if (!g || !g->valid || remaining < 2u ||
+        remaining >= ds41_rocm_short_prefill_max() ||
         g->tp_world != 1u || !g->streaming || g->quality || g->imatrix ||
         g->draft || g->prefill_cap < 2u ||
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL")) return 0;
