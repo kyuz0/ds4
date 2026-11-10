@@ -44564,6 +44564,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     ds41_trace_vec("sweepSh", il, start + r, g->batch.shared, (uint64_t)r * DS4_N_EMBD * 4u, DS4_N_EMBD);
                     ds41_trace_vec("sweepRt", il, start + r, g->batch.routed, (uint64_t)r * DS4_N_EMBD * 4u, DS4_N_EMBD);
                     ds41_trace_vec("sweepSel", il, start + r, g->batch.selected, (uint64_t)r * DS4_N_EXPERT_USED * 4u, DS4_N_EXPERT_USED);
+                    ds41_trace_vec("sweepW", il, start + r, g->batch.route_weights, (uint64_t)r * DS4_N_EXPERT_USED * 4u, DS4_N_EXPERT_USED);
                 }
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&

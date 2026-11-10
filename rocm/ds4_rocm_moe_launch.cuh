@@ -800,6 +800,105 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         int n_experts, int n_expert_used, float clamp, int preserve_reduction,
         cudaStream_t stream);
 
+/* Routed FP16 expert kernels (rocm/gufo_f16, see its NOTICE.md). */
+extern "C" int ds41_v41_routed_f16(int type, const void *w, const void *w_up, uint64_t expert_bytes,
+        const uint16_t *x, uint32_t x_div, const int32_t *rows, const int32_t *bounds,
+        const int32_t *tiles, uint32_t n_tiles, const float *route_w, float limit, void *y,
+        int y_half, uint32_t m, uint32_t k, const void *const *w_table,
+        const void *const *w_up_table);
+extern "C" int ds41_v41_to_half(const float *x, uint16_t *y, uint64_t n);
+extern "C" int ds41_v41_routed_plan_device(const int32_t *ids, uint32_t slots, uint32_t n_experts,
+        int32_t *rows, int32_t *bounds, int32_t *tiles);
+
+/* Default (DS4_ROCM_V41_ROUTED_F16=0 restores MMQ): V4.1 IQ2_XXS gate/up +
+ * Q2_K down for a whole staged layer on the FP16 matrix cores. Activations are
+ * rounded to FP16 instead of MMQ's 8-bit blocks, so results differ from the MMQ
+ * path at rounding level. Measured 2026-11-10: per-layer error against exact
+ * arithmetic 0.06 % (MMQ 0.4-0.7 %); official scorer NLL 0.6385 -> 0.6462
+ * (default) and 0.6414 -> 0.6441 (continued 100), per-case signs flipping
+ * between the two; 24K prefill 335 -> 394 tok/s, 48-256 token appends -12..-24 %.
+ * Returns 1 = done, 0 = not applicable (caller continues), -1 = launch error. */
+static int v41_routed_f16_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_ROUTED_F16");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
+/* Smallest batch that takes the FP16 path (DS4_ROCM_V41_ROUTED_F16_MIN_ROWS). */
+static uint32_t v41_routed_f16_min_rows(void) {
+    static int rows = -1;
+    if (rows < 0) {
+        const char *v = getenv("DS4_ROCM_V41_ROUTED_F16_MIN_ROWS");
+        rows = v && v[0] ? atoi(v) : 48;
+        if (rows < 2) rows = 2;
+    }
+    return (uint32_t)rows;
+}
+
+static int v41_routed_f16_try(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *down,
+        const char *gate_w, const char *up_w, const char *down_w,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, uint32_t n_tokens) {
+    static int32_t *plan_rows = NULL, *plan_bounds = NULL, *plan_tiles = NULL;
+    static uint32_t plan_slots = 0;
+    const uint32_t slots = n_tokens * n_expert;
+    const uint32_t tile_cap = slots / 64u + n_total_expert;
+    const uint64_t xh_bytes = (uint64_t)n_tokens * expert_in_dim * sizeof(uint16_t);
+    const uint64_t mid_bytes = (uint64_t)slots * expert_mid_dim * sizeof(uint16_t);
+    const uint64_t down_bytes = (uint64_t)slots * out_dim * sizeof(float);
+    if (!gate_w || !up_w || !down_w || !gate || !up || !down || !out || !x ||
+        up->bytes < xh_bytes || gate->bytes < mid_bytes || down->bytes < down_bytes ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float) ||
+        x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
+        selected->bytes < (uint64_t)slots * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)slots * sizeof(float)) return 0;
+    if (slots > plan_slots) {
+        if (plan_rows) (void)cudaFree(plan_rows);
+        if (plan_bounds) (void)cudaFree(plan_bounds);
+        if (plan_tiles) (void)cudaFree(plan_tiles);
+        plan_rows = plan_bounds = plan_tiles = NULL;
+        plan_slots = 0;
+        const uint32_t cap = slots < 2048u * 6u ? 2048u * 6u : slots;
+        if (!cuda_ok(cudaMalloc(&plan_rows, (size_t)cap * sizeof(int32_t)), "routed f16 plan rows") ||
+            !cuda_ok(cudaMalloc(&plan_bounds, 513u * sizeof(int32_t)), "routed f16 plan bounds") ||
+            !cuda_ok(cudaMalloc(&plan_tiles, (size_t)(cap / 64u + 512u) * sizeof(int32_t)),
+                     "routed f16 plan tiles")) return -1;
+        plan_slots = cap;
+    }
+    uint16_t *xh = (uint16_t *)up->ptr;     /* FP16 activations */
+    uint16_t *mid_h = (uint16_t *)gate->ptr; /* FP16 weighted SwiGLU per slot */
+    if (ds41_v41_to_half((const float *)x->ptr, xh, (uint64_t)n_tokens * expert_in_dim) ||
+        ds41_v41_routed_plan_device((const int32_t *)selected->ptr, slots, n_total_expert,
+                                    plan_rows, plan_bounds, plan_tiles) ||
+        ds41_v41_routed_f16(16, gate_w, up_w, gate_expert_bytes, xh, n_expert,
+                            plan_rows, plan_bounds, plan_tiles, tile_cap,
+                            (const float *)weights->ptr, clamp, mid_h, 1,
+                            expert_mid_dim, expert_in_dim, NULL, NULL) ||
+        ds41_v41_routed_f16(10, down_w, NULL, down_expert_bytes, mid_h, 1u,
+                            plan_rows, plan_bounds, plan_tiles, tile_cap,
+                            NULL, 0.0f, down->ptr, 0, out_dim, expert_mid_dim, NULL, NULL)) {
+        fprintf(stderr, "ds4: V4.1 routed FP16 launch failed\n");
+        return -1;
+    }
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr,
+                                             out_dim, n_expert, n_tokens);
+    if (!cuda_ok(cudaGetLastError(), "routed f16 sum launch")) return -1;
+    static int logged = 0;
+    if (!logged || (getenv("DS4_ROCM_V41_ROUTED_F16_LOG") && logged < 64)) {
+        logged++;
+        fprintf(stderr, "ds4: ROCm V4.1 routed FP16 gate/up + down active (rows=%u)\n", n_tokens);
+    }
+    return 1;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -1061,6 +1160,17 @@ static int routed_moe_launch(
             DS4_ROCM_MOE_DECODE_PROFILE_PREP_WAIT_END,
             "IQ2 decode MoE profile split prep wait end")) return 0;
 
+    if (stream_full_layer && v41_routed_f16_enabled() && g_deepseek41_model &&
+        !g_glm_model && !g_quality_mode && ds4_rocm_is_gfx1151() &&
+        n_tokens >= v41_routed_f16_min_rows() && n_total_expert == 384u && n_expert == 6u &&
+        expert_in_dim == 5120u && expert_mid_dim == 2304u && out_dim == 5120u &&
+        gate_type == 16u && down_type == 10u &&
+        gate_expert_bytes == 3041280u && down_expert_bytes == 3870720u) {
+        const int f16_rc = v41_routed_f16_try(out, gate, up, down, gate_w, up_w, down_w,
+            gate_expert_bytes, down_expert_bytes, expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+        if (f16_rc != 0) return f16_rc > 0;
+    }
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;

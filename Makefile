@@ -65,7 +65,8 @@ ROCM_MMQ_Y ?= 64
 ROCM_MMQ_FLAGS := $(ROCM_CFLAGS) -std=c++17 -DGGML_USE_HIP -DDS4_HIP_MMQ_Y=$(ROCM_MMQ_Y) $(MMQ_INCLUDES)
 ROCM_MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.rocm.o cuda/mmq/ds4_mmq.rocm.o cuda/mmq/quantize.rocm.o cuda/mmq/mmid.rocm.o cuda/mmq/mmvq.rocm.o cuda/mmq/d2r_stubs.rocm.o cuda/mmq/ds4_repack.rocm.o rocm/ds4_rocm_repack.rocm.o
 ROCM_V41_GATE_UP_OBJS := rocm/v41_gate_up/tiles/descriptors.o rocm/v41_gate_up/tiles/twin.o rocm/v41_gate_up/tiles/wide.o rocm/v41_gate_up/runtime.o
-ROCM_HALO_OBJS := $(ROCM_V41_GATE_UP_OBJS) rocm/halo/shared_gu/kernel.o rocm/halo/q2/runtime.o rocm/halo/q2/prepared.o rocm/halo/moe/runtime.o rocm/halo/moe/public/wide.o rocm/halo/moe/public/twin.o rocm/halo/moe/public/descriptors.o rocm/halo/moe/fresh/wide.o rocm/halo/moe/fresh/twin.o rocm/halo/moe/fresh/descriptors.o
+ROCM_GUFO_F16_OBJS := rocm/gufo_f16/ds41_routed_f16.o
+ROCM_HALO_OBJS := $(ROCM_V41_GATE_UP_OBJS) $(ROCM_GUFO_F16_OBJS) rocm/halo/shared_gu/kernel.o rocm/halo/q2/runtime.o rocm/halo/q2/prepared.o rocm/halo/moe/runtime.o rocm/halo/moe/public/wide.o rocm/halo/moe/public/twin.o rocm/halo/moe/public/descriptors.o rocm/halo/moe/fresh/wide.o rocm/halo/moe/fresh/twin.o rocm/halo/moe/fresh/descriptors.o
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
@@ -820,6 +821,9 @@ cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h
 
 ds4_rocm.o: rocm/ds4_rocm_v41_gate_up.h ds4_rocm.cu ds4_rocm.h ds4_rocm_memory.h ds4_linux_memory.h ds4_gpu.h ds4_gpu_tp.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS) ds4_deepseek41_gpu.h rocm/halo/output_b/code.inc $(wildcard rocm/ds4_rocm_halo*.h rocm/halo/attention/*.hpp rocm/halo/attention/*.cuh rocm/halo/output_a_uncached/*.hpp rocm/halo/q2/*.hpp)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
+
+rocm/gufo_f16/ds41_routed_f16.o: rocm/gufo_f16/ds41_routed_f16.hip.cpp rocm/gufo_f16/ds41_v41.h rocm/gufo_f16/mmq/ggml-common.h
+	$(HIPCC) -std=c++20 -O3 -fPIC --offload-arch=$(ROCM_ARCH) -Irocm/gufo_f16 -c -o $@ $<
 
 cuda/mmq/ds4_ggml_stubs.rocm.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh cuda/mmq/vendors/hip.h ds4_rocm_memory.h ds4_linux_memory.h
 	$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<
