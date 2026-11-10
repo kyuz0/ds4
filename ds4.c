@@ -41998,6 +41998,11 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_comp = (start + count) / ratio;
     ds41_prefill_row *b = &g->batch;
     if (!n_comp) return true;
+    static int idxprof = -1; static double tp[5]; static uint32_t tp_calls;
+    if (idxprof < 0) idxprof = getenv("DS4_V41_INDEX_PROFILE") != NULL;
+    double tq = 0;
+    if (idxprof) { ds4_gpu_synchronize(); tq = now_sec(); }
+#define IDXP(i) do { if (idxprof) { ds4_gpu_synchronize(); const double t_ = now_sec(); tp[i] += t_ - tq; tq = t_; } } while (0)
     if (getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX_PROJ")) {
         for (uint32_t t = 0; t < count; t++) {
             ds41_prefill_row *r = &g->rows_view[t];
@@ -42013,6 +42018,7 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                    count * DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
                !ds41_project_rows(b->index_weights, m, l->indexer_proj, b->norm, count, true))
         return false;
+    IDXP(0);
     ds41_gpu_graph row = *g;
     /* Only 32 score rows are live. Batched sorting retains the original
      * per-row causal width, including padding and tie order. */
@@ -42020,6 +42026,7 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_PACKED_INDEX");
     if (packed && !ds4_gpu_dsv41_indexer_pack(g->index_packed, b->index_q,
         g->index_cache[owner], n_comp, count)) return false;
+    IDXP(1);
     const uint32_t index_rows = ds41_index_batch_rows();
     for (uint32_t off = 0; off < count; off += index_rows) {
         const uint32_t rows = count - off < index_rows ? count - off : index_rows;
@@ -42037,6 +42044,7 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                       q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio)));
         ds4_gpu_tensor_free(weights);
         ds4_gpu_tensor_free(q);
+        IDXP(2);
         const bool batch_topk =
 #ifndef DS4_ROCM_BUILD
             (start + off + 1u) / ratio >= 1024u &&
@@ -42052,6 +42060,7 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                                                   ds41_attention_pick(&row, il));
             ds4_gpu_tensor_free(row.index_scores);
         }
+        IDXP(3);
         if (ok && batch_topk) {
             const uint64_t id_bytes = DS4_N_INDEXER_TOP_K * sizeof(int32_t);
             ds4_gpu_tensor *ids = ds4_gpu_tensor_view(b->selected_comp, off * id_bytes, rows * id_bytes);
@@ -42059,8 +42068,13 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                                                        n_comp, rows, start + off, ratio);
             ds4_gpu_tensor_free(ids);
         }
+        IDXP(4);
         if (!ok) return false;
     }
+#undef IDXP
+    if (idxprof && (++tp_calls % 12u) == 0u)
+        fprintf(stderr, "ds4: index profile calls=%u il=%u n_comp=%u project=%.2f pack=%.2f scores=%.2f candidates=%.2f topk=%.2f s\n",
+                tp_calls, il, n_comp, tp[0], tp[1], tp[2], tp[3], tp[4]);
     return true;
 }
 

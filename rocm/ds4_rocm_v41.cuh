@@ -1070,8 +1070,19 @@ extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const 
         width > INT32_MAX || rows > INT32_MAX || (start + rows) / ratio > width ||
         !cuda_tensor_has_elems2(scores, width, rows, 4u) ||
         !cuda_tensor_has_elems2(selected, 512u, rows, 4u)) return 0;
+    /* The batched causal top-k used to start above 8192 visible rows; below
+     * that every row launched its own sort. It is bit-identical from 512
+     * visible rows (frontier logits at 4K/12K/24K, 2026-11-10) and cuts the
+     * top-k of a 24K prefill from 2.9 to 0.85 s.
+     * DS4_ROCM_V41_TOPK_BATCH_MIN=8192 restores the old crossover. */
+    static int batch_min = -1;
+    if (batch_min < 0) {
+        const char *v = getenv("DS4_ROCM_V41_TOPK_BATCH_MIN");
+        batch_min = v && v[0] ? atoi(v) : 512;
+        if (batch_min < 512) batch_min = 512;
+    }
     if (ds4_rocm_is_gfx1151() && rows >= 2u && rows <= 32u && width <= 65536u &&
-        (start + 1u) / ratio > 8192u)
+        (start + 1u) / ratio > (uint32_t)batch_min)
         return v41_indexer_topk_causal_batch((uint32_t *)selected->ptr, (const float *)scores->ptr,
                                              width, rows, start, ratio);
     for (uint32_t row = 0; row < rows; row++) {
