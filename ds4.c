@@ -42245,6 +42245,12 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_INDEXER_TOP_K, 128, ratio, heads, DS4_N_HEAD_DIM);
     }
     ds41_sub("attn kernel");
+#ifdef DS4_ROCM_BUILD
+    if (ds41_batch_round_fuse()) {
+        if (!ok || !ds4_gpu_dsv41_bf16_rope_rows(b->heads, DS4_N_HEAD_DIM, heads, count, start,
+                                                 ratio != 0, true)) return false;
+    } else
+#endif
     if (!ok || !ds4_gpu_dsv41_quantize(b->heads, heads * DS4_N_HEAD_DIM, count, DS4_V41_BF16) ||
         !ds4_gpu_dsv41_rope(b->heads, DS4_N_HEAD_DIM, heads, count, start, ratio != 0, true))
         return false;

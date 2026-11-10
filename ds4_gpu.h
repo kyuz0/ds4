@@ -56,6 +56,8 @@ int ds4_gpu_dsv41_hc_tail(ds4_gpu_tensor *split_out, const ds4_gpu_tensor *mix,
         uint64_t norm_weight_offset, float eps);
 int ds4_gpu_dsv41_bf16_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                             uint32_t start, bool compressed, bool inverse);
+int ds4_gpu_dsv41_bf16_rope_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                                 uint32_t rows, uint32_t start, bool compressed, bool inverse);
 int ds4_gpu_dsv41_add_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
                            const ds4_gpu_tensor *b, uint32_t n);
 int ds4_gpu_hc_expand_split_bf16_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,

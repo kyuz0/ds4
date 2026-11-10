@@ -316,6 +316,22 @@ extern "C" int ds4_gpu_dsv41_add_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor 
     return cuda_ok(cudaGetLastError(), "V4.1 add + bf16");
 }
 
+/* The same fused bf16 + RoPE kernel for consecutive rows starting at `start`. */
+extern "C" int ds4_gpu_dsv41_bf16_rope_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                                            uint32_t rows, uint32_t start, bool compressed,
+                                            bool inverse) {
+    uint64_t elems = 0;
+    if (width < 64u || !heads || !rows || rows > 1048576u ||
+        (uint64_t)start + (uint64_t)(rows - 1u) >= 1048576u ||
+        (uint64_t)heads * rows > UINT32_MAX ||
+        !cuda_u64_mul3_checked(width, heads, rows, &elems) || !cuda_tensor_has_f32(x, elems)) return 0;
+    if (pthread_once(&v41_rope_once, v41_init_rope_frequencies)) return 0;
+    v41_rope_args args = {width, heads, start, 1u, inverse, {0}};
+    memcpy(args.frequencies, v41_rope_frequencies[compressed ? 1 : 0], sizeof(args.frequencies));
+    v41_bf16_rope_kernel<<<heads * rows, 32>>>((float *)x->ptr, args);
+    return cuda_ok(cudaGetLastError(), "V4.1 batched bf16 + RoPE");
+}
+
 extern "C" int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                                   uint32_t rows, uint32_t start, bool compressed, bool inverse) {
     return ds4_gpu_dsv41_rope_stride(x, width, heads, rows, start, 1, compressed, inverse);
