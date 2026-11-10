@@ -43769,11 +43769,22 @@ static bool ds41_stream_layer_start_full_l(ds41_stream_layer_load *job,
  * by the current route batch. This deliberately stays on the layer-major path,
  * where one loader owns the layer cache. Shared-expert work runs while that
  * loader fills the cache; the routed MoE consumes it only after the join.
- * DS4_ROCM_V41_SELECTIVE_STAGE=0 restores full-layer staging. */
+ * DS4_ROCM_V41_SELECTIVE_STAGE=0 restores full-layer staging.
+ * The limit was 512 rows; one prefill chunk (2048 rows) routes to 215-280 of a
+ * layer's 384 experts, so staging only those reads 11-23 GiB instead of ~55
+ * (2026-11-11, identical logits: +712 tokens 10.3 -> 7.2 s, +1024 10.6 -> 8.3 s,
+ * +2048 10.0 -> 9.7 s). DS4_ROCM_V41_SELECTIVE_STAGE_MAX=512 restores the old limit. */
 static bool ds41_selective_stage_enabled(const ds41_gpu_graph *g, uint32_t count) {
     const char *env = getenv("DS4_ROCM_V41_SELECTIVE_STAGE");
     if (env && env[0] == '0') return false;
-    return g && g->streaming && g->tp_world == 1u && count > 0u && count <= 512u;
+    static int max_rows = -1;
+    if (max_rows < 0) {
+        const char *v = getenv("DS4_ROCM_V41_SELECTIVE_STAGE_MAX");
+        max_rows = v && v[0] ? atoi(v) : 2048;
+        if (max_rows < 1) max_rows = 1;
+    }
+    return g && g->streaming && g->tp_world == 1u && count > 0u && count <= (uint32_t)max_rows &&
+        count <= g->prefill_cap;
 }
 
 static bool ds41_stream_stage_selected_start(ds41_gpu_graph *g, const ds4_model *m,
