@@ -1468,6 +1468,27 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
                 (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
             return cuda_ok(cudaGetLastError(), "V4.1 F16 32 token-reuse projection");
         }
+        /* Indexer query-B (1280 -> 4096): same token-reuse kernel instead of
+         * one launch per row. DS4_ROCM_V41_INDEX_QB_BATCH=0 restores the loop. */
+        static int index_qb_batch = -1;
+        if (index_qb_batch < 0) {
+            const char *v = getenv("DS4_ROCM_V41_INDEX_QB_BATCH");
+            index_qb_batch = !(v && v[0] == '0');
+        }
+        if (index_qb_batch && width == 1280u && outputs == 4096u) {
+            static int qb_tt = -1;
+            if (qb_tt < 0) { const char *v = getenv("DS4_ROCM_V41_INDEX_QB_TT"); qb_tt = v && v[0] ? atoi(v) : 16; }
+            if (qb_tt == 16)
+                v41_launch_f16_sharedx_token_reuse<16u, 128u>(
+                    (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+            else if (qb_tt == 8)
+                v41_launch_f16_sharedx_token_reuse<8u, 128u>(
+                    (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+            else
+            v41_launch_f16_sharedx_token_reuse<4u, 128u>(
+                (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+            return cuda_ok(cudaGetLastError(), "V4.1 F16 indexer query-B token-reuse projection");
+        }
     }
     if (width == 20480u && outputs == 24u && rows <= 6u &&
         ds4_rocm_is_gfx1151()) {

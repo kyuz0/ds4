@@ -41998,7 +41998,7 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_comp = (start + count) / ratio;
     ds41_prefill_row *b = &g->batch;
     if (!n_comp) return true;
-    static int idxprof = -1; static double tp[5]; static uint32_t tp_calls;
+    static int idxprof = -1; static double tp[8]; static uint32_t tp_calls;
     if (idxprof < 0) idxprof = getenv("DS4_V41_INDEX_PROFILE") != NULL;
     double tq = 0;
     if (idxprof) { ds4_gpu_synchronize(); tq = now_sec(); }
@@ -42011,13 +42011,18 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                 !ds4_gpu_dsv41_quantize(r->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
                 !ds41_matmul(r->index_weights, m, l->indexer_proj, r->norm, true)) return false;
         }
-    } else if (!ds41_project_rows(b->index_q, m, l->indexer_attn_q_b, b->qr, count, true) ||
-               !ds4_gpu_dsv41_rope(b->index_q, DS4_N_INDEXER_HEAD_DIM, DS4_N_INDEXER_HEAD,
-                                   count, start, true, false) ||
-               !ds4_gpu_dsv41_quantize(b->index_q, DS4_N_INDEXER_HEAD_DIM,
-                   count * DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
-               !ds41_project_rows(b->index_weights, m, l->indexer_proj, b->norm, count, true))
-        return false;
+    } else {
+        if (!ds41_project_rows(b->index_q, m, l->indexer_attn_q_b, b->qr, count, true)) return false;
+        IDXP(5);
+        if (!ds4_gpu_dsv41_rope(b->index_q, DS4_N_INDEXER_HEAD_DIM, DS4_N_INDEXER_HEAD,
+                                count, start, true, false)) return false;
+        IDXP(6);
+        if (!ds4_gpu_dsv41_quantize(b->index_q, DS4_N_INDEXER_HEAD_DIM,
+                count * DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0)) return false;
+        IDXP(7);
+        if (!ds41_project_rows(b->index_weights, m, l->indexer_proj, b->norm, count, true))
+            return false;
+    }
     IDXP(0);
     ds41_gpu_graph row = *g;
     /* Only 32 score rows are live. Batched sorting retains the original
@@ -42073,8 +42078,8 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
     }
 #undef IDXP
     if (idxprof && (++tp_calls % 12u) == 0u)
-        fprintf(stderr, "ds4: index profile calls=%u il=%u n_comp=%u project=%.2f pack=%.2f scores=%.2f candidates=%.2f topk=%.2f s\n",
-                tp_calls, il, n_comp, tp[0], tp[1], tp[2], tp[3], tp[4]);
+        fprintf(stderr, "ds4: index profile calls=%u il=%u n_comp=%u q_b=%.2f rope=%.2f fp4=%.2f proj=%.2f pack=%.2f scores=%.2f candidates=%.2f topk=%.2f s\n",
+                tp_calls, il, n_comp, tp[5], tp[6], tp[7], tp[0], tp[1], tp[2], tp[3], tp[4]);
     return true;
 }
 
