@@ -1845,6 +1845,37 @@ extern "C" int ds4_gpu_dsv41_q8_projection_pair_rows(
     return cuda_ok(cudaGetLastError(), "V4.1 Q8 fused pair projection");
 }
 
+/* Dense Q8_0 projections on the FP16 matrix cores (rocm/gufo_f16, see its
+ * NOTICE.md). Same operand rounding as the WMMA row-tile kernels (FP16
+ * activations and decoded weights, FP32 accumulation); only the summation
+ * order differs. DS4_ROCM_V41_DENSE_F16=0 restores the row-tile kernels. */
+extern "C" int ds41_v41_dense_f16(int type, const void *w, const void *x, void *out, uint32_t m,
+                                  uint32_t n, uint32_t k, uint32_t groups, uint32_t io);
+static int v41_dense_f16_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_DENSE_F16");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    return on;
+}
+static uint32_t v41_dense_f16_min_rows(void) {
+    static int rows = -1;
+    if (rows < 0) {
+        const char *v = getenv("DS4_ROCM_V41_DENSE_F16_MIN_ROWS");
+        rows = v && v[0] ? atoi(v) : 32;
+        if (rows < 2) rows = 2;
+    }
+    return (uint32_t)rows;
+}
+static void v41_dense_f16_log(const char *what, uint32_t rows) {
+    static int logged = 0;
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr, "ds4: ROCm V4.1 dense FP16 projections active (%s rows=%u)\n", what, rows);
+    }
+}
+
 extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                                 uint64_t weight_offset, uint32_t width, uint32_t outputs,
                                                 uint32_t rows, const ds4_gpu_tensor *in) {
@@ -1860,6 +1891,12 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
      * return value of 2 so the caller can drop its separate rounding pass. */
     const bool want_bf16 = ds4_q8_bf16_fused() && g_q8_round_request != 0;
     int rounded_in_kernel = 0;
+    if (!g_quality_mode && rows >= v41_dense_f16_min_rows() && rows <= 2048u &&
+        width % 256u == 0u && outputs % 256u == 0u && v41_dense_f16_enabled()) {
+        if (ds41_v41_dense_f16(8, weights, in->ptr, out->ptr, outputs, rows, width, 1u, 0u)) return 0;
+        v41_dense_f16_log("q8 projection", rows);
+        return 1;
+    }
     if (rows == 1u && ds4_rocm_is_gfx1151()) {
         v41_q8b4_prefetch_publish();
         v41_q8b4_log_shape("rows1", width, outputs, (uint64_t)(width / 32u) * 34u, rows);
@@ -2144,6 +2181,15 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
             !v41_q8_f32_tiny_rows_launch<1u>((float *)out->ptr, b,
                 (const float *)low->ptr, 8192u, 5120u, n_tokens,
                 UINT64_C(256) * 34u)) return 0;
+        return 1;
+    }
+    if (!g_quality_mode && n_tokens >= v41_dense_f16_min_rows() && n_tokens <= 2048u &&
+        v41_dense_f16_enabled()) {
+        /* Eight groups of 4096 -> 1024, the BF16 low boundary, then 8192 -> 5120. */
+        if (ds41_v41_dense_f16(8, a, heads->ptr, low->ptr, 1024u, n_tokens, 4096u, 8u, 0u) ||
+            !ds4_gpu_dsv41_quantize(low, 8192u, n_tokens, DS4_V41_BF16) ||
+            ds41_v41_dense_f16(8, b, low->ptr, out->ptr, 5120u, n_tokens, 8192u, 1u, 0u)) return 0;
+        v41_dense_f16_log("attention output", n_tokens);
         return 1;
     }
     bool low_rounded = false;

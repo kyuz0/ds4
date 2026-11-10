@@ -1,6 +1,6 @@
 # Routed FP16 expert kernel source notice
 
-`ds41_routed_f16.hip.cpp` and `ds41_v41.h` are copied unchanged from
+`ds41_routed_f16.hip.cpp`, `ds41_dense_f16.hip.cpp` and `ds41_v41.h` are copied unchanged from
 [franzmoca/ds41-gufo-extension](https://github.com/franzmoca/ds41-gufo-extension)
 at commit `706876f14f9ab743fced0fd49dc184ded191295a` (`kernels/rocm/`), MIT licensed
 (`LICENSE.ds41-gufo-extension`; parts derive from Gufo, `LICENSE.gufo`).
@@ -14,3 +14,9 @@ official scorer, not the bit-exact rule.
 
 Used by `routed_moe_launch` (`rocm/ds4_rocm_moe_launch.cuh`) by default for
 staged layers of 48 rows or more; `DS4_ROCM_V41_ROUTED_F16=0` restores the MMQ path.
+
+The dense kernel runs batched Q8_0 projections (attention query/KV, attention
+output A/B, shared expert) for 32-2048 rows from `ds4_gpu_dsv41_q8_projection_rows`
+and `ds4_gpu_dsv41_attention_output_batch` (`rocm/ds4_rocm_v41.cuh`), with the same
+operand rounding as the WMMA row-tile kernels it replaces;
+`DS4_ROCM_V41_DENSE_F16=0` restores those.
