@@ -118,3 +118,4 @@ ds4-kernel-v41-tp-gates
 *.host-x86_64-*
 /ds4-kernel-v41
 
+/SERVER-CONFIGS.txt

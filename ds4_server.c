@@ -3641,6 +3641,8 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+static int server_max_images(const server *s);
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3651,8 +3653,10 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
     }
-    if (count > 16) {
-        snprintf(err, errlen, "too many images; at most 16 are allowed");
+    const int max_images = server_max_images(s);
+    if (count > (size_t)max_images) {
+        snprintf(err, errlen, "too many images; at most %d are allowed "
+                 "(raise with --max-images N)", max_images);
         return false;
     }
     if (!e || !s || !ds4_engine_has_vision(e)) {
@@ -10145,6 +10149,7 @@ struct server {
     server_slot *slots;
     int slot_count;
     int ctx_size;
+    int max_images;
     bool batched_mode;
     pthread_t *slot_threads;
     pthread_t decode_thread;
@@ -10177,6 +10182,10 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static int server_max_images(const server *s) {
+    return s && s->max_images > 0 ? s->max_images : 16;
+}
 
 static void server_inference_lock(server *s) {
     pthread_mutex_lock(&s->inference_mu);
@@ -15501,6 +15510,7 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
+    int max_images;
     int mixed_prefill_quantum;
 } server_config;
 
@@ -15741,6 +15751,8 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--max-images")) {
+            c.max_images = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
@@ -16008,6 +16020,7 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.tp_leader = tp_leader;
     s.ctx_size = cfg.ctx_size;
+    s.max_images = cfg.max_images > 0 ? cfg.max_images : 16;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&

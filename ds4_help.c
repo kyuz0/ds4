@@ -352,6 +352,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
+    opt(fp, c, "--max-images N", "Images allowed per request, counting the whole history. Default: 16");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
