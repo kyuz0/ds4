@@ -3372,7 +3372,17 @@ static int cuda_stream_v41_prepare_layer_impl(const ds4_gpu_stream_expert_table 
         g_stream_v41_reuse_stats.prepares++;
         g_stream_v41_reuse_stats.logical_bytes += total;
     }
+    /* A selected plan stages only the experts its batch routes to: copying
+     * every resident of the layer cost ~22 ms per layer (2.1 GiB), 41 % of a
+     * 128-token append. DS4_ROCM_V41_SELECTIVE_COPY_ALL=1 restores that. */
+    static int copy_all = -1;
+    if (copy_all < 0) {
+        const char *v = getenv("DS4_ROCM_V41_SELECTIVE_COPY_ALL");
+        copy_all = v && v[0] && v[0] != '0';
+    }
     for (uint32_t e = 0; ok && e < 384u; e++) {
+        if (use_selected && !copy_all &&
+            !(selected_bits[e / 64u] & (UINT64_C(1) << (e % 64u)))) continue;
         const int idx = cuda_stream_resident_find(t->model_map, t->layer, (int32_t)e,
             t->gate_offset, t->up_offset, t->down_offset,
             t->gate_expert_bytes, t->down_expert_bytes);
@@ -3511,10 +3521,53 @@ static int cuda_stream_v41_prepare_layer_topup(const ds4_gpu_stream_expert_table
     ds4_gpu_dsv41_stream_layer_plan plan = {};
     plan.table = *t;
     plan.generation = ++g_stream_v41_plan_generation;
-    uint32_t present = 0, missing = 0;
     for (uint32_t i = 0; i < 6u; i++) {
         plan.hits[i] = prev->hits[i] | prev->selected[i];
         plan.selected[i] = selected_bits[i];
+    }
+    /* Newly selected experts that are resident in the dynamic cache are
+     * copied, as a fresh selected prepare would do; the rest is read. */
+    const uint64_t expert_bytes = total / 384u;
+    bool used_stream = false;
+    int ok = 1;
+    for (uint32_t e = 0; ok && e < 384u; e++) {
+        const uint64_t bit = UINT64_C(1) << (e % 64u);
+        if (!(selected_bits[e / 64u] & bit) || (plan.hits[e / 64u] & bit)) continue;
+        const int idx = cuda_stream_resident_find(t->model_map, t->layer, (int32_t)e,
+            t->gate_offset, t->up_offset, t->down_offset,
+            t->gate_expert_bytes, t->down_expert_bytes);
+        if (idx < 0) continue;
+        const cuda_stream_resident_expert &entry = g_stream_resident_experts[(size_t)idx];
+        if (!entry.base || entry.bytes != expert_bytes || entry.gate != entry.base ||
+            entry.up != entry.base + t->gate_expert_bytes ||
+            entry.down != entry.base + 2u * t->gate_expert_bytes) continue;
+        if (!used_stream) {
+            if (!cuda_stream_selected_upload_wait_host("V4.1 top-up source ready") ||
+                !cuda_stream_batch_selected_upload_wait_host("V4.1 top-up batch source ready") ||
+                !cuda_stream_selected_ensure_stream()) { ok = 0; break; }
+            used_stream = true;
+        }
+        const char *src[] = {entry.gate, entry.up, entry.down};
+        char *dst[] = {s.gate + e * t->gate_expert_bytes,
+                       s.up + e * t->gate_expert_bytes,
+                       s.down + e * t->down_expert_bytes};
+        const uint64_t bytes[] = {t->gate_expert_bytes, t->gate_expert_bytes,
+                                  t->down_expert_bytes};
+        for (uint32_t i = 0; ok && i < 3u; i++)
+            ok = cuda_ok(cudaMemcpyAsync(dst[i], src[i], (size_t)bytes[i],
+                            cudaMemcpyDeviceToDevice, g_stream_selected_upload_stream),
+                         "V4.1 cached expert to layer top-up copy");
+        if (ok) plan.hits[e / 64u] |= bit;
+    }
+    if (used_stream &&
+        !cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream),
+                 "V4.1 top-up copy drain")) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "V4.1 top-up copy drainage unproven; refusing cache reuse or teardown\n");
+        abort();
+    }
+    if (!ok) return 0; /* The slot stays inactive; the caller re-prepares it. */
+    uint32_t present = 0, missing = 0;
+    for (uint32_t i = 0; i < 6u; i++) {
         present += (uint32_t)__builtin_popcountll(plan.hits[i]);
         missing += (uint32_t)__builtin_popcountll(selected_bits[i] & ~plan.hits[i]);
     }
@@ -3522,7 +3575,7 @@ static int cuda_stream_v41_prepare_layer_topup(const ds4_gpu_stream_expert_table
     plan.use_selected = 1;
     plan.resident_experts = present;
     plan.missing_experts = missing;
-    plan.missing_bytes = (uint64_t)missing * (total / 384u);
+    plan.missing_bytes = (uint64_t)missing * expert_bytes;
     s.reuse_plan = plan;
     *out = plan;
     return 1;
