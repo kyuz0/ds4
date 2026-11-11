@@ -43838,7 +43838,7 @@ static struct {
     ds4_gpu_tensor *logits, *probs, *selected, *weights;
     uint32_t cap;
     int32_t *ids;          /* predicted routes waiting for the launch */
-    uint32_t n_ids, ids_cap, ids_layer;
+    uint32_t n_ids, ids_cap, ids_layer, ids_rows;
     uint32_t started, adopted;
 } g_ds41_pred;
 
@@ -43913,6 +43913,7 @@ static void ds41_stream_predict_route(ds41_gpu_graph *g, const ds4_model *m,
     if (ok) {
         g_ds41_pred.n_ids = n_selected;
         g_ds41_pred.ids_layer = il + 1u;
+        g_ds41_pred.ids_rows = count;
     }
     ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(sel);
     ds4_gpu_tensor_free(probs); ds4_gpu_tensor_free(logits);
@@ -43951,6 +43952,7 @@ static void ds41_stream_predict_launch(const ds4_model *m, const ds4_layer_weigh
         if (!n) return;
     }
     ds41_stream_predict_drop();
+    ds4_gpu_dsv41_stream_selected_rows_hint(g_ds41_pred.ids_rows);
     if (ds41_stream_layer_start_selected(&g_ds41_pred.job, m, l + 1, il + 1u,
                                          g_ds41_pred.ids, n)) {
         g_ds41_pred.layer = il + 1u;
@@ -44000,6 +44002,7 @@ static bool ds41_stream_stage_selected_start(ds41_gpu_graph *g, const ds4_model 
         ok = ds4_gpu_tensor_read(g->batch.selected, 0, selected,
                                  (uint64_t)n_selected * sizeof(selected[0])) != 0;
     bool topped = false;
+    ds4_gpu_dsv41_stream_selected_rows_hint(count);
     if (g_ds41_pred.job.active || g_ds41_pred.loaded) {
         /* Take over what the prediction staged for this layer, if anything. */
         if (g_ds41_pred.job.active) {

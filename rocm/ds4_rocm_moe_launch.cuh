@@ -845,7 +845,9 @@ static int v41_routed_f16_try(
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const ds4_gpu_tensor *x, uint32_t n_tokens) {
+        const ds4_gpu_tensor *x, uint32_t n_tokens,
+        const void *const *gate_table, const void *const *up_table,
+        const void *const *down_table) {
     static int32_t *plan_rows = NULL, *plan_bounds = NULL, *plan_tiles = NULL;
     static uint32_t plan_slots = 0;
     const uint32_t slots = n_tokens * n_expert;
@@ -880,10 +882,10 @@ static int v41_routed_f16_try(
         ds41_v41_routed_f16(16, gate_w, up_w, gate_expert_bytes, xh, n_expert,
                             plan_rows, plan_bounds, plan_tiles, tile_cap,
                             (const float *)weights->ptr, clamp, mid_h, 1,
-                            expert_mid_dim, expert_in_dim, NULL, NULL) ||
+                            expert_mid_dim, expert_in_dim, gate_table, up_table) ||
         ds41_v41_routed_f16(10, down_w, NULL, down_expert_bytes, mid_h, 1u,
                             plan_rows, plan_bounds, plan_tiles, tile_cap,
-                            NULL, 0.0f, down->ptr, 0, out_dim, expert_mid_dim, NULL, NULL)) {
+                            NULL, 0.0f, down->ptr, 0, out_dim, expert_mid_dim, down_table, NULL)) {
         fprintf(stderr, "ds4: V4.1 routed FP16 launch failed\n");
         return -1;
     }
@@ -1166,10 +1168,29 @@ static int routed_moe_launch(
         expert_in_dim == 5120u && expert_mid_dim == 2304u && out_dim == 5120u &&
         gate_type == 16u && down_type == 10u &&
         gate_expert_bytes == 3041280u && down_expert_bytes == 3870720u) {
+        /* A pointer-mode slot holds only the experts read from disk; routed
+         * residents are read in place through these tables. */
+        const void *const *gate_table = NULL, *const *up_table = NULL, *const *down_table = NULL;
+        int pointer_mode = 0;
+        if (!cuda_stream_v41_layer_pointer_tables(model_map, layer_index, gate_offset, up_offset,
+                down_offset, gate_expert_bytes, down_expert_bytes,
+                &gate_table, &up_table, &down_table, &pointer_mode)) return 0;
         const int f16_rc = v41_routed_f16_try(out, gate, up, down, gate_w, up_w, down_w,
             gate_expert_bytes, down_expert_bytes, expert_in_dim, expert_mid_dim, out_dim,
-            selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+            selected, weights, n_total_expert, n_expert, clamp, x, n_tokens,
+            gate_table, up_table, down_table);
         if (f16_rc != 0) return f16_rc > 0;
+        if (pointer_mode) {
+            fprintf(stderr, "ds4: V4.1 pointer-mode layer %u cannot fall back to MMQ\n", layer_index);
+            return 0;
+        }
+    } else if (stream_full_layer && layer_index < 40u &&
+               g_stream_layer_expert_cache[layer_index & 1u].pointer_mode &&
+               g_stream_layer_expert_cache[layer_index & 1u].layer == layer_index) {
+        /* No other kernel reads experts through pointer tables. */
+        fprintf(stderr, "ds4: V4.1 pointer-mode layer %u reached a non-FP16 routed path (rows=%u)\n",
+                layer_index, n_tokens);
+        return 0;
     }
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;

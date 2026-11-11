@@ -492,6 +492,10 @@ int ds4_gpu_dsv41_stream_prepare_layer_selected(
         const int32_t *selected,
         uint32_t n_selected,
         ds4_gpu_dsv41_stream_layer_plan *plan);
+/* Row count of the batch the next selected or top-up plan is for. Selected
+ * plans for batches the routed FP16 kernel takes stage only the experts read
+ * from disk and leave routed residents in the dynamic cache. */
+void ds4_gpu_dsv41_stream_selected_rows_hint(uint32_t rows);
 /* Keep what the loaded selected plan `prev` staged for this layer and plan
  * reads only for the newly selected experts that are not staged yet. */
 int ds4_gpu_dsv41_stream_prepare_layer_topup(

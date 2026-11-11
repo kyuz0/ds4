@@ -311,6 +311,10 @@ extern "C" int ds4_gpu_dsv41_stream_prepare_layer_selected(
     return cuda_stream_v41_prepare_layer_selected(table, selected, n_selected, plan);
 }
 
+extern "C" void ds4_gpu_dsv41_stream_selected_rows_hint(uint32_t rows) {
+    g_stream_v41_selected_rows_hint = rows;
+}
+
 extern "C" int ds4_gpu_dsv41_stream_prepare_layer_topup(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected,
