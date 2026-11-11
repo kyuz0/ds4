@@ -48,15 +48,16 @@ static void v41_hc_plan_destroy(ds4_gpu_dsv41_hc_plan *p) {
     delete p;
 }
 static rocblas_status v41_hc_submit(ds4_gpu_dsv41_hc_plan *p,
-        float *out, const float *wide, const float *input) {
+        float *out, const float *wide, const float *input, uint32_t rows) {
     const float alpha = 1.0f, beta = 0.0f;
     return rocblas_sgemm(p->handle, rocblas_operation_transpose, rocblas_operation_none,
-        24, 2048, 20480, &alpha, wide, 20480, input, 20480, &beta, out, 24);
+        24, (rocblas_int)rows, 20480, &alpha, wide, 20480, input, 20480, &beta, out, 24);
 }
 /*1 enqueued,0 unsupported before projection submission,-1 failed and drained.
  * Inputs are the existing RMS-normalized F32 values; no precision boundary is added. */
 static int v41_hc_plan_run(ds4_gpu_dsv41_hc_plan **owner,
-        float *out, const uint16_t *weight, const float *input, void *scratch) {
+        float *out, const uint16_t *weight, const float *input, void *scratch,
+        uint32_t rows) {
     if (!*owner) *owner = new (std::nothrow) ds4_gpu_dsv41_hc_plan;
     ds4_gpu_dsv41_hc_plan *p = *owner;
     if (!p || p->failed) return -1;
@@ -75,7 +76,8 @@ static int v41_hc_plan_run(ds4_gpu_dsv41_hc_plan **owner,
         void *workspace = static_cast<unsigned char *>(scratch) + v41_hc_wide_bytes;
         V41_HC_BLAS(rocblas_set_workspace(p->handle, workspace, 256));
         V41_HC_BLAS(rocblas_start_device_memory_size_query(p->handle));
-        const rocblas_status query = v41_hc_submit(p, out, wide, input);
+        /* Size the workspace for a full chunk; smaller batches need no more. */
+        const rocblas_status query = v41_hc_submit(p, out, wide, input, 2048u);
         size_t required = 0;
         const rocblas_status stop = rocblas_stop_device_memory_size_query(p->handle, &required);
         if (query != rocblas_status_success && query != rocblas_status_size_increased && query != rocblas_status_size_unchanged)
@@ -99,7 +101,7 @@ static int v41_hc_plan_run(ds4_gpu_dsv41_hc_plan **owner,
     p->pending = true;
     const hipError_t converted = v41_hc_widen(static_cast<float *>(scratch), weight, UINT64_C(20480) * 24u);
     if (converted != hipSuccess) return v41_hc_error(p, "weight widening", int(converted));
-    V41_HC_BLAS(v41_hc_submit(p, out, static_cast<float *>(scratch), input));
+    V41_HC_BLAS(v41_hc_submit(p, out, static_cast<float *>(scratch), input, rows));
 #undef V41_HC_BLAS
     return 1;
 }

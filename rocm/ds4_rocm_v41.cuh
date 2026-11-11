@@ -1268,12 +1268,12 @@ extern "C" int ds4_gpu_dsv41_hc_project(ds4_gpu_dsv41_hc_plan **plan,
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t rows, const ds4_gpu_tensor *input,
         ds4_gpu_tensor *full_heads_scratch) {
-    if (rows != 2048u || !ds4_rocm_is_gfx1151() ||
+    if (!rows || rows > 2048u || !ds4_rocm_is_gfx1151() ||
         g_quality_mode || cuda_runtime_config()->graph_dump || !g_rocblas_ready ||
         g_rocblas_f16_solution_set != DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) return 0;
     const uint64_t weight_bytes = UINT64_C(20480) * 24u * 2u;
-    const uint64_t in_bytes = UINT64_C(20480) * 2048u * 4u;
-    const uint64_t out_bytes = UINT64_C(24) * 2048u * 4u;
+    const uint64_t in_bytes = UINT64_C(20480) * rows * 4u;
+    const uint64_t out_bytes = UINT64_C(24) * rows * 4u;
     if (!plan || !model_map || !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
         !cuda_tensor_has_bytes(input, in_bytes) || !cuda_tensor_has_bytes(out, out_bytes)) return -1;
     if (!cuda_tensor_has_bytes(full_heads_scratch, v41_hc_scratch_bytes)) return 0;
@@ -1286,7 +1286,8 @@ extern "C" int ds4_gpu_dsv41_hc_project(ds4_gpu_dsv41_hc_plan **plan,
         !v41_hc_disjoint(weight, weight_bytes, out->ptr, out_bytes) ||
         !v41_hc_disjoint(weight, weight_bytes, input->ptr, in_bytes) ||
         !v41_hc_disjoint(weight, weight_bytes, full_heads_scratch->ptr, v41_hc_scratch_bytes)) return -1;
-    return v41_hc_plan_run(plan, (float *)out->ptr, weight, (const float *)input->ptr, full_heads_scratch->ptr);
+    return v41_hc_plan_run(plan, (float *)out->ptr, weight, (const float *)input->ptr,
+                           full_heads_scratch->ptr, rows);
 }
 
 /* Default Engram lane l consumes l+32*i, i=0..191, then the existing

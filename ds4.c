@@ -41827,6 +41827,7 @@ static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
 }
 
 static void ds41_sub(const char *name);
+static uint32_t g_ds41_trace_il; /* layer of the running sweep, for trace file names only */
 /* ROCm: batched rows reuse the decode kernels that fold the following BF16
  * pass into the store (hc expand + bf16, add + bf16). Same arithmetic, one
  * pass over the rows less each. DS4_ROCM_V41_BATCH_ROUND_FUSE=0 restores the
@@ -41859,8 +41860,20 @@ static bool ds41_hc_mix_batch(
      * Only HC projection is padded; attention and experts keep active rows. */
     const bool pad_hc = count >= 32u && count < 2048u && g->prefill_cap >= 2048u &&
         metal_graph_tp_env_flag("DS4_ROCM_V41_SUFFIX_HC_PAD", false);
+    /* The SGEMM projection used to serve full 2048-row chunks only; partial
+     * chunks took the ordered kernel (~30 ms per call at 712 rows against
+     * ~4.6 ms for a full chunk). It now also takes partial chunks of
+     * DS4_ROCM_V41_HC_SGEMM_MIN_ROWS (default 32) rows or more; 2048 restores
+     * the old behaviour. Summation order differs from the ordered kernel. */
+    static int hc_sgemm_min = -1;
+    if (hc_sgemm_min < 0) {
+        const char *v = getenv("DS4_ROCM_V41_HC_SGEMM_MIN_ROWS");
+        hc_sgemm_min = v && v[0] ? atoi(v) : 32;
+        if (hc_sgemm_min < 1) hc_sgemm_min = 1;
+    }
+    const bool hc_partial = !pad_hc && count >= (uint32_t)hc_sgemm_min && count < 2048u;
     if (fn->type == DS4_TENSOR_F16 && fn->dim[0] == 20480u && fn->dim[1] == 24u &&
-        (count == 2048u || pad_hc)) {
+        (count == 2048u || pad_hc || hc_partial)) {
         /* Preserve the existing RMS input and feed F32 mix directly to Sinkhorn. */
         if (!ds4_gpu_rms_norm_plain_rows_tensor(b->flat_norm, input,
                 DS4_N_HC * DS4_N_EMBD, count, DS4_RMS_EPS)) return false;
@@ -41874,7 +41887,8 @@ static bool ds41_hc_mix_batch(
             if (!cleared) return false;
         }
         const int result = ds4_gpu_dsv41_hc_project(&g->hc_sgemm,
-            pad_hc ? g->batch.mix : b->mix, m->map, m->size, fn->abs_offset, 2048u,
+            pad_hc ? g->batch.mix : b->mix, m->map, m->size, fn->abs_offset,
+            hc_partial ? count : 2048u,
             pad_hc ? g->batch.flat_norm : b->flat_norm, g->batch.heads);
         if (result < 0) return false;
         projected = result > 0 || ds41_matmul_batch(b->mix, m, fn, b->flat_norm, count, false);
@@ -41894,6 +41908,11 @@ static bool ds41_hc_mix_batch(
         ds4_gpu_rms_norm_plain_rows_tensor(b->flat_norm, input,
             DS4_N_HC * DS4_N_EMBD, count, DS4_RMS_EPS) &&
         ds41_matmul_batch(b->mix, m, fn, b->flat_norm, count, false);
+#ifdef DS4_ROCM_BUILD
+    for (uint32_t r = 0; projected && r < count; r++)
+        ds41_trace_vec(ffn ? "sweepMixF" : "sweepMixA", g_ds41_trace_il, g->pos + r, b->mix,
+                       (uint64_t)r * 24u * 4u, 24u);
+#endif
     return projected &&
         ds4_gpu_hc_split_sinkhorn_tensor(ffn ? b->ffn_split : b->attn_split, b->mix,
             m->map, m->size, scale->abs_offset, base->abs_offset,
@@ -44600,6 +44619,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok && batch_attention) {
                 const ds4_layer_weights *l = &w->layer[il];
+                g_ds41_trace_il = il;
                 ok = ds41_attention_project_batch(g, m, l, count);
                 DS41_STAGE("attention projections");
                 if (ok && batch_core) ok = ds41_attention_batch(g, m, l, il, count);
