@@ -42480,6 +42480,11 @@ static bool ds41_stream_stage_selected_join(const ds4_model *m,
                                              const ds4_layer_weights *l, uint32_t il,
                                              uint32_t count,
                                              ds41_stream_layer_load *stage);
+static void ds41_stream_predict_route(ds41_gpu_graph *g, const ds4_model *m,
+                                      const ds4_layer_weights *l, uint32_t il,
+                                      uint32_t count);
+static void ds41_stream_predict_launch(const ds4_model *m, const ds4_layer_weights *l,
+                                       uint32_t il);
 #endif
 
 static bool ds41_dspark_ssd_allowed(void);
@@ -42532,6 +42537,14 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         const bool staged = ds41_stream_stage_selected_join(m, l, il, count,
                                                              &selected_stage);
         ok = ok && staged;
+        /* The loader is free again: route the next layer on this layer's FFN
+         * input and stage the experts it predicts, while this layer's routed
+         * experts and the next layer's attention run. (Routing before the join
+         * and launching after the routed kernels measured worse.) */
+        if (ok) {
+            ds41_stream_predict_route(g, m, l, il, count);
+            ds41_stream_predict_launch(m, l, il);
+        }
     }
 #endif
     ds41_sub("ffn stage join");
@@ -43806,6 +43819,175 @@ static bool ds41_selective_stage_enabled(const ds41_gpu_graph *g, uint32_t count
         count <= g->prefill_cap;
 }
 
+/* Router-predicted prefetch for selective staging. A selected stage can only
+ * start once its layer has routed, so its reads overlap nothing but the
+ * shared expert. While layer il's routed experts and layer il + 1's attention
+ * run, the loader is idle: run layer il + 1's router on layer il's FFN input
+ * (one layer stale) and stage the experts it picks. When layer il + 1 has its
+ * real routes, the stage keeps what is already there and reads only the rest
+ * (ds4_gpu_dsv41_stream_prepare_layer_topup). A wrong prediction costs reads,
+ * never results: the routed kernels only touch really selected experts.
+ * DS4_ROCM_V41_STAGE_PREDICT=0 disables; DS4_ROCM_V41_STAGE_PREDICT_MIN_ROWS
+ * (default 512) and DS4_ROCM_V41_STAGE_PREDICT_MIN_VOTES override the policy. */
+static struct {
+    ds41_stream_layer_load job;
+    ds4_gpu_dsv41_stream_layer_plan plan; /* loaded plan of a joined prefetch */
+    bool loaded;
+    uint32_t layer;
+    const void *map;
+    ds4_gpu_tensor *logits, *probs, *selected, *weights;
+    uint32_t cap;
+    int32_t *ids;          /* predicted routes waiting for the launch */
+    uint32_t n_ids, ids_cap, ids_layer;
+    uint32_t started, adopted;
+} g_ds41_pred;
+
+static bool ds41_stage_predict_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_STAGE_PREDICT");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
+/* Join a running prefetch and forget its result. */
+static void ds41_stream_predict_drop(void) {
+    if (g_ds41_pred.job.active) (void)ds41_stream_layer_join(&g_ds41_pred.job, NULL);
+    g_ds41_pred.loaded = false;
+}
+
+static uint32_t ds41_stage_predict_min_rows(void) {
+    static int rows = -1;
+    if (rows < 0) {
+        const char *v = getenv("DS4_ROCM_V41_STAGE_PREDICT_MIN_ROWS");
+        rows = v && v[0] ? atoi(v) : 512;
+        if (rows < 1) rows = 1;
+    }
+    return (uint32_t)rows;
+}
+
+static void ds41_stream_predict_route(ds41_gpu_graph *g, const ds4_model *m,
+                                      const ds4_layer_weights *l, uint32_t il,
+                                      uint32_t count) {
+    g_ds41_pred.n_ids = 0;
+    if (!ds41_stage_predict_enabled() || count < ds41_stage_predict_min_rows() ||
+        il + 1u >= DS4_N_LAYER ||
+        g->image_count || g->tp_world != 1u || !ds41_selective_stage_enabled(g, count)) return;
+    const ds4_layer_weights *next = l + 1;
+    if (!next->ffn_gate_inp || !next->ffn_exp_probs_b || !next->ffn_gate_exps) return;
+    if (g_ds41_pred.cap < g->prefill_cap) {
+        ds4_gpu_tensor_free(g_ds41_pred.logits); ds4_gpu_tensor_free(g_ds41_pred.probs);
+        ds4_gpu_tensor_free(g_ds41_pred.selected); ds4_gpu_tensor_free(g_ds41_pred.weights);
+        const uint64_t rows = g->prefill_cap;
+        g_ds41_pred.logits = ds4_gpu_tensor_alloc(rows * DS4_N_EXPERT * sizeof(float));
+        g_ds41_pred.probs = ds4_gpu_tensor_alloc(rows * DS4_N_EXPERT * sizeof(float));
+        g_ds41_pred.selected = ds4_gpu_tensor_alloc(rows * DS4_N_EXPERT_USED * sizeof(int32_t));
+        g_ds41_pred.weights = ds4_gpu_tensor_alloc(rows * DS4_N_EXPERT_USED * sizeof(float));
+        g_ds41_pred.cap = g_ds41_pred.logits && g_ds41_pred.probs && g_ds41_pred.selected &&
+            g_ds41_pred.weights ? g->prefill_cap : 0;
+        if (!g_ds41_pred.cap) return;
+    }
+    const uint32_t n_selected = count * DS4_N_EXPERT_USED;
+    ds4_gpu_tensor *logits = ds4_gpu_tensor_view(g_ds41_pred.logits, 0,
+        (uint64_t)count * DS4_N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *probs = ds4_gpu_tensor_view(g_ds41_pred.probs, 0,
+        (uint64_t)count * DS4_N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_view(g_ds41_pred.selected, 0,
+        (uint64_t)n_selected * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_view(g_ds41_pred.weights, 0,
+        (uint64_t)n_selected * sizeof(float));
+    if (g_ds41_pred.ids_cap < n_selected) {
+        free(g_ds41_pred.ids);
+        g_ds41_pred.ids = (int32_t *)malloc((size_t)n_selected * sizeof(int32_t));
+        g_ds41_pred.ids_cap = g_ds41_pred.ids ? n_selected : 0;
+    }
+    int32_t *ids = g_ds41_pred.ids;
+    const bool ok = logits && probs && sel && weights && ids &&
+        ds41_matmul_batch(logits, m, next->ffn_gate_inp, g->batch.norm, count, false) &&
+        ds4_gpu_router_select_batch_tensor(sel, weights, probs, m->map, m->size,
+            next->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
+            logits, g->prefill_tokens, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+            DS4_EXPERT_WEIGHT_SCALE, count) &&
+        ds4_gpu_tensor_read(sel, 0, ids, (uint64_t)n_selected * sizeof(ids[0])) != 0;
+    if (ok) {
+        g_ds41_pred.n_ids = n_selected;
+        g_ds41_pred.ids_layer = il + 1u;
+    }
+    ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(sel);
+    ds4_gpu_tensor_free(probs); ds4_gpu_tensor_free(logits);
+}
+
+/* Called after layer il's routed experts were enqueued and its own loader
+ * joined: stage the predicted experts of layer il + 1. */
+static void ds41_stream_predict_launch(const ds4_model *m, const ds4_layer_weights *l,
+                                       uint32_t il) {
+    uint32_t n = g_ds41_pred.n_ids;
+    g_ds41_pred.n_ids = 0;
+    if (!n || g_ds41_pred.ids_layer != il + 1u || il + 1u >= DS4_N_LAYER) return;
+    /* Keep only experts that at least `votes` predicted routes agree on: a
+     * mispredicted expert costs a read the next layer has to wait for. */
+    static int votes_env = -1;
+    if (votes_env < 0) {
+        const char *v = getenv("DS4_ROCM_V41_STAGE_PREDICT_MIN_VOTES");
+        votes_env = v && v[0] ? atoi(v) : 0;
+        if (votes_env < 0) votes_env = 0;
+    }
+    /* Measured 2026-11-11 (A/B/B/A, identical logits): one vote is best from
+     * 1024 rows (+1024 tokens 5.93 -> 5.61 s, +2048 9.95 -> 8.19 s), two votes
+     * for 512-1023 rows (+712 tokens 5.17 -> 4.89 s). Below 512 rows the
+     * prediction does not pay (see ds41_stage_predict_min_rows). */
+    const int votes = votes_env ? votes_env : (n >= 1024u * DS4_N_EXPERT_USED ? 1 : 2);
+    if (votes > 1) {
+        uint32_t seen[384] = {0};
+        for (uint32_t i = 0; i < n; i++) {
+            const int32_t e = g_ds41_pred.ids[i];
+            if (e >= 0 && e < 384) seen[e]++;
+        }
+        uint32_t kept = 0;
+        for (uint32_t e = 0; e < 384u; e++)
+            if (seen[e] >= (uint32_t)votes) g_ds41_pred.ids[kept++] = (int32_t)e;
+        n = kept;
+        if (!n) return;
+    }
+    ds41_stream_predict_drop();
+    if (ds41_stream_layer_start_selected(&g_ds41_pred.job, m, l + 1, il + 1u,
+                                         g_ds41_pred.ids, n)) {
+        g_ds41_pred.layer = il + 1u;
+        g_ds41_pred.map = m->map;
+        g_ds41_pred.started++;
+    }
+}
+
+/* Start a loader that keeps the slot contents `prev` staged and reads only
+ * the newly selected experts. */
+static bool ds41_stream_layer_start_topup(ds41_stream_layer_load *job, const ds4_model *m,
+                                          const ds4_layer_weights *l, uint32_t il,
+                                          const int32_t *selected, uint32_t n_selected,
+                                          const ds4_gpu_dsv41_stream_layer_plan *prev) {
+    ds4_gpu_stream_expert_table table;
+    if (!job || job->active || il >= DS4_N_LAYER || !selected || !n_selected || !prev ||
+        !ds41_stream_table(m, l, il, &table)) return false;
+    memset(job, 0, sizeof(*job));
+    job->prepare_start = now_sec();
+    if (!ds4_gpu_dsv41_stream_prepare_layer_topup(&table, selected, n_selected, prev, &job->plan))
+        return false;
+    job->prepare_done = now_sec();
+    job->resident_experts = job->plan.resident_experts;
+    job->missing_experts = job->plan.missing_experts;
+    job->missing_bytes = job->plan.missing_bytes;
+    const int rc = pthread_create(&job->thread, NULL, ds41_stream_layer_read, job);
+    if (rc) {
+        if (!ds4_gpu_dsv41_stream_cancel_layer(&job->plan))
+            ds4_die("cannot cancel unstarted V4.1 expert top-up plan");
+        memset(job, 0, sizeof(*job));
+        return false;
+    }
+    job->start_done = now_sec();
+    job->active = true;
+    return true;
+}
+
 static bool ds41_stream_stage_selected_start(ds41_gpu_graph *g, const ds4_model *m,
                                               const ds4_layer_weights *l, uint32_t il,
                                               uint32_t count,
@@ -43817,7 +43999,21 @@ static bool ds41_stream_stage_selected_start(ds41_gpu_graph *g, const ds4_model 
     if (ok)
         ok = ds4_gpu_tensor_read(g->batch.selected, 0, selected,
                                  (uint64_t)n_selected * sizeof(selected[0])) != 0;
-    if (ok)
+    bool topped = false;
+    if (g_ds41_pred.job.active || g_ds41_pred.loaded) {
+        /* Take over what the prediction staged for this layer, if anything. */
+        if (g_ds41_pred.job.active) {
+            ds41_stream_layer_load snap = {0};
+            g_ds41_pred.loaded = ds41_stream_layer_join(&g_ds41_pred.job, &snap);
+            g_ds41_pred.plan = snap.plan;
+        }
+        if (ok && g_ds41_pred.loaded && g_ds41_pred.layer == il && g_ds41_pred.map == m->map)
+            topped = ds41_stream_layer_start_topup(stage, m, l, il, selected, n_selected,
+                                                   &g_ds41_pred.plan);
+        g_ds41_pred.loaded = false;
+        if (topped) g_ds41_pred.adopted++;
+    }
+    if (ok && !topped)
         ok = ds41_stream_layer_start_selected(stage, m, l, il,
                                                selected, n_selected);
     free(selected);
@@ -43873,11 +44069,16 @@ static bool ds41_stream_stage_selected_join(const ds4_model *m,
 static bool ds41_stream_sweep_start(ds41_stream_layer_load *job,
                                     const ds4_model *m, const ds4_weights *w,
                                     bool selective_stage) {
+    ds41_stream_predict_drop();
     if (!ds4_gpu_stream_expert_cache_quiesce()) return false;
     return selective_stage || ds41_stream_layer_start(job, m, w, 0);
 }
 
 static bool ds41_stream_sweep_finish(ds41_stream_layer_load *job) {
+    ds41_stream_predict_drop();
+    if (getenv("DS4_ROCM_V41_SELECTIVE_TRACE") && g_ds41_pred.started)
+        fprintf(stderr, "ds4: V4.1 predicted stages started=%u adopted=%u\n",
+                g_ds41_pred.started, g_ds41_pred.adopted);
     bool ok = ds41_stream_layer_join(job, NULL);
     if (!ds4_gpu_stream_expert_cache_quiesce()) ok = false;
     return ok;

@@ -3459,6 +3459,75 @@ static int cuda_stream_v41_prepare_layer_selected(const ds4_gpu_stream_expert_ta
     return cuda_stream_v41_prepare_layer_impl(t, selected, n_selected, out);
 }
 
+/* Top up a slot that a selected plan (`prev`) already loaded for this layer:
+ * its contents stay (the residents copied when `prev` was prepared plus the
+ * experts `prev` read from disk) and the new plan reads only the experts in
+ * `selected` that are not there yet. No source copies are made. */
+static int cuda_stream_v41_prepare_layer_topup(const ds4_gpu_stream_expert_table *t,
+                                               const int32_t *selected,
+                                               uint32_t n_selected,
+                                               const ds4_gpu_dsv41_stream_layer_plan *prev,
+                                               ds4_gpu_dsv41_stream_layer_plan *out) {
+    if (!out || !prev || !prev->use_selected || !selected || !n_selected) return 0;
+    memset(out, 0, sizeof(*out));
+    uint64_t selected_bits[6] = {0};
+    uint32_t selected_unique = 0;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const int32_t e = selected[i];
+        if (e < 0 || (uint32_t)e >= 384u) return 0;
+        const uint64_t bit = UINT64_C(1) << ((uint32_t)e % 64u);
+        if (!(selected_bits[(uint32_t)e / 64u] & bit)) {
+            selected_bits[(uint32_t)e / 64u] |= bit;
+            selected_unique++;
+        }
+    }
+    uint64_t total = 0;
+    if (!selected_unique || !g_ssd_streaming_mode || !cuda_stream_layer_table_bytes(t, &total) ||
+        t->n_total_expert != 384u || t->layer >= 40u || g_model_fd < 0 ||
+        g_model_fd_host_base != t->model_map ||
+        g_stream_selected_pending.active || g_stream_batch_selected_pending.active ||
+        g_stream_v41_plan_generation == UINT64_MAX) return 0;
+    pthread_mutex_lock(&g_stream_read_mutex);
+    const bool busy = g_stream_read_active_jobs != NULL;
+    pthread_mutex_unlock(&g_stream_read_mutex);
+    if (busy) return 0; /* Caller must join the previous layer loader. */
+    cuda_stream_layer_expert_cache &s = g_stream_layer_expert_cache[t->layer & 1u];
+    const ds4_gpu_stream_expert_table &pt = prev->table;
+    if (!s.active || !s.reserved || !s.base || s.capacity != total || s.bytes != total ||
+        s.layer != t->layer || s.model_map != t->model_map || s.model_size != t->model_size ||
+        s.n_total_expert != t->n_total_expert ||
+        s.gate_offset != t->gate_offset || s.up_offset != t->up_offset ||
+        s.down_offset != t->down_offset ||
+        s.gate_expert_bytes != t->gate_expert_bytes ||
+        s.down_expert_bytes != t->down_expert_bytes ||
+        pt.model_map != t->model_map || pt.layer != t->layer ||
+        pt.gate_offset != t->gate_offset || pt.up_offset != t->up_offset ||
+        pt.down_offset != t->down_offset ||
+        !s.reuse_plan.use_selected ||
+        memcmp(s.reuse_plan.hits, prev->hits, sizeof(prev->hits)) != 0 ||
+        memcmp(s.reuse_plan.selected, prev->selected, sizeof(prev->selected)) != 0 ||
+        !cuda_stream_layer_expert_cache_wait(s)) return 0;
+    s.active = 0;
+    ds4_gpu_dsv41_stream_layer_plan plan = {};
+    plan.table = *t;
+    plan.generation = ++g_stream_v41_plan_generation;
+    uint32_t present = 0, missing = 0;
+    for (uint32_t i = 0; i < 6u; i++) {
+        plan.hits[i] = prev->hits[i] | prev->selected[i];
+        plan.selected[i] = selected_bits[i];
+        present += (uint32_t)__builtin_popcountll(plan.hits[i]);
+        missing += (uint32_t)__builtin_popcountll(selected_bits[i] & ~plan.hits[i]);
+    }
+    plan.selected_experts = selected_unique;
+    plan.use_selected = 1;
+    plan.resident_experts = present;
+    plan.missing_experts = missing;
+    plan.missing_bytes = (uint64_t)missing * (total / 384u);
+    s.reuse_plan = plan;
+    *out = plan;
+    return 1;
+}
+
 static int cuda_stream_v41_plan_matches(const ds4_gpu_dsv41_stream_layer_plan *p) {
     uint64_t bytes = 0;
     if (!p || !p->generation || !cuda_stream_layer_table_bytes(&p->table, &bytes) ||

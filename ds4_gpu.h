@@ -492,6 +492,14 @@ int ds4_gpu_dsv41_stream_prepare_layer_selected(
         const int32_t *selected,
         uint32_t n_selected,
         ds4_gpu_dsv41_stream_layer_plan *plan);
+/* Keep what the loaded selected plan `prev` staged for this layer and plan
+ * reads only for the newly selected experts that are not staged yet. */
+int ds4_gpu_dsv41_stream_prepare_layer_topup(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *selected,
+        uint32_t n_selected,
+        const ds4_gpu_dsv41_stream_layer_plan *prev,
+        ds4_gpu_dsv41_stream_layer_plan *plan);
 int ds4_gpu_dsv41_stream_load_layer(
         ds4_gpu_dsv41_stream_layer_plan *plan);
 int ds4_gpu_dsv41_stream_cancel_layer(
