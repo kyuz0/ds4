@@ -41943,6 +41943,19 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
 #endif
             b, m, l, false, count)) return false;
     ds41_sub("hc mix (attn)");
+#ifdef DS4_ROCM_BUILD
+    /* Weighted sum, BF16, norm and BF16 in one pass per row. */
+    if (ds41_batch_round_fuse() && DS4_N_HC == 4u && DS4_N_EMBD == 5120u &&
+        l->attn_norm->dim[0] == 5120u && !getenv("DS4_ROCM_V41_HC_WSUM_NORM_SPLIT")) {
+        const bool fused = ds4_gpu_dsv41_hc_wsum_norm_rows(b->x, b->norm, b->residual,
+            il ? b->ffn_split : b->pre, il ? 24u : 4u, m->map, m->size,
+            l->attn_norm->abs_offset, count, DS4_RMS_EPS) != 0;
+        ds41_sub("hc wsum+norm fused (attn)");
+        for (uint32_t r = 0; fused && r < count; r++)
+            ds41_trace_vec("batchAN", il, g->pos + r, b->norm, (uint64_t)r * DS4_N_EMBD * 4u, DS4_N_EMBD);
+        return fused;
+    }
+#endif
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
     const bool mixed = il ?
         ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
@@ -41984,6 +41997,15 @@ static bool ds41_after_attention_batch(
 #endif
             b, m, l, true, count);
     ds41_sub("hc mix (ffn)");
+#ifdef DS4_ROCM_BUILD
+    if (ds41_batch_round_fuse() && DS4_N_HC == 4u && DS4_N_EMBD == 5120u &&
+        l->ffn_norm->dim[0] == 5120u && !getenv("DS4_ROCM_V41_HC_WSUM_NORM_SPLIT")) {
+        ok = ok && ds4_gpu_dsv41_hc_wsum_norm_rows(b->x, b->norm, b->after_attn, b->attn_split,
+            24u, m->map, m->size, l->ffn_norm->abs_offset, count, DS4_RMS_EPS) != 0;
+        ds41_sub("hc wsum+norm fused (ffn)");
+        return ok;
+    }
+#endif
     ok = ok && ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->after_attn, b->attn_split, DS4_N_EMBD, DS4_N_HC);
     ds41_sub("hc weighted sum (ffn)");
     ok = ok && ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
@@ -41996,13 +42018,26 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
                                          const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
-    return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
+    bool paired = false;
+#ifdef DS4_ROCM_BUILD
+    /* Query-A and KV read the same rows: one launch, then the BF16 passes
+     * ds41_matmul_batch would have applied to each. */
+    if (!g_ds41_dspark_verify_dense &&
+        l->attn_q_a->type == DS4_TENSOR_Q8_0 && l->attn_kv->type == DS4_TENSOR_Q8_0 &&
+        l->attn_q_a->dim[0] == l->attn_kv->dim[0] &&
+        ds4_gpu_dsv41_q8_projection_pair_batch(b->qr, b->kv, m->map, m->size,
+            l->attn_q_a->abs_offset, l->attn_kv->abs_offset, (uint32_t)l->attn_q_a->dim[0],
+            (uint32_t)l->attn_q_a->dim[1], (uint32_t)l->attn_kv->dim[1], count, b->norm))
+        paired = ds4_gpu_dsv41_quantize(b->qr, (uint32_t)l->attn_q_a->dim[1], count, DS4_V41_BF16) &&
+            ds4_gpu_dsv41_quantize(b->kv, (uint32_t)l->attn_kv->dim[1], count, DS4_V41_BF16);
+#endif
+    return (paired || ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true)) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
             l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
         ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16) &&
         ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
                                g->tp_rank * q_dim, q_dim, count) &&
-        ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true) &&
+        (paired || ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true)) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
             l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
         ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16);
@@ -42499,7 +42534,15 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     bool mid_f16 = false;
     ds41_sub(NULL);
-    bool ok = ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false);
+    bool ok;
+#ifdef DS4_ROCM_BUILD
+    if (l->ffn_gate_inp->type == DS4_TENSOR_F32 &&
+        ds4_gpu_dsv41_router_bf16_rows(b->route_logits, m->map, m->size,
+            l->ffn_gate_inp->abs_offset, (uint32_t)l->ffn_gate_inp->dim[0],
+            (uint32_t)l->ffn_gate_inp->dim[1], count, b->norm)) ok = true;
+    else
+#endif
+    ok = ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false);
     ds41_sub("ffn router matmul");
     ok = ok && ds41_route_batch(g, m, l, count);
     ds41_sub("ffn route select");
@@ -42527,8 +42570,23 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     (void)stage_selected;
 #endif
     if (ok && !(shared_owner && g->tp_rank != (il & 1u))) {
-        ok = ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
-            ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
+        bool paired = false;
+#ifdef DS4_ROCM_BUILD
+        /* Gate and up in one launch, then the two BF16 passes ds41_matmul_batch
+         * would have applied. */
+        if (!g_ds41_dspark_verify_dense &&
+            l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+            l->ffn_gate_shexp->dim[0] == l->ffn_up_shexp->dim[0] &&
+            ds4_gpu_dsv41_q8_projection_pair_batch(b->shared_gate, b->shared_up, m->map, m->size,
+                l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                (uint32_t)l->ffn_gate_shexp->dim[0], (uint32_t)l->ffn_gate_shexp->dim[1],
+                (uint32_t)l->ffn_up_shexp->dim[1], count, b->norm))
+            paired = ds4_gpu_dsv41_quantize(b->shared_gate, (uint32_t)l->ffn_gate_shexp->dim[1], count, DS4_V41_BF16) &&
+                ds4_gpu_dsv41_quantize(b->shared_up, (uint32_t)l->ffn_up_shexp->dim[1], count, DS4_V41_BF16);
+#endif
+        ok = (paired ||
+              (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
+               ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true))) &&
             ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
                 count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
             ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
@@ -43950,7 +44008,11 @@ static void ds41_stream_predict_route(ds41_gpu_graph *g, const ds4_model *m,
     }
     int32_t *ids = g_ds41_pred.ids;
     const bool ok = logits && probs && sel && weights && ids &&
-        ds41_matmul_batch(logits, m, next->ffn_gate_inp, g->batch.norm, count, false) &&
+        ((next->ffn_gate_inp->type == DS4_TENSOR_F32 &&
+          ds4_gpu_dsv41_router_bf16_rows(logits, m->map, m->size,
+              next->ffn_gate_inp->abs_offset, (uint32_t)next->ffn_gate_inp->dim[0],
+              (uint32_t)next->ffn_gate_inp->dim[1], count, g->batch.norm)) ||
+         ds41_matmul_batch(logits, m, next->ffn_gate_inp, g->batch.norm, count, false)) &&
         ds4_gpu_router_select_batch_tensor(sel, weights, probs, m->map, m->size,
             next->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
             logits, g->prefill_tokens, DS4_N_EXPERT, DS4_N_EXPERT_USED,

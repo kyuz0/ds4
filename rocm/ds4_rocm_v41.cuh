@@ -191,6 +191,66 @@ __global__ __launch_bounds__(1024) static void v41_hc_tail_kernel(
     for (uint32_t i = tid; i < N; i += 1024u) norm_out[i] = v41_bf16(xs[i] * scale * nw[i]);
 }
 
+/* The weighted-sum and norm part of v41_hc_tail_kernel for a batch of rows:
+ * x[d] = bf16(sum_h residual[h][d] * w[h]), norm_out = bf16(rms_norm(x) * nw),
+ * one block per row. Same per-element arithmetic and reduction tree as
+ * hc_weighted_sum_kernel + v41_bf16_kernel + rms_norm_batched_kernel<true> +
+ * v41_bf16_kernel. */
+__global__ __launch_bounds__(1024) static void v41_hc_wsum_norm_rows_kernel(
+        const float *w, uint32_t w_stride, const float *residual, float *x,
+        float *norm_out, const float *nw, float eps) {
+    constexpr uint32_t N = 5120u;
+    __shared__ float xs[N];
+    __shared__ float partial[256];
+    const uint32_t tid = threadIdx.x;
+    const uint64_t row = blockIdx.x;
+    const float *wr = w + row * w_stride;
+    const float *res = residual + row * 4u * N;
+    float *xr = x + row * N;
+    float *no = norm_out + row * N;
+    for (uint32_t d = tid; d < N; d += 1024u) {
+        float acc = 0.0f;
+        for (uint32_t h = 0; h < 4u; h++) acc += res[(uint64_t)h * N + d] * wr[h];
+        const float v = v41_bf16(acc);
+        xr[d] = v;
+        xs[d] = v;
+    }
+    __syncthreads();
+    if (tid < 256u) {
+        float sum = 0.0f;
+        for (uint32_t i = tid; i < N; i += 256u) {
+            const float v = xs[i];
+            sum += v * v;
+        }
+        partial[tid] = sum;
+    }
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)N + eps);
+    for (uint32_t i = tid; i < N; i += 1024u) no[i] = v41_bf16(xs[i] * scale * nw[i]);
+}
+
+extern "C" int ds4_gpu_dsv41_hc_wsum_norm_rows(ds4_gpu_tensor *x, ds4_gpu_tensor *norm_out,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *w, uint32_t w_stride,
+        const void *model_map, uint64_t model_size, uint64_t norm_weight_offset,
+        uint32_t rows, float eps) {
+    if (!x || !norm_out || !residual || !w || !model_map || !rows || w_stride < 4u ||
+        !cuda_tensor_has_elems2(x, 5120u, rows, 4u) ||
+        !cuda_tensor_has_elems2(norm_out, 5120u, rows, 4u) ||
+        !cuda_tensor_has_elems2(residual, 4u * 5120u, rows, 4u) ||
+        !cuda_tensor_has_elems2(w, w_stride, rows, 4u) ||
+        !cuda_model_range_fits(model_size, norm_weight_offset, 5120u * 4u)) return 0;
+    const float *nw = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
+                                                          5120u * 4u, "rms_weight");
+    if (!nw) return 0;
+    v41_hc_wsum_norm_rows_kernel<<<rows, 1024>>>((const float *)w->ptr, w_stride,
+        (const float *)residual->ptr, (float *)x->ptr, (float *)norm_out->ptr, nw, eps);
+    return cuda_ok(cudaGetLastError(), "V4.1 batched HC weighted sum + norm");
+}
+
 extern "C" int ds4_gpu_dsv41_hc_tail(ds4_gpu_tensor *split_out, const ds4_gpu_tensor *mix,
         const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset,
         uint32_t sinkhorn_iters, float hc_eps, const ds4_gpu_tensor *w,
@@ -1894,6 +1954,76 @@ extern "C" int ds4_gpu_dsv41_q8_projection_pair_rows(
     return cuda_ok(cudaGetLastError(), "V4.1 Q8 fused pair projection");
 }
 
+/* Router projection (F32 384 x 5120) on the BF16 matrix cores
+ * (rocm/gufo_f16/ds41_v41.hip.cpp). The router weights are BF16 values stored
+ * as F32, so their BF16 copy is exact; it is made once per layer and kept.
+ * The kernel splits each F32 activation into three BF16 terms, so every
+ * product is exact and only the summation order differs from SGEMM.
+ * Returns 1 done, 0 not applicable (caller uses its usual path).
+ * DS4_ROCM_V41_ROUTER_BF16=0 disables. */
+extern "C" int ds41_v41_matmul_bf16(const uint16_t *w, const float *x, float *out, uint32_t rows,
+                                    uint32_t k, uint32_t n);
+__global__ static void v41_f32_to_bf16_exact_kernel(uint16_t *out, const float *in, uint64_t n,
+                                                   uint32_t *inexact) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint32_t bits = __float_as_uint(in[i]);
+    out[i] = (uint16_t)(bits >> 16);
+    if (bits & 0xffffu) atomicOr(inexact, 1u);
+}
+extern "C" int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t width, uint32_t outputs,
+        uint32_t rows, const ds4_gpu_tensor *in) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_ROUTER_BF16");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    if (!on || g_quality_mode || rows < 16u || rows > 2048u || outputs != 384u || width != 5120u ||
+        !model_map || !cuda_tensor_has_elems2(in, width, rows, 4u) ||
+        !cuda_tensor_has_elems2(out, outputs, rows, 4u) ||
+        ((uintptr_t)in->ptr % 16u) != 0u) return 0;
+    const uint64_t n = (uint64_t)outputs * width;
+    if (!cuda_model_range_fits(model_size, weight_offset, n * sizeof(float))) return 0;
+    struct entry { const void *map; uint64_t offset; uint16_t *w; int state; };
+    static entry cache[64];
+    entry *e = NULL;
+    for (uint32_t i = 0; i < 64u; i++) {
+        if (cache[i].state && cache[i].map == model_map && cache[i].offset == weight_offset) { e = &cache[i]; break; }
+        if (!cache[i].state) {
+            const float *w32 = (const float *)cuda_model_range_ptr(model_map, weight_offset,
+                n * sizeof(float), "V4.1 router F32");
+            if (!w32) return 0;
+            uint16_t *w16 = NULL; uint32_t *flag = NULL;
+            if (!cuda_ok(cudaMalloc(&w16, n * sizeof(uint16_t)), "V4.1 router BF16 weights") ||
+                !cuda_ok(cudaMalloc(&flag, sizeof(uint32_t)), "V4.1 router BF16 check")) return 0;
+            uint32_t inexact = 0;
+            if (!cuda_ok(cudaMemcpy(flag, &inexact, sizeof(inexact), cudaMemcpyHostToDevice), "V4.1 router BF16 check reset")) return 0;
+            v41_f32_to_bf16_exact_kernel<<<(unsigned)((n + 255u) / 256u), 256u>>>(w16, w32, n, flag);
+            if (!cuda_ok(cudaGetLastError(), "V4.1 router BF16 convert") ||
+                !cuda_ok(cudaMemcpy(&inexact, flag, sizeof(inexact), cudaMemcpyDeviceToHost), "V4.1 router BF16 check read")) return 0;
+            (void)cudaFree(flag);
+            cache[i].map = model_map; cache[i].offset = weight_offset;
+            if (inexact) {
+                /* Not BF16 values: keep SGEMM for this matrix. */
+                (void)cudaFree(w16);
+                cache[i].w = NULL; cache[i].state = 2;
+                fprintf(stderr, "ds4: V4.1 router weights at %llu are not exact BF16; keeping SGEMM\n",
+                        (unsigned long long)weight_offset);
+            } else {
+                cache[i].w = w16; cache[i].state = 1;
+            }
+            e = &cache[i];
+            break;
+        }
+    }
+    if (!e || e->state != 1 || ((uintptr_t)e->w % 16u) != 0u) return 0;
+    if (ds41_v41_matmul_bf16(e->w, (const float *)in->ptr, (float *)out->ptr, outputs, width, rows)) return 0;
+    static int logged = 0;
+    if (!logged) { logged = 1; fprintf(stderr, "ds4: ROCm V4.1 router on BF16 matrix cores active (rows=%u)\n", rows); }
+    return 1;
+}
+
 /* Dense Q8_0 projections on the FP16 matrix cores (rocm/gufo_f16, see its
  * NOTICE.md). Same operand rounding as the WMMA row-tile kernels (FP16
  * activations and decoded weights, FP32 accumulation); only the summation
@@ -1923,6 +2053,41 @@ static void v41_dense_f16_log(const char *what, uint32_t rows) {
         logged = 1;
         fprintf(stderr, "ds4: ROCm V4.1 dense FP16 projections active (%s rows=%u)\n", what, rows);
     }
+}
+
+/* Two Q8_0 matrices over the same input rows in one launch (the same results
+ * as two ds41_v41_dense_f16 calls): shared-expert gate + up, and attention
+ * query-A + KV. Outputs are not rounded; the caller applies its BF16 passes.
+ * Returns 1 done, 0 not applicable. DS4_ROCM_V41_DENSE_PAIR=0 disables. */
+extern "C" int ds41_v41_dense_f16_pair(int type, const void *w1, void *out1, uint32_t m1,
+                                       const void *w2, void *out2, uint32_t m2, const void *x,
+                                       uint32_t n, uint32_t k, uint32_t io);
+extern "C" int ds4_gpu_dsv41_q8_projection_pair_batch(ds4_gpu_tensor *out1, ds4_gpu_tensor *out2,
+        const void *model_map, uint64_t model_size, uint64_t offset1, uint64_t offset2,
+        uint32_t width, uint32_t outputs1, uint32_t outputs2, uint32_t rows,
+        const ds4_gpu_tensor *in) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_DENSE_PAIR");
+        on = !(v && v[0] == '0');
+    }
+    uint64_t bytes1 = 0, bytes2 = 0;
+    if (!on || g_quality_mode || !v41_dense_f16_enabled() || rows < v41_dense_f16_min_rows() ||
+        rows > 2048u || !width || width % 256u || !outputs1 || outputs1 % 256u ||
+        !outputs2 || outputs2 % 256u || !model_map ||
+        !cuda_u64_mul3_checked(width / 32u, outputs1, 34u, &bytes1) ||
+        !cuda_u64_mul3_checked(width / 32u, outputs2, 34u, &bytes2) ||
+        !cuda_model_range_fits(model_size, offset1, bytes1) ||
+        !cuda_model_range_fits(model_size, offset2, bytes2) ||
+        !cuda_tensor_has_elems2(in, width, rows, 4u) ||
+        !cuda_tensor_has_elems2(out1, outputs1, rows, 4u) ||
+        !cuda_tensor_has_elems2(out2, outputs2, rows, 4u)) return 0;
+    const void *w1 = cuda_model_range_ptr(model_map, offset1, bytes1, "V4.1 Q8 pair A");
+    const void *w2 = cuda_model_range_ptr(model_map, offset2, bytes2, "V4.1 Q8 pair B");
+    if (!w1 || !w2) return 0;
+    if (ds41_v41_dense_f16_pair(8, w1, out1->ptr, outputs1, w2, out2->ptr, outputs2, in->ptr,
+                                rows, width, 0u)) return 0;
+    return 1;
 }
 
 extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,

@@ -56,6 +56,17 @@ int ds4_gpu_dsv41_hc_tail(ds4_gpu_tensor *split_out, const ds4_gpu_tensor *mix,
         uint64_t norm_weight_offset, float eps);
 int ds4_gpu_dsv41_bf16_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                             uint32_t start, bool compressed, bool inverse);
+int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t width, uint32_t outputs,
+        uint32_t rows, const ds4_gpu_tensor *in);
+int ds4_gpu_dsv41_q8_projection_pair_batch(ds4_gpu_tensor *out1, ds4_gpu_tensor *out2,
+        const void *model_map, uint64_t model_size, uint64_t offset1, uint64_t offset2,
+        uint32_t width, uint32_t outputs1, uint32_t outputs2, uint32_t rows,
+        const ds4_gpu_tensor *in);
+int ds4_gpu_dsv41_hc_wsum_norm_rows(ds4_gpu_tensor *x, ds4_gpu_tensor *norm_out,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *w, uint32_t w_stride,
+        const void *model_map, uint64_t model_size, uint64_t norm_weight_offset,
+        uint32_t rows, float eps);
 int ds4_gpu_dsv41_bf16_rope_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                                  uint32_t rows, uint32_t start, bool compressed, bool inverse);
 int ds4_gpu_dsv41_add_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
