@@ -276,6 +276,9 @@ struct cuda_stream_layer_expert_cache {
      * dynamic cache through per-expert pointer tables. */
     uint64_t in_slot[6];
     int pointer_mode;
+    /* Selected plan of a sweep whose larger chunks run on the routed FP16
+     * kernel: its short last chunk uses that kernel too, in either mode. */
+    int f16_any_rows;
 };
 
 struct cuda_stream_v41_reuse_stats {
@@ -3104,6 +3107,7 @@ static int cuda_stream_expert_cache_quiesce(void) {
         if (slot.reuse_plan.use_selected) {
             slot.active = 0;
             slot.pointer_mode = 0;
+            slot.f16_any_rows = 0;
             memset(slot.in_slot, 0, sizeof(slot.in_slot));
         }
     }
@@ -3349,6 +3353,13 @@ static int cuda_stream_v41_pointer_mode_wanted(void) {
         g_stream_v41_selected_rows_hint >= v41_routed_f16_min_rows() &&
         g_stream_v41_selected_rows_hint <= 2048u;
 }
+/* The batch this selected plan belongs to runs on the routed FP16 kernel. */
+static int cuda_stream_v41_selected_f16_batch(void) {
+    return g_deepseek41_model && !g_quality_mode && ds4_rocm_is_gfx1151() &&
+        v41_routed_f16_enabled() &&
+        g_stream_v41_selected_rows_hint >= v41_routed_f16_min_rows() &&
+        g_stream_v41_selected_rows_hint <= 2048u;
+}
 
 /* V4.1 only: the graph owns dynamic-cache metadata until every source copy
  * completes. The following reader receives no cache pointer or vector index. */
@@ -3398,6 +3409,7 @@ static int cuda_stream_v41_prepare_layer_impl(const ds4_gpu_stream_expert_table 
     s.down = s.up + t->n_total_expert * t->gate_expert_bytes;
     const bool no_copy = use_selected && cuda_stream_v41_pointer_mode_wanted();
     s.pointer_mode = no_copy ? 1 : 0;
+    s.f16_any_rows = use_selected && cuda_stream_v41_selected_f16_batch() ? 1 : 0;
     memset(s.in_slot, 0, sizeof(s.in_slot));
     ds4_gpu_dsv41_stream_layer_plan plan = {};
     plan.table = *t;

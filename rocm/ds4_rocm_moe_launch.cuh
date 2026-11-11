@@ -1162,9 +1162,16 @@ static int routed_moe_launch(
             DS4_ROCM_MOE_DECODE_PROFILE_PREP_WAIT_END,
             "IQ2 decode MoE profile split prep wait end")) return 0;
 
+    /* The short last chunk of a selective sweep shares its layer slot with the
+     * larger chunks before it and is served here at any size. */
+    const bool slot_pointer_mode = stream_full_layer && layer_index < 40u &&
+        (g_stream_layer_expert_cache[layer_index & 1u].pointer_mode ||
+         g_stream_layer_expert_cache[layer_index & 1u].f16_any_rows) &&
+        g_stream_layer_expert_cache[layer_index & 1u].layer == layer_index;
     if (stream_full_layer && v41_routed_f16_enabled() && g_deepseek41_model &&
         !g_glm_model && !g_quality_mode && ds4_rocm_is_gfx1151() &&
-        n_tokens >= v41_routed_f16_min_rows() && n_total_expert == 384u && n_expert == 6u &&
+        (n_tokens >= v41_routed_f16_min_rows() || (slot_pointer_mode && n_tokens >= 1u)) &&
+        n_total_expert == 384u && n_expert == 6u &&
         expert_in_dim == 5120u && expert_mid_dim == 2304u && out_dim == 5120u &&
         gate_type == 16u && down_type == 10u &&
         gate_expert_bytes == 3041280u && down_expert_bytes == 3870720u) {

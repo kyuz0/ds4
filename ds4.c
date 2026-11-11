@@ -18667,7 +18667,10 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
 }
 
 /* ROCm: the decoder suffix (layers 20-39 recompute only their sliding-window
- * tail, at least DS4_ROCM_V41_SUFFIX_MIN_ROWS=4096) is the default. It changes
+ * tail) is the default for sweeps of DS4_ROCM_V41_SUFFIX_MIN_TOTAL (2049) rows
+ * or more; it was limited to 8192+ until 2026-11-11 (8192 restores that).
+ * At least DS4_ROCM_V41_SUFFIX_MIN_ROWS=4096 rows for sweeps of 8192+ rows and
+ * DS4_ROCM_V41_SUFFIX_APPEND_MIN_ROWS=1024 below. It changes
  * results only at rounding level: long-prefix perplexity on prose/code/docs moved
  * -0.58/+0.03/+0.19 % (2026-11-06).
  * DS4_METAL_V41_DECODER_SUFFIX=0 disables. */
@@ -43797,6 +43800,20 @@ static bool ds41_stream_layer_start_full_l(ds41_stream_layer_load *job,
     return ds41_stream_layer_start_plan(job, &table, NULL, 0);
 }
 
+/* State of the running selective sweep, for the per-chunk stage calls.
+ * A sweep of more than one 2048-row chunk (2049..8191 tokens) stages each
+ * layer incrementally: the first chunk starts a selected plan, later chunks
+ * top it up with the experts they add (ds41_stream_layer_start_topup). */
+static struct {
+    bool active;          /* a selective sweep is running */
+    uint32_t start, total; /* its first position and row count */
+    uint32_t hint_rows;   /* rows of its largest chunk, for the pointer-mode hint */
+    bool have_plan;       /* `plan` is the last loaded stage of `layer` */
+    uint32_t layer;
+    const void *map;
+    ds4_gpu_dsv41_stream_layer_plan plan;
+} g_ds41_sel_sweep;
+
 /* Default for validated layer-major workloads: stage only the experts selected
  * by the current route batch. This deliberately stays on the layer-major path,
  * where one loader owns the layer cache. Shared-expert work runs while that
@@ -43819,6 +43836,23 @@ static bool ds41_selective_stage_enabled(const ds41_gpu_graph *g, uint32_t count
         count <= g->prefill_cap;
 }
 
+/* Sweep-level decision. Besides single-chunk sweeps, sweeps of 2049..8191
+ * rows stage selectively chunk by chunk (DS4_ROCM_V41_SELECTIVE_STAGE_MULTI=0
+ * restores whole-layer staging for them). Larger sweeps keep whole layers:
+ * their compute hides the next layer's load. */
+static bool ds41_selective_sweep_enabled(const ds41_gpu_graph *g, uint32_t total) {
+    if (ds41_selective_stage_enabled(g, total)) return true;
+    static int multi = -1;
+    if (multi < 0) {
+        const char *v = getenv("DS4_ROCM_V41_SELECTIVE_STAGE_MULTI");
+        multi = !(v && v[0] == '0');
+    }
+    const char *env = getenv("DS4_ROCM_V41_SELECTIVE_STAGE");
+    if (env && env[0] == '0') return false;
+    return multi && g && g->streaming && g->tp_world == 1u && g->prefill_cap >= 2048u &&
+        total > 2048u && total < 8192u && ds41_selective_stage_enabled(g, 2048u);
+}
+
 /* Router-predicted prefetch for selective staging. A selected stage can only
  * start once its layer has routed, so its reads overlap nothing but the
  * shared expert. While layer il's routed experts and layer il + 1's attention
@@ -43837,8 +43871,11 @@ static struct {
     const void *map;
     ds4_gpu_tensor *logits, *probs, *selected, *weights;
     uint32_t cap;
-    int32_t *ids;          /* predicted routes waiting for the launch */
+    int32_t *ids;          /* scratch for one chunk's predicted routes */
     uint32_t n_ids, ids_cap, ids_layer, ids_rows;
+    uint32_t votes[384];   /* predicted routes per expert over the layer's chunks */
+    uint32_t vote_rows;    /* rows those votes come from */
+    bool last_chunk;       /* the chunk just routed ends its layer */
     uint32_t started, adopted;
 } g_ds41_pred;
 
@@ -43871,7 +43908,16 @@ static void ds41_stream_predict_route(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l, uint32_t il,
                                       uint32_t count) {
     g_ds41_pred.n_ids = 0;
-    if (!ds41_stage_predict_enabled() || count < ds41_stage_predict_min_rows() ||
+    const bool in_sweep = g_ds41_sel_sweep.active;
+    const uint32_t basis = in_sweep ? g_ds41_sel_sweep.total : count;
+    g_ds41_pred.last_chunk = !in_sweep ||
+        g->pos + count >= g_ds41_sel_sweep.start + g_ds41_sel_sweep.total;
+    if (g_ds41_pred.ids_layer != il + 1u || !g_ds41_pred.vote_rows) {
+        memset(g_ds41_pred.votes, 0, sizeof(g_ds41_pred.votes));
+        g_ds41_pred.vote_rows = 0;
+        g_ds41_pred.ids_layer = il + 1u;
+    }
+    if (!ds41_stage_predict_enabled() || basis < ds41_stage_predict_min_rows() ||
         il + 1u >= DS4_N_LAYER ||
         g->image_count || g->tp_world != 1u || !ds41_selective_stage_enabled(g, count)) return;
     const ds4_layer_weights *next = l + 1;
@@ -43911,9 +43957,11 @@ static void ds41_stream_predict_route(ds41_gpu_graph *g, const ds4_model *m,
             DS4_EXPERT_WEIGHT_SCALE, count) &&
         ds4_gpu_tensor_read(sel, 0, ids, (uint64_t)n_selected * sizeof(ids[0])) != 0;
     if (ok) {
+        for (uint32_t i = 0; i < n_selected; i++)
+            if (ids[i] >= 0 && ids[i] < 384) g_ds41_pred.votes[ids[i]]++;
+        g_ds41_pred.vote_rows += count;
         g_ds41_pred.n_ids = n_selected;
-        g_ds41_pred.ids_layer = il + 1u;
-        g_ds41_pred.ids_rows = count;
+        g_ds41_pred.ids_rows = g_ds41_pred.vote_rows < 2048u ? g_ds41_pred.vote_rows : 2048u;
     }
     ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(sel);
     ds4_gpu_tensor_free(probs); ds4_gpu_tensor_free(logits);
@@ -43923,8 +43971,12 @@ static void ds41_stream_predict_route(ds41_gpu_graph *g, const ds4_model *m,
  * joined: stage the predicted experts of layer il + 1. */
 static void ds41_stream_predict_launch(const ds4_model *m, const ds4_layer_weights *l,
                                        uint32_t il) {
-    uint32_t n = g_ds41_pred.n_ids;
+    /* The loader serves this layer's later chunks first: predict from all of
+     * them and launch once the layer's last chunk has staged. */
+    if (!g_ds41_pred.last_chunk) return;
+    uint32_t n = g_ds41_pred.vote_rows * DS4_N_EXPERT_USED;
     g_ds41_pred.n_ids = 0;
+    g_ds41_pred.vote_rows = 0;
     if (!n || g_ds41_pred.ids_layer != il + 1u || il + 1u >= DS4_N_LAYER) return;
     /* Keep only experts that at least `votes` predicted routes agree on: a
      * mispredicted expert costs a read the next layer has to wait for. */
@@ -43939,15 +43991,11 @@ static void ds41_stream_predict_launch(const ds4_model *m, const ds4_layer_weigh
      * for 512-1023 rows (+712 tokens 5.17 -> 4.89 s). Below 512 rows the
      * prediction does not pay (see ds41_stage_predict_min_rows). */
     const int votes = votes_env ? votes_env : (n >= 1024u * DS4_N_EXPERT_USED ? 1 : 2);
-    if (votes > 1) {
-        uint32_t seen[384] = {0};
-        for (uint32_t i = 0; i < n; i++) {
-            const int32_t e = g_ds41_pred.ids[i];
-            if (e >= 0 && e < 384) seen[e]++;
-        }
+    {
         uint32_t kept = 0;
+        if (g_ds41_pred.ids_cap < 384u) return;
         for (uint32_t e = 0; e < 384u; e++)
-            if (seen[e] >= (uint32_t)votes) g_ds41_pred.ids[kept++] = (int32_t)e;
+            if (g_ds41_pred.votes[e] >= (uint32_t)votes) g_ds41_pred.ids[kept++] = (int32_t)e;
         n = kept;
         if (!n) return;
     }
@@ -44002,7 +44050,18 @@ static bool ds41_stream_stage_selected_start(ds41_gpu_graph *g, const ds4_model 
         ok = ds4_gpu_tensor_read(g->batch.selected, 0, selected,
                                  (uint64_t)n_selected * sizeof(selected[0])) != 0;
     bool topped = false;
-    ds4_gpu_dsv41_stream_selected_rows_hint(count);
+    /* Every chunk of a sweep must agree on the staging mode, so a short last
+     * chunk reports the sweep's largest chunk. */
+    ds4_gpu_dsv41_stream_selected_rows_hint(
+        g_ds41_sel_sweep.active && g_ds41_sel_sweep.hint_rows > count ?
+            g_ds41_sel_sweep.hint_rows : count);
+    if (ok && g_ds41_sel_sweep.active && g_ds41_sel_sweep.have_plan &&
+        g_ds41_sel_sweep.layer == il && g_ds41_sel_sweep.map == m->map) {
+        /* A later chunk of this layer: keep what the earlier chunks staged. */
+        topped = ds41_stream_layer_start_topup(stage, m, l, il, selected, n_selected,
+                                               &g_ds41_sel_sweep.plan);
+        g_ds41_sel_sweep.have_plan = false;
+    } else
     if (g_ds41_pred.job.active || g_ds41_pred.loaded) {
         /* Take over what the prediction staged for this layer, if anything. */
         if (g_ds41_pred.job.active) {
@@ -44037,8 +44096,17 @@ static bool ds41_stream_stage_selected_join(const ds4_model *m,
     const bool trace = getenv("DS4_ROCM_V41_SELECTIVE_TRACE") != NULL;
     const bool was_fallback = stage->fallback;
     ds41_stream_layer_load snap = {0};
-    bool joined = ds41_stream_layer_join(stage, trace ? &snap : NULL);
+    const bool was_active = stage->active;
+    bool joined = ds41_stream_layer_join(stage, &snap);
     bool fallback = was_fallback;
+    g_ds41_sel_sweep.have_plan = false;
+    if (joined && was_active && !was_fallback && g_ds41_sel_sweep.active &&
+        snap.plan.use_selected) {
+        g_ds41_sel_sweep.plan = snap.plan;
+        g_ds41_sel_sweep.layer = il;
+        g_ds41_sel_sweep.map = m->map;
+        g_ds41_sel_sweep.have_plan = true;
+    }
     if (!joined && !fallback) {
         fprintf(stderr,
                 "ds4: V4.1 selective stage load failed layer=%u tokens=%u; "
@@ -44079,6 +44147,7 @@ static bool ds41_stream_sweep_start(ds41_stream_layer_load *job,
 
 static bool ds41_stream_sweep_finish(ds41_stream_layer_load *job) {
     ds41_stream_predict_drop();
+    memset(&g_ds41_sel_sweep, 0, sizeof(g_ds41_sel_sweep));
     if (getenv("DS4_ROCM_V41_SELECTIVE_TRACE") && g_ds41_pred.started)
         fprintf(stderr, "ds4: V4.1 predicted stages started=%u adopted=%u\n",
                 g_ds41_pred.started, g_ds41_pred.adopted);
@@ -44545,7 +44614,17 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
      * are the only source of their compressed/index rows. A publication-only
      * correction cannot be exact. Keep the unqualified path opt-in and use the
      * full decoder body by default. */
-    const bool decoder_suffix = wide && total_count >= 8192u &&
+#ifdef DS4_ROCM_BUILD
+    static int suffix_min_total = -1;
+    if (suffix_min_total < 0) {
+        const char *v = getenv("DS4_ROCM_V41_SUFFIX_MIN_TOTAL");
+        suffix_min_total = v && v[0] ? atoi(v) : 2049;
+        if (suffix_min_total < 2049) suffix_min_total = 2049;
+    }
+#else
+    const int suffix_min_total = 8192;
+#endif
+    const bool decoder_suffix = wide && total_count >= (uint32_t)suffix_min_total &&
         metal_graph_tp_env_flag("DS4_METAL_V41_DECODER_SUFFIX", DS41_DECODER_SUFFIX_DEFAULT) &&
         !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
@@ -44583,9 +44662,16 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #ifdef DS4_ROCM_BUILD
     ds41_stream_layer_load prepare = {0};
     const bool selective_stage = g->streaming && batch_moe &&
-        ds41_selective_stage_enabled(g, total_count);
+        ds41_selective_sweep_enabled(g, total_count);
     bool ok = !g->streaming ||
         ds41_stream_sweep_start(&prepare, m, w, selective_stage);
+    memset(&g_ds41_sel_sweep, 0, sizeof(g_ds41_sel_sweep));
+    if (selective_stage) {
+        g_ds41_sel_sweep.active = true;
+        g_ds41_sel_sweep.start = g->pos;
+        g_ds41_sel_sweep.total = total_count;
+        g_ds41_sel_sweep.hint_rows = total_count < 2048u ? total_count : 2048u;
+    }
 #else
     const bool selective_stage = false;
     bool ok = !g->streaming || metal_graph_stream_map_token(m, w);
@@ -44665,13 +44751,21 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
              * few rows leaves layers 20-39 cold for decode (+74 % misses; 2048 rows: +15 %,
              * 4096 rows: -12 % vs the full decoder at 24K). */
             {
-                static int min_rows = -1;
+                static int min_rows = -1, append_min_rows = -1;
                 if (min_rows < 0) {
                     const char *v = getenv("DS4_ROCM_V41_SUFFIX_MIN_ROWS");
                     min_rows = v && *v ? atoi(v) : 4096;
                     if (min_rows < 0) min_rows = 0;
+                    /* Sweeps below 8192 rows are appends to a session whose
+                     * cache is already seeded; 1024 rows measured as good as
+                     * 2048 for the decode that follows (2026-11-11). */
+                    v = getenv("DS4_ROCM_V41_SUFFIX_APPEND_MIN_ROWS");
+                    append_min_rows = v && *v ? atoi(v) : 1024;
+                    if (append_min_rows < 0) append_min_rows = 0;
                 }
-                if (needed < (uint32_t)min_rows) needed = (uint32_t)min_rows;
+                const uint32_t floor_rows =
+                    (uint32_t)(total_count >= 8192u ? min_rows : append_min_rows);
+                if (needed < floor_rows) needed = floor_rows;
                 if (needed > total_count - 127u) needed = total_count - 127u;
             }
 #endif
