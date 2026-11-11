@@ -3094,6 +3094,19 @@ static int cuda_stream_expert_cache_quiesce(void) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming quiesce could not prove GPU drainage; refusing teardown\n");
         abort();
     }
+    /* A slot staged for a selected plan holds only part of its layer (the
+     * experts that batch routed to). It is valid for that sweep alone: left
+     * active, the next multi-row batch at the same layer (a short append or a
+     * DSpark verify at layers 38/39) would take it for a full layer and read
+     * unstaged rows. Full-layer slots stay usable. */
+    for (uint32_t i = 0; i < 2u; i++) {
+        cuda_stream_layer_expert_cache &slot = g_stream_layer_expert_cache[i];
+        if (slot.reuse_plan.use_selected) {
+            slot.active = 0;
+            slot.pointer_mode = 0;
+            memset(slot.in_slot, 0, sizeof(slot.in_slot));
+        }
+    }
     g_routed_moe_selected_override_n = 0;
     g_stream_selected_cache.loaded = 0;
     g_stream_selected_cache.model_map = NULL;
