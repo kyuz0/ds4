@@ -8,24 +8,39 @@
 > [antirez/ds4](https://github.com/antirez/ds4). It focuses on running
 > **DeepSeek V4.1 Flash on AMD Strix Halo** (gfx1151, 128 GB) with SSD expert
 > streaming, for agentic coding: faster prefill and decode, short/medium append
-> batching, disk KV checkpoints for long chats, and a fix for the shared expert being
-> added twice in batched rows. Everything below this note is the upstream README.
+> batching, selective expert staging for tool-result sized appends, disk KV
+> checkpoints for long chats, and a fix for the shared expert being added twice in
+> batched rows. Everything below this note is the upstream README.
 >
-> Benchmark (2026-11-09), `ds4-bench --rocm --ssd-streaming --ssd-streaming-cache-experts 92GB`,
+> **Third-party kernels.** Batched prefill runs its routed experts, dense Q8
+> projections, router and attention on GPU kernels copied unchanged from
+> [franzmoca/ds41-gufo-extension](https://github.com/franzmoca/ds41-gufo-extension)
+> (MIT; parts derive from Gufo). They live in `rocm/gufo_f16/` with their licenses
+> and a [NOTICE](rocm/gufo_f16/NOTICE.md) listing the source commit and where each
+> kernel is used. Thanks to its author: most of the prefill gain between the two
+> columns of this fork below comes from those kernels.
+>
+> Benchmark, `ds4-bench --rocm --ssd-streaming --ssd-streaming-cache-experts 92GB`,
 > model `DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf`, prompt
-> `speed-bench/promessi_sposi.txt`, 512 generated tokens. Each repo was built clean with
-> `make strix-halo`, 3 runs in rotated order, median shown (tok/s, higher is better):
+> `speed-bench/promessi_sposi.txt`, 512 generated tokens, `make strix-halo`, 3 runs,
+> median shown (tok/s, higher is better). The first column was measured on
+> 2026-11-11, the other three on 2026-11-09 (clean builds, rotated order):
 >
-> | Context | Metric | this fork (`5bf1982`) | kyuz0/ds4 (`2998e96`) | antirez/ds4 (`b3f5018`) |
-> |---|---|---|---|---|
-> | 8K | prefill | **201.7** | 169.3 | 71.5 |
-> | 8K | decode | **12.25** | 9.13 | 4.66 |
-> | 32K | prefill (8K→32K) | **331.7** | 294.4 | 96.6 |
-> | 32K | decode | **12.05** | 8.33 | 4.41 |
+> | Context | Metric | this fork (`afe74b7`) | this fork (`5bf1982`) | kyuz0/ds4 (`2998e96`) | antirez/ds4 (`b3f5018`) |
+> |---|---|---|---|---|---|
+> | 8K | prefill | **342.3** | 201.7 | 169.3 | 71.5 |
+> | 8K | decode | **14.34** | 12.25 | 9.13 | 4.66 |
+> | 32K | prefill (8K→32K) | **643.4** | 331.7 | 294.4 | 96.6 |
+> | 32K | decode | **14.21** | 12.05 | 8.33 | 4.41 |
 >
-> Hardware: Strix Halo, 128 GB unified memory, model on a DRAM-less PCIe NVMe
-> (~1-1.6 GB/s random reads). With SSD streaming the drive is the main bottleneck, so
-> numbers on a faster drive will differ. Speed only; output quality is checked separately.
+> Hardware: Strix Halo, 128 GB unified memory, model on a DRAM-less PCIe NVMe.
+> With SSD streaming the drive matters, and so does how the file is laid out on it:
+> the 2026-11-09 columns read the model file as first downloaded (~1-1.6 GB/s for
+> scattered expert reads); the `afe74b7` column reads a sequential copy of the same
+> bytes (`dd bs=64M iflag=direct oflag=direct`), which the same drive serves at
+> 4.4-6 GB/s. That copy accounts for the decode gain and part of the 8K prefill gain;
+> the 8K→32K prefill gain is compute. Speed only; output quality is checked
+> separately with the official scorer.
 
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
