@@ -42296,12 +42296,23 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
             count, start, n_raw, g->prefill_cap + 128u, 0, n_comp, 128, ratio,
             heads, DS4_N_HEAD_DIM);
     } else {
+#ifdef DS4_ROCM_BUILD
+        /* Window rows before this batch are still in the layer's ring (slot
+         * pos % 128); this batch's own rows are b->kv. */
+        ok = g->tp_world == 1u && ds4_gpu_dsv41_attention_fp4_batch(b->heads, m->map, m->size,
+            sinks, b->q, g->window[il], b->kv, g->compressed[owner], b->selected_comp,
+            count, start, n_comp, DS4_N_INDEXER_TOP_K, 128, ratio, heads, DS4_N_HEAD_DIM) != 0;
+        if (!ok)
+#endif
         ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(b->heads, m->map, m->size,
             sinks, b->q, g->raw_prefill, g->compressed[owner], 0,
             b->selected_comp, count, start, n_raw, g->prefill_cap + 128u, 0, n_comp,
             DS4_N_INDEXER_TOP_K, 128, ratio, heads, DS4_N_HEAD_DIM);
     }
     ds41_sub("attn kernel");
+    for (uint32_t r = 0; ok && r < count; r++)
+        ds41_trace_vec("sweepH", il, start + r, b->heads,
+                       (uint64_t)r * heads * DS4_N_HEAD_DIM * 4u, (uint64_t)heads * DS4_N_HEAD_DIM);
 #ifdef DS4_ROCM_BUILD
     if (ds41_batch_round_fuse()) {
         if (!ok || !ds4_gpu_dsv41_bf16_rope_rows(b->heads, DS4_N_HEAD_DIM, heads, count, start,

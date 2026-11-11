@@ -1954,6 +1954,97 @@ extern "C" int ds4_gpu_dsv41_q8_projection_pair_rows(
     return cuda_ok(cudaGetLastError(), "V4.1 Q8 fused pair projection");
 }
 
+/* Batched sparse attention on the kernel from rocm/gufo_f16/ds41_v41.hip.cpp.
+ * It reads the compressed KV rows in their packed FP4 form (256 code bytes +
+ * 32 scale bytes per row instead of 2 KiB of F32), which is what bounds this
+ * step: every token gathers its 512 selected rows twice. The rows in the F32
+ * cache are already FP4 values (DS4_V41_FP4_E4M3, blocks of 16), so they are
+ * packed on the fly for each call; DS4_ROCM_V41_ATTN_FP4_CHECK=1 verifies
+ * that packing reproduces them exactly and reports mismatches.
+ * `ring` holds the window rows before pos0 at slot pos % window, `chunk` this
+ * batch's rows. Returns 1 done, 0 not applicable.
+ * DS4_ROCM_V41_ATTN_FP4=0 disables. */
+typedef struct ds41_fp4_rows { const uint8_t *codes; const uint8_t *scales; } ds41_fp4_rows;
+extern "C" int ds41_v41_fp4_store(const float *x, uint8_t *codes, uint8_t *scales, uint32_t n,
+                                  uint32_t block, int e4m3_scale);
+extern "C" int ds41_v41_fp4_fake_quant(float *x, uint32_t n, uint32_t block, int e4m3_scale);
+extern "C" int ds41_v41_attention(float *q, const float *ring, const float *chunk, uint32_t window,
+        uint32_t floor, ds41_fp4_rows comp, const uint32_t *idx, uint32_t k, uint32_t ratio,
+        const float *sinks, float *out, uint16_t *out_half, float *partial, uint32_t pos0,
+        uint32_t n, uint32_t heads, uint32_t head_dim, float scale, const float *inv_freq,
+        uint32_t rope_dim, float *rope_scratch);
+__global__ static void v41_count_diff_kernel(const float *a, const float *b, uint64_t n, uint32_t *count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && __float_as_uint(a[i]) != __float_as_uint(b[i])) atomicAdd(count, 1u);
+}
+extern "C" int ds4_gpu_dsv41_attention_fp4_batch(ds4_gpu_tensor *heads, const void *model_map,
+        uint64_t model_size, uint64_t sinks_offset, ds4_gpu_tensor *q, const ds4_gpu_tensor *ring,
+        const ds4_gpu_tensor *chunk, const ds4_gpu_tensor *comp_kv, const ds4_gpu_tensor *topk,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_comp, uint32_t top_k, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_ATTN_FP4");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    if (!on || g_quality_mode || n_tokens < 8u || n_tokens > 2048u || !ratio || top_k != 512u ||
+        n_comp < top_k || window != 128u || n_head != 64u || head_dim != 512u ||
+        !heads || !q || !ring || !chunk || !comp_kv || !topk || !model_map ||
+        (uint64_t)n_comp * head_dim > UINT32_MAX ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        ring->bytes < (uint64_t)window * head_dim * sizeof(float) ||
+        chunk->bytes < (uint64_t)n_tokens * head_dim * sizeof(float) ||
+        comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+        topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t) ||
+        !cuda_model_range_fits(model_size, sinks_offset, (uint64_t)n_head * sizeof(float))) return 0;
+    const float *sinks = (const float *)cuda_model_range_ptr(model_map, sinks_offset,
+        (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+    static uint8_t *codes = NULL, *scales = NULL;
+    static uint32_t cap_rows = 0;
+    if (n_comp > cap_rows) {
+        if (codes) (void)cudaFree(codes);
+        if (scales) (void)cudaFree(scales);
+        codes = scales = NULL; cap_rows = 0;
+        const uint32_t want = n_comp < 16384u ? 16384u : n_comp + n_comp / 4u;
+        if (!cuda_ok(cudaMalloc(&codes, (size_t)want * (head_dim / 2u)), "V4.1 FP4 KV codes") ||
+            !cuda_ok(cudaMalloc(&scales, (size_t)want * (head_dim / 16u)), "V4.1 FP4 KV scales")) return 0;
+        cap_rows = want;
+    }
+    const uint32_t n_values = n_comp * head_dim;
+    static int check = -1;
+    if (check < 0) check = getenv("DS4_ROCM_V41_ATTN_FP4_CHECK") != NULL;
+    if (check) {
+        float *tmp = NULL; uint32_t *cnt = NULL; uint32_t diff = 0;
+        if (cuda_ok(cudaMalloc(&tmp, (size_t)n_values * sizeof(float)), "V4.1 FP4 check") &&
+            cuda_ok(cudaMalloc(&cnt, sizeof(uint32_t)), "V4.1 FP4 check count")) {
+            (void)cudaMemcpy(cnt, &diff, sizeof(diff), cudaMemcpyHostToDevice);
+            (void)cudaMemcpy(tmp, comp_kv->ptr, (size_t)n_values * sizeof(float), cudaMemcpyDeviceToDevice);
+            (void)ds41_v41_fp4_fake_quant(tmp, n_values, 16u, 1);
+            v41_count_diff_kernel<<<(unsigned)((n_values + 255u) / 256u), 256u>>>(tmp,
+                (const float *)comp_kv->ptr, n_values, cnt);
+            (void)cudaMemcpy(&diff, cnt, sizeof(diff), cudaMemcpyDeviceToHost);
+            static uint64_t calls = 0, bad = 0;
+            calls++; bad += diff;
+            if (diff || (calls % 64u) == 1u)
+                fprintf(stderr, "ds4: V4.1 FP4 KV check call=%llu rows=%u mismatched values=%u (total %llu)\n",
+                        (unsigned long long)calls, n_comp, diff, (unsigned long long)bad);
+        }
+        if (tmp) (void)cudaFree(tmp);
+        if (cnt) (void)cudaFree(cnt);
+    }
+    if (ds41_v41_fp4_store((const float *)comp_kv->ptr, codes, scales, n_values, 16u, 1)) return 0;
+    const ds41_fp4_rows comp = {codes, scales};
+    if (ds41_v41_attention((float *)q->ptr, (const float *)ring->ptr, (const float *)chunk->ptr,
+            window, 0u, comp, (const uint32_t *)topk->ptr, top_k, ratio, sinks,
+            (float *)heads->ptr, NULL, NULL, pos0, n_tokens, n_head, head_dim,
+            1.0f / sqrtf((float)head_dim), NULL, 0u, NULL)) return 0;
+    static int logged = 0;
+    if (!logged) { logged = 1; fprintf(stderr, "ds4: ROCm V4.1 FP4-row attention active (rows=%u)\n", n_tokens); }
+    return 1;
+}
+
 /* Router projection (F32 384 x 5120) on the BF16 matrix cores
  * (rocm/gufo_f16/ds41_v41.hip.cpp). The router weights are BF16 values stored
  * as F32, so their BF16 copy is exact; it is made once per layer and kept.

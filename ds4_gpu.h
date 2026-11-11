@@ -67,6 +67,11 @@ int ds4_gpu_dsv41_hc_wsum_norm_rows(ds4_gpu_tensor *x, ds4_gpu_tensor *norm_out,
         const ds4_gpu_tensor *residual, const ds4_gpu_tensor *w, uint32_t w_stride,
         const void *model_map, uint64_t model_size, uint64_t norm_weight_offset,
         uint32_t rows, float eps);
+int ds4_gpu_dsv41_attention_fp4_batch(ds4_gpu_tensor *heads, const void *model_map,
+        uint64_t model_size, uint64_t sinks_offset, ds4_gpu_tensor *q, const ds4_gpu_tensor *ring,
+        const ds4_gpu_tensor *chunk, const ds4_gpu_tensor *comp_kv, const ds4_gpu_tensor *topk,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_comp, uint32_t top_k, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim);
 int ds4_gpu_dsv41_bf16_rope_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                                  uint32_t rows, uint32_t start, bool compressed, bool inverse);
 int ds4_gpu_dsv41_add_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
