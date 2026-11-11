@@ -45195,11 +45195,23 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
          * attention core and output per row. */
         const bool batch_attention = prefill_only &&
             getenv("DS4_ROCM_V41_SHORT_PREFILL_SCALAR_ATTN") == NULL;
-        const bool batch_output = g->draft && g->draft->verify_rows == rows &&
-            rows > 1u && rows <= DS4_DSPARK_MAX_BLOCK_SIZE + 1u &&
+        /* Short prefill batches used to run the two attention output
+         * projections once per row (each reading its ~40 MB matrix again);
+         * the tiny-row kernels the DSpark verifier uses read them once for
+         * all rows. DS4_ROCM_V41_SHORT_PREFILL_ROW_ATTN_OUT=1 restores the
+         * per-row launches. */
+        static int short_batch_out = -1;
+        if (short_batch_out < 0)
+            short_batch_out = getenv("DS4_ROCM_V41_SHORT_PREFILL_ROW_ATTN_OUT") == NULL;
+        const bool batch_output =
+            ((g->draft && g->draft->verify_rows == rows &&
+              rows <= DS4_DSPARK_MAX_BLOCK_SIZE + 1u &&
+              !getenv("DS4_ROCM_DSPARK_V41_DISABLE_BATCH_ATTN_OUT")) ||
+             (short_batch_out && batch_attention && !g->draft && rows <= 6u &&
+              g->tp_world == 1u)) &&
+            rows > 1u &&
             l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
-            l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
-            !getenv("DS4_ROCM_DSPARK_V41_DISABLE_BATCH_ATTN_OUT");
+            l->attn_output_b->type == DS4_TENSOR_Q8_0;
 #else
         const bool batch_attention = false;
         const bool batch_output = false;
